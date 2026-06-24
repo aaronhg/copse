@@ -1,0 +1,50 @@
+{
+  "name": "copse",
+  "version": "0.0.1",
+  "description": "Drive and assert a running Cocos canvas game through its live node tree — no pixels, no input simulation. AI-friendly integration/flow testing. Runtime sibling to coir.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.js",
+    "./driver-puppeteer": "./src/drivers/puppeteer.js",
+    "./agent-claude": "./src/agents/claude.js",
+    "./inject": "./dist/copse.inject.js"
+  },
+  "bin": {
+    "copse": "./bin/copse.js"
+  },
+  "files": [
+    "src",
+    "bin",
+    "dist"
+  ],
+  "scripts": {
+    "test": "node --test",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build",
+    "build": "esbuild src/cocos/inject.js --bundle --format=iife --outfile=dist/copse.inject.js --banner:js='/* copse inject bundle — exposes globalThis.copse + auto-installs window.__copse once cc is live. Rebuild: npm run build */'"
+  },
+  "keywords": [
+    "cocos",
+    "cocos-creator",
+    "canvas",
+    "game-testing",
+    "qa",
+    "integration-test",
+    "ai"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "esbuild": "^0.28.1",
+    "puppeteer-core": "^24.43.1",
+    "typescript": "^5.4.0"
+  },
+  "peerDependencies": {
+    "puppeteer-core": ">=22"
+  },
+  "peerDependenciesMeta": {
+    "puppeteer-core": {
+      "optional": true
+    }
+  }
+}
