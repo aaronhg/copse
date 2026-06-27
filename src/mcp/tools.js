@@ -1,0 +1,198 @@
+// @ts-check
+// copse MCP tool registry — one entry per tool: { name, description, inputSchema, run(state,args) }.
+// `run` drives the live session in `state.cp` (a copse Driver from connect()) and RETURNS
+// { data } / { error } — it never prints (stdout is the MCP protocol channel); server.js turns
+// the result into an MCP tool result. The `connect` tool establishes state.cp (lazy-importing the
+// puppeteer driver — the only peer-dep edge); `close` tears it down. Selectors use copse's
+// grammar: Parent/Child:Comp.prop, [i] to disambiguate same-name siblings.
+//
+// Tools tagged `debug: true` (the CDP Debugger surface: break_*/wait_pause/eval_frame/debug_step/
+// clear_breakpoints) are HIDDEN from tools/list by default — they're dev-build-only (pausing trips
+// anti-debug games) and would otherwise crowd the menu. `copse mcp --debug` surfaces them
+// (server.js filters by this tag). They stay callable by name regardless, so tests/power-users
+// aren't blocked.
+
+const needCp = (state) => {
+  if (!state.cp) throw new Error('no open game — call the `connect` tool with a url first');
+  return state.cp;
+};
+
+// Lazily attach the CDP Debugger over the live session (state.dbg). Tests can pre-seed state.dbg.
+const ensureDbg = async (state) => {
+  if (!state.dbg) {
+    const cp = needCp(state);
+    const { attachDebugger } = await import('../debug.js');
+    state.dbg = await attachDebugger(cp.page);
+  }
+  return state.dbg;
+};
+
+/** @type {{name:string,description:string,inputSchema:any,debug?:boolean,run:(state:any,args:any)=>Promise<{data?:any,error?:string}>}[]} */
+export const TOOLS = [
+  {
+    name: 'connect',
+    description: 'Launch a browser at <url> (or ATTACH to an already-open tab), load a running Cocos game, inject copse, wait until ready. Call this FIRST (same operation as the library connect()). headed:true shows a window; browserURL points at your own Chrome (started with --remote-debugging-port). attach:true + match drives an ALREADY-OPEN tab without navigating — use this for Cloudflare/login sites you got past by hand. Returns a readiness summary.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        url: { type: 'string', description: 'the running game URL (omit when attach:true — use match instead)' },
+        headed: { type: 'boolean', description: 'show a visible browser window (default: headless)' },
+        fps: { type: 'number', description: 'frame-rate cap (default 10; raise to watch smoothly)' },
+        browserURL: { type: 'string', description: 'CDP URL of an existing Chrome (e.g. http://127.0.0.1:9222) — required for attach' },
+        attach: { type: 'boolean', description: 'drive an already-open tab (no navigation) instead of opening a new one' },
+        match: { type: 'string', description: 'when attach:true, pick the open tab whose URL contains this substring' },
+      },
+    },
+    run: async (state, a) => {
+      if (state.cp) { try { await state.cp.close(); } catch { /* ignore */ } state.cp = null; }
+      const { connect } = await import('../drivers/puppeteer.js');
+      const opts = { ...state.connectOpts };
+      if (a.headed) opts.headless = false;
+      if (typeof a.fps === 'number') opts.fpsCap = a.fps;
+      if (a.browserURL) opts.browserURL = a.browserURL;
+      if (a.attach) { opts.attach = true; opts.match = a.match || a.url; }
+      const target = a.url || opts.match || '';
+      state.cp = await connect(target, opts);
+      // attached while the renderer is paused at a breakpoint → copse inject is deferred (it'd hang).
+      // Return now: Debugger tools (wait_pause/eval_frame/break_at) work immediately; snapshot/press/
+      // break_in auto-run once you resume.
+      if (state.cp.paused) return { data: { ok: true, url: target, attached: true, paused: true, note: 'renderer paused in the debugger — inject deferred. Use wait_pause/eval_frame/break_at now; snapshot/press/break_in run after you resume.' } };
+      const snap = await state.cp.snapshot({ relevant: true });
+      const inter = await state.cp.interactive();
+      return { data: { ok: true, url: target, attached: !!opts.attach, relevantNodes: snap.length, buttons: inter.length } };
+    },
+  },
+  {
+    name: 'snapshot',
+    description: 'Slim live node-tree snapshot: [{ref, button?, interactable?, click?, label?, codeHandlers?}]. Default relevant:true (only nodes with a testable surface — buttons/labels/code-handlers). includeInactive:true also walks hidden subtrees; components:true adds raw component types.',
+    inputSchema: { type: 'object', properties: { relevant: { type: 'boolean' }, includeInactive: { type: 'boolean' }, components: { type: 'boolean' } } },
+    run: async (state, a) => ({ data: await needCp(state).snapshot({ relevant: a.relevant ?? true, includeInactive: a.includeInactive, components: a.components }) }),
+  },
+  {
+    name: 'interactive',
+    description: 'Buttons only, each annotated with reachable/blockedBy (best-effort geometric reachability).',
+    inputSchema: { type: 'object', properties: {} },
+    run: async (state) => ({ data: await needCp(state).interactive() }),
+  },
+  {
+    name: 'press',
+    description: 'Press a button by ref — runs its wired clickEvents + emits CLICK (NOT a coordinate click). Returns {ok, fired, changed?}; `changed` auto-reports what the action did once the tree settles (appeared/disappeared/activated/deactivated/labelChanged as node descriptors, so you can read a panel\'s contents straight from it). Honors interactable unless force:true.',
+    inputSchema: { type: 'object', properties: { ref: { type: 'string', description: 'node ref, e.g. Canvas/Panel/CloseBtn' }, force: { type: 'boolean', description: 'press even if interactable:false' } }, required: ['ref'] },
+    run: async (state, a) => ({ data: await needCp(state).press(a.ref, a.force ? { force: true } : {}) }),
+  },
+  {
+    name: 'get',
+    description: 'Read a member for assertions: path:Comp.prop (e.g. Canvas/Score:Label.string), or path:Node.prop for a node intrinsic (e.g. Canvas/Panel:Node.active). Returns {ok, value}.',
+    inputSchema: { type: 'object', properties: { sel: { type: 'string', description: 'path:Comp.member selector' } }, required: ['sel'] },
+    run: async (state, a) => ({ data: await needCp(state).get(a.sel) }),
+  },
+  {
+    name: 'call',
+    description: 'Invoke any method on any component: path:Comp.method(...args) — drives game logic beyond buttons. Returns {ok, value, changed?}.',
+    inputSchema: { type: 'object', properties: { sel: { type: 'string', description: 'path:Comp.method selector' }, args: { type: 'array', items: {}, description: 'method arguments' } }, required: ['sel'] },
+    run: async (state, a) => ({ data: await needCp(state).call(a.sel, ...(a.args || [])) }),
+  },
+  {
+    name: 'reachable',
+    description: 'Best-effort: is this button actually reachable by a player, or covered by an overlay / BlockInputEvents / a later-drawn panel? Returns {ok, reachable, blockedBy}. A geometric heuristic — treat reachable:false as a strong signal to verify, not gospel.',
+    inputSchema: { type: 'object', properties: { ref: { type: 'string' } }, required: ['ref'] },
+    run: async (state, a) => ({ data: await needCp(state).reachable(a.ref) }),
+  },
+  {
+    name: 'node',
+    description: 'Node intrinsics for visibility checks: {active, activeInHierarchy, opacity, scale, worldPos, size}.',
+    inputSchema: { type: 'object', properties: { ref: { type: 'string' } }, required: ['ref'] },
+    run: async (state, a) => ({ data: await needCp(state).node(a.ref) }),
+  },
+  {
+    name: 'diff',
+    description: 'Diff two snapshots (before vs after an action) → {appeared, disappeared, activated, deactivated, labelChanged} as node descriptors. `press`/`call` already attach this as `changed`; use this tool for manual before→act→after comparisons, e.g. snapshot({includeInactive:true}) → act → snapshot → diff to see which panel subtree opened.',
+    inputSchema: { type: 'object', properties: { before: { type: 'array', items: {}, description: 'an earlier snapshot() result' }, after: { type: 'array', items: {}, description: 'a later snapshot() result' } }, required: ['before', 'after'] },
+    run: async (state, a) => ({ data: await needCp(state).diff(a.before, a.after) }),
+  },
+  {
+    name: 'listeners',
+    description: 'User code-registered node.on() handlers on a node (engine-internal events + the Button\'s own touch listeners filtered out): [{type, fn?, target?}]. Surfaces on(\'click\')/on(TOUCH_*) wiring that `press` fires. Minified builds strip fn/target names (you get identity, not semantics).',
+    inputSchema: { type: 'object', properties: { ref: { type: 'string' } }, required: ['ref'] },
+    run: async (state, a) => ({ data: await needCp(state).listeners(a.ref) }),
+  },
+  {
+    name: 'hijack',
+    description: 'Opt-in: patch Node.prototype.on so subsequent node.on() registrations are recorded, then read them with `captured`. NOTE: only catches handlers registered AFTER this call — in a fully-booted game most wiring already happened, so this is mainly useful before a scene/panel loads. For already-registered handlers use `listeners`.',
+    inputSchema: { type: 'object', properties: {} },
+    run: async (state) => ({ data: await needCp(state).hijack() }),
+  },
+  {
+    name: 'captured',
+    description: 'Read node.on() registrations recorded since `hijack` was called, for a node: [{type, fn?, target?}]. Empty unless `hijack` ran first and the node wired handlers afterward.',
+    inputSchema: { type: 'object', properties: { ref: { type: 'string' } }, required: ['ref'] },
+    run: async (state, a) => ({ data: await needCp(state).captured(a.ref) }),
+  },
+  {
+    name: 'logs',
+    description: "Recent console output + uncaught errors captured from the game (all frames): [{level, text, t, stack?}] (level is the console method / 'pageerror'). Use to check whether an action logged/threw an error with no visible UI change. `since` is an index — pass the count you've already seen to get only new lines.",
+    inputSchema: { type: 'object', properties: { since: { type: 'number', description: 'return logs from this index onward (default 0 = all)' } } },
+    run: async (state, a) => ({ data: await needCp(state).logs(a.since || 0) }),
+  },
+  {
+    name: 'break_at',
+    debug: true,
+    description: 'DEBUG (CDP Debugger — for your OWN dev build; pausing trips anti-debug games). Set a breakpoint by script URL + line. urlRegex matches the script URL (e.g. "ShopController" or "game\\\\.js$"); line/col are 0-based. Optional condition (a JS expr). Then trigger it and call wait_pause.',
+    inputSchema: { type: 'object', properties: { urlRegex: { type: 'string', description: 'regex matched against the script URL' }, line: { type: 'number', description: '0-based line number' }, col: { type: 'number', description: '0-based column (optional)' }, condition: { type: 'string', description: 'pause only if this JS expr is truthy (optional)' } }, required: ['urlRegex', 'line'] },
+    run: async (state, a) => ({ data: await (await ensureDbg(state)).breakAt(a.urlRegex, a.line, a.col, a.condition) }),
+  },
+  {
+    name: 'break_in',
+    debug: true,
+    description: 'DEBUG. Break when a Cocos component method is CALLED, addressed by copse selector path:Comp.method (e.g. Canvas/Mgr:ShopController.buy) — resolved to the actual function, so it works on minified builds. Breaks the METHOD (every instance); pass condition like "this===…" or check `this` via eval_frame to narrow. Then trigger it and call wait_pause.',
+    inputSchema: { type: 'object', properties: { sel: { type: 'string', description: 'path:Comp.method selector' }, condition: { type: 'string', description: 'pause only if this JS expr is truthy (optional)' } }, required: ['sel'] },
+    run: async (state, a) => ({ data: await (await ensureDbg(state)).breakIn(a.sel, a.condition) }),
+  },
+  {
+    name: 'break_exceptions',
+    debug: true,
+    description: 'DEBUG. Pause on thrown exceptions: state "all" | "uncaught" | "none". Then run the game and call wait_pause to catch the throwing stack.',
+    inputSchema: { type: 'object', properties: { state: { type: 'string', enum: ['all', 'uncaught', 'none'] } }, required: ['state'] },
+    run: async (state, a) => ({ data: await (await ensureDbg(state)).breakOnExceptions(a.state) }),
+  },
+  {
+    name: 'wait_pause',
+    debug: true,
+    description: 'DEBUG. Block until a breakpoint/exception hits, then return the call stack: {reason, frames:[{i, fn, url, line, col, scopes}]}. Returns null on timeout (default 30s). While paused the game is frozen — inspect with eval_frame, then step/resume.',
+    inputSchema: { type: 'object', properties: { timeoutMs: { type: 'number', description: 'how long to wait (default 30000)' } } },
+    run: async (state, a) => ({ data: await (await ensureDbg(state)).waitPause(a.timeoutMs ?? 30000) }),
+  },
+  {
+    name: 'eval_frame',
+    debug: true,
+    description: 'DEBUG (must be paused). Evaluate an expression in a paused call frame to read locals / `this` / arguments. frame is the index from wait_pause (0 = top). Returns {value} or {error}.',
+    inputSchema: { type: 'object', properties: { frame: { type: 'number', description: 'frame index (0 = innermost)' }, expr: { type: 'string', description: 'JS expression, e.g. this.balance' } }, required: ['frame', 'expr'] },
+    run: async (state, a) => ({ data: await (await ensureDbg(state)).evalFrame(a.frame, a.expr) }),
+  },
+  {
+    name: 'debug_step',
+    debug: true,
+    description: 'DEBUG (must be paused). Step execution: kind "over" | "into" | "out" | "resume". After stepping, call wait_pause again for the new stack.',
+    inputSchema: { type: 'object', properties: { kind: { type: 'string', enum: ['over', 'into', 'out', 'resume'] } }, required: ['kind'] },
+    run: async (state, a) => ({ data: a.kind === 'resume' ? await (await ensureDbg(state)).resume() : await (await ensureDbg(state)).step(a.kind) }),
+  },
+  {
+    name: 'clear_breakpoints',
+    debug: true,
+    description: 'DEBUG. Remove all breakpoints set this session (resume the game separately if it is paused).',
+    inputSchema: { type: 'object', properties: {} },
+    run: async (state) => ({ data: await (await ensureDbg(state)).clear() }),
+  },
+  {
+    name: 'close',
+    description: 'Close the browser session opened by `connect` (also detaches the debugger).',
+    inputSchema: { type: 'object', properties: {} },
+    run: async (state) => {
+      if (state.dbg) { try { await state.dbg.detach(); } catch { /* ignore */ } state.dbg = null; }
+      if (state.cp) { await state.cp.close(); state.cp = null; }
+      return { data: { ok: true } };
+    },
+  },
+];
+
+export const TOOLS_BY_NAME = new Map(TOOLS.map((t) => [t.name, t]));

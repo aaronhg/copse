@@ -11,9 +11,11 @@ UI tree. Both turn an opaque Cocos internal into structured data an AI (or a tes
 can query — and both speak the **same selector grammar** (`Parent/Child:Comp.prop`,
 `[i]` to disambiguate same-name siblings).
 
-> Status: **working.** Pure core + Cocos adapter + AI-driver harness + a CLI/library
-> entry, verified end-to-end against live builds (a web-mobile game and a remote slot):
-> snapshot, `press → get` state round-trips, reachability, and panel-open detection.
+> Status: **working.** Pure core + Cocos adapter + AI-driver harness + CLI/library/**MCP**
+> entry, verified end-to-end against live builds (a web-mobile game and remote live games):
+> snapshot, `press → get` state round-trips (a real spin deducting the bet), reachability,
+> panel open/close detection, and an AI loop driving buyfeature open+close to a PASS — plus
+> driving the live game natively from Claude Code over MCP.
 
 ## Why this shape
 
@@ -52,10 +54,11 @@ copse trades away the whole visual/spatial/timing dimension:
 - **Layout / position** — a button at `(-9999, 0)` or two overlapping panels.
 - **⚠ Reachability (now best-effort)** — *calling the handler ≠ a player being able to reach
   it.* `reachable(ref)` / `interactive()` flag a button covered by an overlay /
-  `BlockInputEvents` / a later-drawn panel (`blockedBy`), via a geometric hitTest +
-  draw-order heuristic. It does **not** resolve cross-camera/Layer z-order or alpha hit
-  areas — treat `reachable:false` as a strong signal to verify, `reachable:true` as "not
-  obviously covered". Still not a substitute for a real playtest.
+  `BlockInputEvents` / a later-drawn panel (`blockedBy`), via a geometric hitTest with
+  cross-camera/Layer z-order (camera priority → sibling-index). A separate `visible` flag
+  (`opacity/scale!==0`) catches opacity/scale-hidden buttons. But `reachable` answers "would a
+  **touch** reach it" — a button covered by an opaque *sprite* (no input-consumer on top) still
+  reads `reachable:true` (that's pixels, not the logic tree). Not a substitute for a real playtest.
 - **Timing / animation / feel**, **physics / gameplay**, **audio**, and any state not
   exposed on a component (closures, locals).
 - **What a button does** is opaque at runtime (you press and observe a state delta) —
@@ -72,15 +75,16 @@ testable in Node against a fake tree. `src/cocos/runtime.js` is the Cocos `cc.*`
 ```js
 __copse.snapshot()                 // slim: [{ ref, active?(only false), button?, interactable?, click?, label?, codeHandlers? }]
 __copse.snapshot({ relevant:true })  // only nodes with a testable surface (button|label|codeHandlers); {components:true} adds raw types
-__copse.interactive()              // buttons only, WITH reachable/blockedBy
+__copse.interactive()              // buttons only, WITH reachable/blockedBy + visible:false (opacity/scale hidden)
 __copse.press('Canvas/ShopBtn')    // run its clickEvents + emit CLICK → { ok, ref, fired }
 __copse.press('Canvas/BuyBtn', { force: true })   // ignore interactable
 __copse.get('Canvas/Score:Label.string')          // { ok, value }
 __copse.call('Canvas/Mgr:ShopController.buy', 30)  // invoke any method → { ok, value }
-__copse.reachable('Canvas/ShopBtn')               // { ok, reachable, blockedBy } — covered by an overlay/BlockInputEvents?
+__copse.reachable('Canvas/ShopBtn')               // { ok, reachable, blockedBy, visible } — covered (z-order/BlockInputEvents)? + opacity/scale visible
 __copse.node('Canvas/Panel')                      // node intrinsics → { active, activeInHierarchy, opacity, scale, worldPos, size }
 __copse.diff(before, after)                        // → { appeared, activated, deactivated (node descriptors), labelChanged, ... }
 __copse.listeners('Canvas/ShopBtn')               // user node.on() handlers (best-effort; see caveat)
+__copse.logs()                                     // captured console.* + uncaught errors → [{level,text,t,stack?}]
 __copse.hijack(); __copse.captured('Canvas/X')    // opt-in: record node.on() registrations made after install
 ```
 
@@ -109,14 +113,15 @@ structured `{ pass, rounds, snapshot }` (raw material to reshape in code) plus
 `summary` when you supply `agent.report`. The AI sees the node tree, not pixels,
 so its verdict is scoped to **logic/flow**, not visual/reachability. Real
 Playwright + Anthropic (`claude-opus-4-8`) wiring, the steering knobs, and the
-report shape are in [`examples/ai-driver.md`](examples/ai-driver.md);
-[`examples/ai-driver-demo.js`](examples/ai-driver-demo.js) is a runnable demo and
+report shape are in [`docs/AI-DRIVER.md`](docs/AI-DRIVER.md);
+[`scripts/ai-driver-demo.js`](scripts/ai-driver-demo.js) is a runnable demo and
 `localDriver()` builds an in-process driver for testing the loop without a browser.
 
 ## Run it on your game
 
 copse drives a **running** Cocos game (dev/preview, or a release build where `cc` is
-reachable). Three on-ramps:
+reachable). Four on-ramps below; the debugger edge is separate — see
+[**Beyond testing**](#beyond-testing--one-cdp-attach-another-lens).
 
 ### 1. CLI — quickest
 
@@ -128,7 +133,15 @@ npx copse scan <url>                                  # read-only: print buttons
 npx copse ai   <url> --goal "verify the buy flow clamps gold at 0" \
                [--stop "..."] [--report "..."] [--rounds 3] [--model sonnet] \
                [--verbose] [-o <folder>] [--headed] [--fps 30]
+
+# one-shot primitives — connect, run one op, print JSON, close (pipe to jq, use in shell scripts):
+npx copse get   <url> Canvas/Score:Label.string       # read a member  → {ok,value}
+npx copse press <url> Canvas/ShopBtn [--force]         # press a button → {ok,fired,changed?}
+npx copse call  <url> Canvas/Mgr:Shop.buy 30           # invoke a method (each arg JSON-parsed) → {ok,value,changed?}
+npx copse node  <url> Canvas/Panel                     # node intrinsics; copse reachable <url> <ref> for coverage
 ```
+
+(`copse --version` prints the version; `copse --help` lists everything.)
 
 **Watch it run:** add `--headed` for a visible browser window (default is headless), and
 `--fps 30` to raise the fps cap (default 10) so it's smooth. Headed uses the real GPU —
@@ -141,9 +154,35 @@ button-press animation. Or `--browser-url http://127.0.0.1:9222` to drive **your
 (needs it logged in); `scan` is one-shot discovery. `--verbose` prints untruncated step
 results; `-o <folder>` appends the run log to `<folder>/<cmd>.log`; the run ends with a
 `cost: $… | N claude -p calls` line (from each call's `total_cost_usd`). (Local dev:
-`node bin/copse.js …`.)
+`node src/cli.js …`.)
 
-### 2. Library — programmatic / CI
+### 2. MCP — drive the canvas from any agent
+
+`copse mcp` exposes the bridge as **MCP tools** (`connect`/`snapshot`/`press`/`get`/`call`/`diff`/
+`listeners`/…) over stdio, so **Claude Code**, a plain Anthropic tool-use loop, **browser-use**,
+Stagehand or Cursor becomes the brain while copse stays the eyes + hands into the canvas. The MCP
+tool names match the library 1:1 (including `connect`), so the two surfaces read the same:
+
+```bash
+claude mcp add copse -- npx copse mcp        # then: "Use copse: connect <url>, test the buy-feature window"
+```
+
+The default tool set is the 14 testing primitives. The CDP **debugger** tools are **hidden from the
+tool list by default** (dev-build-only — pausing trips anti-debug); start with `copse mcp --debug` to
+surface them (see [Beyond testing](#beyond-testing--one-cdp-attach-other-lenses)).
+
+The valuable part of copse is the bridge; the agent loop is replaceable — borrow a good one. (Existing
+browser agents can't help here on their own: a Cocos game is one opaque `<canvas>` to the DOM.) See
+[`docs/MCP.md`](docs/MCP.md).
+
+**Gated sites** (Cloudflare / login / freeze-on-DevTools): a fresh headless launch trips the bot gate.
+Instead, open the game in **your own** Chrome (`--remote-debugging-port=9222`), pass the gate by hand,
+then register a plain `copse mcp` and **attach** without navigating — the agent calls
+`connect({attach:true, browserURL:"http://127.0.0.1:9222", match:"<url-substr>"})` (CLI: `--attach --browser-url --match`). CDP attach opens no
+DevTools panel, so **anti-debug / devtools-detection stays dormant** — verified attaching to a
+Cloudflare-gated game opened by hand. (copse still only drives **Cocos** games.)
+
+### 3. Library — programmatic / CI
 
 The core is zero-dep; the browser + LLM edges are optional subpaths:
 
@@ -162,13 +201,27 @@ await cp.close();
 Both `cp` and `agent` are just adapters — swap `connect` for a Playwright driver, or
 `makeClaudeAgent` for an Anthropic-SDK / deterministic agent. For a **deterministic**
 (no-LLM) test, skip the agent and assert against `cp` directly (`cp.press`/`cp.get`/
-`cp.diff`/`cp.reachable`). See [`examples/ai-driver.md`](examples/ai-driver.md).
+`cp.diff`/`cp.reachable`). See [`docs/AI-DRIVER.md`](docs/AI-DRIVER.md).
 
-### 3. Manual — no install
+### 4. Manual — no install
 
 Paste `dist/copse.inject.js` (after `npm run build`) into the game's DevTools console
 and call `__copse.*` by hand — or inject via Playwright `addInitScript` / a dev-build
-hook. See [`examples/inject.md`](examples/inject.md).
+hook. See [`docs/INJECT.md`](docs/INJECT.md).
+
+## Beyond testing — one CDP attach, another lens
+
+Testing is copse's flagship use, but the way it gets there is **one CDP attach to a running Cocos
+game**. That same connection exposes one more CDP domain that's *independent of the logic core* (it
+doesn't need `cc`) — a handy adjacent tool, deliberately kept off the main testing path:
+
+### Breakpoints + call stack — CDP **Debugger**
+
+For your **own dev build**, `copse/debug` (and the MCP `--debug` tools) set breakpoints over the CDP
+Debugger domain: `break_in Canvas/Mgr:ShopController.buy` breaks a component method **by copse selector**
+(resolved to the function, so it works minified) — trigger it, then read the call stack + locals
+(`wait_pause`/`eval_frame`/`debug_step`). Pausing trips anti-debug, so this is dev-only, not for
+driving a protected live game. See [`docs/DEBUG.md`](docs/DEBUG.md).
 
 ## Develop
 
