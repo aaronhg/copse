@@ -1,3 +1,7 @@
 node_modules/
 .DS_Store
 dist/
+.mcp.json
+# harvested third-party game data + fetched bundles — NEVER commit (public repo; contains
+# operator/game/host identifiers + copyrighted assets). Covers harvest/, harvest-headed/, etc.
+harvest*/

@@ -11,17 +11,26 @@
 // We import the IN-PAGE pieces only (not the barrel) — `runHarness`/`localDriver`
 // run driver-side (Node/Playwright), so they have no business in the injected blob.
 import { snapshot, resolve, press, get, call } from '../core/index.js';
-import { cocosRuntime, install } from './runtime.js';
+import { cocosRuntime, install, findCC, startLogCapture } from './runtime.js';
 
-const copse = { snapshot, resolve, press, get, call, cocosRuntime, install };
+const copse = { snapshot, resolve, press, get, call, cocosRuntime, install, findCC, startLogCapture };
 
 const g = /** @type {any} */ (globalThis);
 
 // Always available for ad-hoc use / a manual `copse.install(myCc)`.
 g.copse = copse;
 
-/** The live engine — usually `window.cc` in a dev/preview build, once booted. */
-const findCc = () => (g.cc && g.cc.director ? g.cc : null);
+// NOTE: we do NOT auto-capture console here. Patching `console.*` makes it non-native and
+// trips anti-tamper `isNative` guards (a hardened game self-destructed when it caught our patched
+// console). The puppeteer driver captures console passively over CDP instead. If you're doing
+// a console-paste and want `__copse.logs()`, opt in explicitly: `copse.startLogCapture()`.
+
+/**
+ * The live engine — `window.cc` once booted, OR a same-origin nested (i)frame's `cc`
+ * (games are often iframed). Cross-origin frames can't be reached from here; for those,
+ * inject this bundle INTO that frame (addInitScript injects every frame automatically).
+ */
+const findCc = () => findCC(g);
 
 /** Install once `cc` is reachable. @returns {boolean} whether it installed. */
 function tryInstall() {

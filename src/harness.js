@@ -1,5 +1,5 @@
 // @ts-check
-import { snapshot as snap, press, get, call } from './core/index.js';
+import { snapshot as snap, press, get, call, reachable as coreReachable } from './core/index.js';
 // AI-driver harness — the autonomous test loop that sits ON TOP of copse's
 // primitives. Like the core (pure over a `Runtime`), this is pure over two
 // adapters, so the whole loop is testable in Node against fakes; the real
@@ -48,6 +48,7 @@ import { snapshot as snap, press, get, call } from './core/index.js';
  * @property {(ref:string,opts?:any)=>any} press
  * @property {(sel:string)=>any} get
  * @property {(sel:string,...args:any[])=>any} call
+ * @property {(sel:string)=>any} [reachable]   OPTIONAL: drives the harness's reachability hard-fail gate
  */
 
 /**
@@ -79,10 +80,21 @@ import { snapshot as snap, press, get, call } from './core/index.js';
  */
 
 /** Run one planned step against the driver, capturing throws (doesn't-crash is a signal we WANT). */
-async function execStep(driver, step) {
+async function execStep(driver, step, reachableGate) {
   try {
     switch (step.op) {
-      case 'press':       return await driver.press(step.ref, step.opts);
+      case 'press': {
+        // A button copse CAN press (it calls the handler directly) but a player CANNOT reach (covered by an
+        // overlay / off-screen) is a REAL fail, not a pass. Check before pressing; honor `force` (explicit
+        // override) and skip silently when the driver has no reachability (degrades to today's behavior).
+        let unreachable = null;
+        if (reachableGate && !(step.opts && step.opts.force) && typeof driver.reachable === 'function') {
+          try { const rr = await driver.reachable(step.ref); if (rr && rr.reachable === false) unreachable = rr.blockedBy || true; } catch { /* best-effort */ }
+        }
+        const r = await driver.press(step.ref, step.opts);
+        if (unreachable && r && typeof r === 'object') r.unreachable = unreachable; // surfaced to judge + hard-failed below
+        return r;
+      }
       case 'get':         return await driver.get(step.sel);
       case 'call':        return await driver.call(step.sel, ...(step.args || []));
       case 'snapshot':    return await driver.snapshot(step.opts);
@@ -104,10 +116,11 @@ async function execStep(driver, step) {
  * @param {any} [opts.context]     anything the agent needs + per-run guidance
  *        (e.g. `{ diff, goal, stopCondition, reportFormat }`) — passed verbatim to every stage.
  * @param {number} [opts.maxRounds]  hard cap on iterations (default 1)
- * @returns {Promise<{pass:boolean, rounds:Array<{round:number, rationale?:string, steps:Array<{step:Step, result:any}>, verdict:Verdict}>, snapshot:any, summary?:any}>}
+ * @param {boolean} [opts.reachableGate]  hard-fail a press to a covered/unreachable button (default true)
+ * @returns {Promise<{pass:boolean, rounds:Array<{round:number, rationale?:string, steps:Array<{step:Step, result:any}>, verdict:Verdict}>, snapshot:any, summary?:any, unreachable?:Array<{ref:string, blockedBy:any}>}>}
  */
 export async function runHarness(driver, agent, opts = {}) {
-  const { context = null, maxRounds = 1 } = opts;
+  const { context = null, maxRounds = 1, reachableGate = true } = opts;
   const rounds = [];
   let snapshot = await driver.snapshot();
 
@@ -115,7 +128,7 @@ export async function runHarness(driver, agent, opts = {}) {
     const plan = (await agent.plan({ context, snapshot, rounds, round })) || { steps: [] };
 
     const steps = [];
-    for (const step of plan.steps || []) steps.push({ step, result: await execStep(driver, step) });
+    for (const step of plan.steps || []) steps.push({ step, result: await execStep(driver, step, reachableGate) });
 
     const verdict = await agent.judge({ context, snapshot, plan, steps, rounds, round });
     rounds.push({ round, rationale: plan.rationale, steps, verdict });
@@ -130,14 +143,20 @@ export async function runHarness(driver, agent, opts = {}) {
   // judge "not complete yet". So this is only the FALLBACK — the report (which alone sees
   // every round / the whole goal) is the authoritative verdict when it provides one.
   const pass = rounds.length > 0 && rounds.every((r) => r.verdict && r.verdict.pass !== false);
-  const out = { pass, rounds, snapshot };
+  // A press that hit a covered/unreachable button is a HARD fail — a real player couldn't have done it, so
+  // the flow isn't actually exercisable. This overrides even a passing judge/report (it's a fact, not an
+  // opinion). The offending refs are surfaced so the report can explain it. Disable with reachableGate:false.
+  const unreachablePresses = rounds.flatMap((r) => (r.steps || []).filter((s) => s.result && s.result.unreachable).map((s) => ({ ref: s.step.ref, blockedBy: s.result.unreachable })));
+  const out = { pass: pass && unreachablePresses.length === 0, rounds, snapshot };
+  if (unreachablePresses.length) out.unreachable = unreachablePresses;
   // AI ④ (optional). Returning `{ pass, summary }` sets the OVERALL verdict + summary
   // (overrides the per-round AND); any other return value is treated as the summary.
   if (agent.report) {
-    const rep = await agent.report({ context, rounds, pass, snapshot });
+    const rep = await agent.report({ context, rounds, pass: out.pass, snapshot, unreachable: unreachablePresses });
     if (rep && typeof rep === 'object' && 'pass' in rep) { out.pass = rep.pass; out.summary = rep.summary; }
     else out.summary = rep;
   }
+  if (unreachablePresses.length) out.pass = false; // hard gate: not even the report can pass over an unreachable press
   return out;
 }
 
@@ -156,5 +175,6 @@ export function localDriver(root, rt) {
     press: (ref, opts) => press(root, rt, ref, opts),
     get: (sel) => get(root, rt, sel),
     call: (sel, ...args) => call(root, rt, sel, args),
+    reachable: (sel) => coreReachable(root, rt, sel), // degrades to {reason:'unsupported'} when rt has no reachable
   };
 }

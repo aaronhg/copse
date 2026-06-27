@@ -31,7 +31,7 @@ factory makes both ergonomic — see **Steering each stage** below.
 ## 1. The driver — copse over Playwright
 
 Each method is a `page.evaluate` against the injected `window.__copse` (build it
-with `npm run build`, inject per [`inject.md`](inject.md)). This is the only
+with `npm run build`, inject per [`inject.md`](INJECT.md)). This is the only
 "impure" half on the copse side — and it stays in your test project, not in the
 package.
 
@@ -316,7 +316,7 @@ So you get the report your way two ways: post-process the structured object in
 code, or set `reportFormat` and let `agent.report` write `summary` (free text,
 JSON, JUnit-ish — whatever your `report` method returns). A runnable example that
 sets all of goal / stopCondition / reportFormat is
-[`ai-driver-demo.js`](ai-driver-demo.js).
+[`ai-driver-demo.js`](../scripts/ai-driver-demo.js).
 
 ## How a plan is produced
 
@@ -365,7 +365,7 @@ driver over an in-process tree (same shape as the Playwright one). See
 the throwing-step capture, and the iteration-bound tests (deterministic, no LLM).
 
 For a runnable end-to-end demo with a **real** LLM but no browser/game, see
-[`ai-driver-demo.js`](ai-driver-demo.js): `localDriver` over a fake shop scene +
-the `claude -p` agent. `node examples/ai-driver-demo.js` prints the same `report`
+[`ai-driver-demo.js`](../scripts/ai-driver-demo.js): `localDriver` over a fake shop scene +
+the `claude -p` agent. `node scripts/ai-driver-demo.js` prints the same `report`
 shape a live run produces (plan → results → verdict). Needs the `claude` CLI
 logged in; swap `localDriver` → a Playwright driver to point it at a real game.

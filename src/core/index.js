@@ -27,8 +27,9 @@
  * @property {(b:any)=>{target?:string,component?:string,handler?:string,data?:any}[]} clickHandlers
  * @property {(b:any)=>number} fireClickHandlers         // run serialized clickEvents; returns count
  * @property {(n:any,b:any)=>void} emitClick             // emit CLICK for code-registered listeners
+ * @property {(n:any)=>boolean} [emitTouch]              // OPTIONAL: synthesize a tap (touch-start→end) for touch-wired buttons
  * @property {(n:any)=>{type:string,fn?:string,target?:string}[]} [codeHandlers]  // OPTIONAL: user node.on() listeners (engine-internal + Button's own filtered out)
- * @property {(n:any)=>{reachable:boolean,blockedBy?:string|null}} [reachable]     // OPTIONAL: can a player reach it, or is it covered (z-order / BlockInputEvents)?
+ * @property {(n:any)=>{reachable:boolean,blockedBy?:string|null,visible?:boolean}} [reachable]     // OPTIONAL: can a player reach it (z-order / BlockInputEvents)? + `visible` (opacity/scale!==0), a separate signal
  * @property {(n:any)=>object} [nodeInfo]  // OPTIONAL: node intrinsics (active/activeInHierarchy/opacity/scale/worldPos/size/onScreen)
  */
 
@@ -90,7 +91,7 @@ export function snapshot(root, rt, { onlyInteractive = false, includeInactive = 
       if (components) desc.components = rt.components(node).map((c) => c.type);
       if (btn) {
         desc.button = true; desc.interactable = rt.isInteractable(btn); desc.click = rt.clickHandlers(btn).map(slimClick);
-        if (reachability && rt.reachable) { const r = rt.reachable(node); desc.reachable = r.reachable; if (!r.reachable && r.blockedBy) desc.blockedBy = r.blockedBy; }
+        if (reachability && rt.reachable) { const r = rt.reachable(node); desc.reachable = r.reachable; if (!r.reachable && r.blockedBy) desc.blockedBy = r.blockedBy; if (r.visible === false) desc.visible = false; }
       }
       if (labelStr != null) desc.label = labelStr;
       if (hasCode) desc.codeHandlers = ch;
@@ -126,8 +127,11 @@ export function resolve(root, rt, path) {
 /**
  * "Press" a button WITHOUT pixels or input: run its serialized clickEvents (the
  * editor-wired handlers — what coir sees statically) AND emit CLICK (so code-
- * registered `node.on(CLICK, …)` listeners fire too). Honors `interactable`
- * unless `force`. Returns `{ok, ref, fired}` or `{ok:false, ref, reason}`.
+ * registered `node.on(CLICK, …)` listeners fire too). If nothing was serialized
+ * (`fired===0`) — typical of buttons wired via raw `touch-start/end` rather than
+ * `click` (e.g. many real-money slots) — synthesize a tap so they actuate too (`rt.emitTouch`,
+ * best-effort, engine-only). Honors `interactable` unless `force`. Returns
+ * `{ok, ref, fired, touched?}` or `{ok:false, ref, reason}`.
  * NOTE this tests the handler LOGIC, not whether a player could reach the button
  * (z-order / overlap / on-screen are not checked — see README "What it can't test").
  * @param {any} root @param {Runtime} rt @param {string} path @param {{force?:boolean}} [opts]
@@ -140,7 +144,9 @@ export function press(root, rt, path, { force = false } = {}) {
   if (!force && !rt.isInteractable(btn)) return { ok: false, ref: path, reason: 'disabled' };
   const fired = rt.fireClickHandlers(btn);
   rt.emitClick(node, btn);
-  return { ok: true, ref: path, fired };
+  const res = { ok: true, ref: path, fired };
+  if (fired === 0 && typeof rt.emitTouch === 'function' && rt.emitTouch(node)) res.touched = true;
+  return res;
 }
 
 /**
@@ -156,7 +162,7 @@ export function reachable(root, rt, path) {
   if (!node) return { ok: false, ref: path, reason: 'not-found' };
   if (!rt.reachable) return { ok: false, ref: path, reason: 'unsupported' };
   const r = rt.reachable(node);
-  return { ok: true, ref: path, reachable: r.reachable, blockedBy: r.blockedBy ?? null };
+  return { ok: true, ref: path, reachable: r.reachable, blockedBy: r.blockedBy ?? null, visible: r.visible ?? true };
 }
 
 // "Canvas/Score:Label.string" → { path, comp, member }

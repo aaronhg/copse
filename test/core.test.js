@@ -109,6 +109,26 @@ test('press: clear errors for non-button / missing', () => {
   assert.equal(press(scene, rt, 'Canvas/Ghost').reason, 'not-found');
 });
 
+test('press: synthesizes a tap (emitTouch) only when no serialized clickEvents fired', () => {
+  const rt = fakeRuntime();
+  let touched = 0;
+  rt.emitTouch = () => { touched++; return true; };
+
+  // touch-wired button: empty clickEvents → fired:0 → falls back to emitTouch
+  const touchBtn = node('TouchBtn', [], [{ type: 'Button', interactable: true, clickEvents: [] }]);
+  const s1 = node('Scene', [node('Canvas', [touchBtn])]);
+  assert.deepEqual(press(s1, rt, 'Canvas/TouchBtn'), { ok: true, ref: 'Canvas/TouchBtn', fired: 0, touched: true });
+  assert.equal(touched, 1);
+
+  // click-wired button: clickEvents present → fired>0 → NO touch fallback
+  const clickBtn = node('ClickBtn', [], [{ type: 'Button', interactable: true, clickEvents: [{ fired: 0, fire() { this.fired++; } }] }]);
+  const s2 = node('Scene', [node('Canvas', [clickBtn])]);
+  const r2 = press(s2, rt, 'Canvas/ClickBtn');
+  assert.equal(r2.fired, 1);
+  assert.equal('touched' in r2, false);
+  assert.equal(touched, 1, 'emitTouch not called again');
+});
+
 test('get / call: read state, drive arbitrary methods', () => {
   const { scene, ctrl } = fixture();
   const rt = fakeRuntime();
@@ -189,7 +209,9 @@ test('reachable(): resolves + delegates to rt.reachable; clear reasons otherwise
   const { scene, shopBtn } = fixture();
   const rt = fakeRuntime();
   assert.equal(reachable(scene, rt, 'Canvas/ShopBtn').reason, 'unsupported'); // rt has no reachable
-  rt.reachable = (n) => ({ reachable: n !== shopBtn, blockedBy: n === shopBtn ? 'Canvas/Mask' : null });
-  assert.deepEqual(reachable(scene, rt, 'Canvas/ShopBtn'), { ok: true, ref: 'Canvas/ShopBtn', reachable: false, blockedBy: 'Canvas/Mask' });
+  rt.reachable = (n) => ({ reachable: n !== shopBtn, blockedBy: n === shopBtn ? 'Canvas/Mask' : null, visible: n !== shopBtn });
+  assert.deepEqual(reachable(scene, rt, 'Canvas/ShopBtn'), { ok: true, ref: 'Canvas/ShopBtn', reachable: false, blockedBy: 'Canvas/Mask', visible: false }); // visible (opacity/scale!==0) passes through, separate from reachable
+  rt.reachable = (n) => ({ reachable: true }); // a runtime that omits visible → defaults true
+  assert.deepEqual(reachable(scene, rt, 'Canvas/ShopBtn'), { ok: true, ref: 'Canvas/ShopBtn', reachable: true, blockedBy: null, visible: true });
   assert.equal(reachable(scene, rt, 'Canvas/Ghost').reason, 'not-found');
 });

@@ -45,7 +45,8 @@ src/cocos/          runtime.js (the cc.* adapter + install→window.__copse) + i
 src/harness.js      runHarness — the AI loop, pure over a Driver + Agent adapter
 src/drivers/        puppeteer.js — optional browser driver (peer dep)
 src/agents/         claude.js   — optional claude -p agent (no npm dep)
-bin/copse.js        the CLI
+src/mcp/            server.js + tools.js — optional MCP edge (copse as tools for any agent)
+src/cli.js          the CLI (ai / scan / mcp; no bin/ dir, matches coir)
 ```
 
 The `Runtime` contract is the whole engine surface copse needs (`name`/`children`/`isActive`/
@@ -169,8 +170,19 @@ if the top hit isn't the node (or an ancestor/descendant), it's **blocked** → 
 probe confirmed: `UITransform.hitTest` works with `worldToScreen` points; `cc.BlockInputEvents`
 exists; the draw-order heuristic resolves the real case. Result on web-mobile: `btn_open`
 `reachable:true` on Home, then `reachable:false, blockedBy:"Canvas/Popup/mask"` once a panel
-opened. Caveats kept honest: it's a geometric heuristic — no cross-camera/Layer z-order, no alpha
-hit areas → treat `reachable:false` as a strong signal to verify, not gospel.
+opened. Caveats kept honest: it's a geometric heuristic — treat `reachable:false` as a strong signal, not gospel.
+
+**Later upgraded (a multi-camera real slot forced it):** the draw-order key became `[camera priority,
+…sibling-index]` — `camOf(node)` picks the node's rendering camera (visibility-mask ∩ `node.layer`, top
+`priority`) and projects with *that* camera, not always `cams[0]`; so it resolves **cross-camera/Layer
+z-order**. A two-agent review then caught a wrong turn: an opacity filter I'd added to skip transparent
+blockers — but **input ignores opacity** (a transparent `BlockInputEvents` still swallows touches), so it
+was reverted. The lasting lesson: `reachable` answers "would a **touch** reach it", NOT "is it visible".
+A button covered by an opaque *sprite* (no input-consumer on top) is still `reachable:true` — that's
+pixels, outside the logic tree. So a **separate** `visible` signal (`opacity/scale===0` up the chain,
+exact-zero, never folded into the reachable boolean) was added for opacity/scale-hidden buttons; combine
+`reachable && visible`. Opaque-sprite visual occlusion remains out of reach (it needs render-order pixel
+analysis — pixels, not the logic tree).
 
 ---
 
@@ -188,7 +200,10 @@ Buttons don't always wire via serialized `clickEvents` — many register in code
 
 Probe finding (and a corrected assumption): on the slot, the `click:[]` buttons turned out to be
 **genuinely unwired** (only the Button's own touch listeners), not secretly code-registered.
-`press` already covers `on('click')` via the emitted CLICK; raw `on(TOUCH_*)` is the remaining gap.
+`press` covers `on('click')` via the emitted CLICK, and now also **synthesizes a `TOUCH_START`→`END`
+tap** (`rt.emitTouch`, called only when no serialized clickEvent fired) so touch-wired buttons — common
+in real-money slots — actuate too. `EventTouch` is resolved across shapes (`cc.EventTouch` /
+`cc.Event.EventTouch` / `cc.internal`) for minified builds; `press` returns `touched:true` when it took that path.
 
 ---
 
@@ -256,10 +271,12 @@ To make it a usable tool for outside users without polluting the zero-dep core:
 - **Optional subpaths**: `copse/driver-puppeteer` (`connect(url)` → a Driver; **peerDep** puppeteer-
   core, system Chrome) and `copse/agent-claude` (`makeClaudeAgent({goal,stopCondition,reportFormat})`
   → an Agent over the `claude -p` CLI, **no npm dep**).
-- **Thin CLI** `bin/copse.js`: `copse ai <url> --goal "…"` / `copse scan <url>`, plus `--verbose`
-  (untruncated step results) and `-o <folder>` (**append** the run log to `<folder>/<cmd>.log`).
-- `puppeteer-core` is a **peerDependency (optional)** + devDep; `prepublishOnly` builds the bundle;
-  `files` ships `src`/`bin`/`dist`.
+- **Thin CLI** `src/cli.js` (registered as `copse`; see §14a): `copse ai <url> --goal "…"` /
+  `copse scan <url>` / `copse mcp [url]`, plus `--verbose` and `-o <folder>` (**append** the run log).
+  Later grew **single-shot** verbs — `copse get|press|call|node|reachable <url> <sel>` (connect → one
+  primitive → JSON → close, for shell/jq), and `--version`.
+- `puppeteer-core` is a **peerDependency (optional)** + devDep; a `prepare` script builds the bundle;
+  `files` ships `src`/`dist`.
 
 `connect()` is the boot rig (launch system Chrome → inject → return a Driver); it waits for `cc` +
 a UI scene (some interactive buttons present) before returning, fps-capped (§7/§12).
@@ -269,10 +286,49 @@ a UI scene (some interactive buttons present) before returning, fps-capped (§7/
 ## 14. Directory Layout
 
 Reorganised by concern: the pure core under `src/core/` (file = `index.js`, not the redundant
-`core/core.js`); the engine layer under `src/cocos/`; optional edges under `src/drivers/` and
-`src/agents/`; `src/harness.js` and `src/index.js` (the public barrel) at the top; the CLI in `bin/`.
-Public import paths are unchanged (the `exports` map preserves `copse` / `copse/driver-puppeteer` /
-`copse/agent-claude`); only internal file locations moved.
+`core/core.js`); the engine layer under `src/cocos/`; optional edges under `src/drivers/`,
+`src/agents/` and `src/mcp/`; `src/harness.js`, `src/index.js` (the public barrel) and `src/cli.js`
+(the CLI) at the top. Public import paths are unchanged (the `exports` map preserves `copse` /
+`copse/driver-puppeteer` / `copse/agent-claude`); only internal file locations moved.
+
+## 14a. copse-MCP — the bridge as tools for any agent
+
+The realisation (validated by the comparison work) that **copse's value is the inject/bridge, not
+its harness**: the harness is a generic plan/judge loop; mature agent loops (browser-use, Stagehand,
+Claude Code) are smarter. But those are all **DOM/vision-based → blind to a Cocos `<canvas>`**. So the
+high-leverage move is to **decouple the bridge from the brain**: expose copse's surface as **MCP tools**
+and let any MCP client drive it. `copse mcp` then makes Claude Code itself (or browser-use, Stagehand, a
+plain tool-use loop) the harness — no need to grow copse's own loop.
+
+- **Hand-rolled, mirroring coir** (chosen over the official SDK to keep zero new deps): `src/mcp/server.js`
+  is JSON-RPC 2.0 over stdio (newline-delimited), `PROTOCOL_VERSION 2025-06-18`, all logging forced to
+  **stderr** (stdout is the protocol channel — puppeteer / the inject bundle / a chatty page must not
+  corrupt it), a **serialized** handler chain (two browser ops never overlap), and `createDispatcher(state)`
+  split out so the protocol is unit-testable without a browser. `src/mcp/tools.js` is the registry — the
+  **14 testing primitives** (`open`/`snapshot`/`interactive`/`press`/`get`/`call`/`reachable`/`node`/
+  `diff`/`listeners`/`hijack`/`captured`/`logs`/`close`) over a live `connect()` session in `state.cp`
+  (`press`/`call` carry the auto-`changed` delta straight through), plus **7 `debug:true`-tagged Debugger
+  tools** (`break_*`/`wait_pause`/`eval_frame`/`debug_step`/`clear_breakpoints`, §18) that are **hidden
+  from `tools/list` unless `copse mcp --debug`** (dev-build-only; pausing trips anti-debug). `connect` also
+  takes **`attach`/`match`** to drive an already-open tab (Cloudflare/login sites a human got past) — no
+  navigation, so the gate isn't re-triggered.
+- **Layout aligned to coir at the same time**: no `bin/` dir — the CLI moved to `src/cli.js` (`bin:
+  {"copse":"src/cli.js"}`), MCP is the `copse mcp [url]` subcommand (lazy `import('./mcp/server.js')`),
+  and the heavy/optional imports (puppeteer driver, claude agent) became **lazy per-command** so
+  `copse --help` / `copse mcp` don't require puppeteer-core. Only `dist/copse.inject.js` is ever built;
+  everything else (cli, mcp, core) runs as raw ESM.
+- **Tested** over a fake Driver (`test/mcp.test.js`): `initialize` / `tools/list` / `tools/call` dispatch,
+  arg mapping (`force`, `call` arg-spread, `snapshot` defaulting `relevant:true`), unknown-tool and
+  no-session errors, `close` teardown, notification = no-reply.
+- **Verified end-to-end driving a live slot game natively from Claude Code** (registered via a project
+  `.mcp.json`): Claude called `open` → `press` (dismiss start page, `changed.disappeared`) → `interactive`
+  (**saw the BUY FEATURE toggle was still `interactable:false`, waited until it enabled** — the adaptive
+  move a blind script can't make) → `press` boost (panel open, `changed.appeared` = title/costs/close) →
+  `press` close (`changed.disappeared`) → `close`. The payoff of the whole design: **Claude itself is the
+  harness, copse the eyes+hands, no browser-use.** See `docs/MCP.md`.
+- **Pitfall (config write-back race)**: adding the server to `~/.claude.json` via `claude mcp add` while a
+  session was running got clobbered when that session wrote its in-memory config on exit. Fix: a project
+  `.mcp.json` (read fresh at startup, not rewritten by the session) — robust across restarts.
 
 ---
 
@@ -335,23 +391,44 @@ around again. Forcing one round was the mistake.
 
 ---
 
-## 18. Validation Methodology (throughout)
+## 18. CDP Beyond Runtime — the Debugger Edge
 
-- **Headless core tests** (`node:test`, zero deps): 21 cases over fake trees — addressing/`[i]`,
-  press (fire + emit + disabled/force), get/call, the `Node` pseudo-component, slim shape + `relevant`,
-  `reachable`/`node`/`diff` plumbing over fakes, the harness loop (plan/execute/judge, throwing-step
-  capture, iteration bound, the `report` stage), and the claude-agent factory shape (no LLM call).
+The core uses one CDP domain — **Runtime** (`Runtime.evaluate` to inject + walk
+`cc.director.getScene()`). The realisation: the *same* CDP connection can drive other domains for
+adjacent jobs that never touch `cc`. copse keeps one such edge:
+
+- **Debugger** → `src/debug.js`: breakpoints + call stack. `breakIn('path:Comp.method')` resolves the
+  method via `window.__copse` (the live component) → breaks on call, so it **works on minified builds**
+  (never matches source text). iframe-aware (page + iframe/OOPIF targets). Exposed as MCP tools
+  `break_*`/`wait_pause`/`eval_frame`/`debug_step`, **hidden unless `copse mcp --debug`** (pausing trips
+  anti-debug → dev-build-only).
+
+A **"how loud is each domain" ordering** holds: a passive **Network** read is quietest (below JS), **DOM**
+middling, **Runtime / Debugger loudest** — they change the page's own JS-runtime behaviour, which a
+hardened page can measure from the inside. copse needs Runtime to read the scene, so it sits at the loud
+end. (The Network edge — a passive asset/RPC tap — was split out into the separate **mast** tool.)
+
+---
+
+## 19. Validation Methodology (throughout)
+
+- **Headless tests** (`node:test`, zero deps): **32 cases** over fakes — core (addressing/`[i]`, press
+  fire+emit+disabled/force **+ the touch fallback**, get/call, the `Node` pseudo-component, slim shape +
+  `relevant`, `reachable`/`node`/`diff` plumbing), the harness loop (plan/execute/judge, throwing-step
+  capture, the reachability hard-fail gate, iteration bound, the `report` stage), the MCP JSON-RPC
+  dispatcher (`createDispatcher`: tool dispatch, arg-mapping, debug-tool routing, error/teardown), and the
+  claude-agent factory shape (no LLM call).
 - **Probe-before-ship**: engine internals (`_eventProcessor` field names, `UITransform.hitTest` coord
   space, hijack timing) were verified on the real build with throwaway probes before being written into
   `runtime.js`.
 - **Real-game end-to-end**: snapshot/press/get/reachable/node/diff and the full AI loop run against a
-  web-mobile build and two remote slots; the mainfeature flow PASSes open+close.
+  web-mobile build and remote live games; the buy-feature flow PASSes open+close.
 - **Build / typecheck**: `npm run build` (esbuild), `npm run typecheck` (`tsc --noEmit`, JSDoc +
   `// @ts-check`; the browser-glue driver opts out — its `page.evaluate` callbacks are browser code).
 
 ---
 
-## 19. Conventions
+## 23. Conventions
 
 - **Zero runtime deps.** Engine-free pure core (`src/core/`); the `cc.*` coupling lives only in
   `src/cocos/`. The browser driver (`src/drivers/`, puppeteer-core) and LLM agent (`src/agents/`) are
@@ -364,11 +441,13 @@ around again. Forcing one round was the mistake.
 
 ---
 
-## 20. To Do
+## 24. To Do
 
-- Wire `reachable` into the harness judge (a covered button → a real fail, not a PASS).
-- Emit a synthetic touch for raw `on(TOUCH_*)` handlers (`press` currently only emits CLICK).
-- Better draw-order in `reachable` (cross-camera / Layer); optional alpha hit-testing.
+- Optional alpha hit-testing in `reachable` (cross-camera / Layer draw-order is done; opaque-sprite
+  visual occlusion stays out of scope — that's pixels, not the logic tree).
 - Adaptive re-planning within a round (so result-dependent steps don't always need another round).
 - A deterministic `node:test` harness example (assert against `cp` directly) for CI.
 - State reset between rounds (reload / close panels) for clean multi-round toggles.
+
+(Done since the initial plan: synthetic `TOUCH_*` tap (§9); the CDP Debugger edge (§18); the
+reachability hard-fail gate in the harness. The Network/asset-foraging edge was split into **mast**.)

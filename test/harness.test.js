@@ -131,6 +131,29 @@ test('agent.report: {pass,summary} sets the overall verdict + summary; absent �
   assert.equal(r3.summary, 'just text');
 });
 
+test('a press to an UNREACHABLE button is a hard fail — overrides a passing judge AND report', async () => {
+  const { scene } = fixture();
+  const base = localDriver(scene, fakeRuntime());
+  // simulate a covered button: the driver's reachability says it's blocked by an overlay
+  const driver = { ...base, reachable: (ref) => ({ ok: true, ref, reachable: false, blockedBy: 'Canvas/Popup/mask' }) };
+  const agent = {
+    plan: () => ({ steps: [{ op: 'press', ref: 'Canvas/ShopBtn' }] }),
+    judge: () => ({ pass: true }),                         // the handler fired → judge is happy
+    report: () => ({ pass: true, summary: 'looks good' }), // report tries to pass too
+  };
+  const report = await runHarness(driver, agent);
+  assert.equal(report.pass, false, 'a player could not reach the button → hard fail, even over judge+report');
+  assert.deepEqual(report.unreachable, [{ ref: 'Canvas/ShopBtn', blockedBy: 'Canvas/Popup/mask' }]);
+  assert.equal(report.rounds[0].steps[0].result.unreachable, 'Canvas/Popup/mask', 'surfaced on the step result');
+
+  // force:true (an explicit override) bypasses the reachability gate
+  const r2 = await runHarness(driver, { plan: () => ({ steps: [{ op: 'press', ref: 'Canvas/ShopBtn', opts: { force: true } }] }), judge: () => ({ pass: true }) });
+  assert.equal(r2.pass, true, 'force:true overrides the reachability gate');
+  // reachableGate:false disables it entirely
+  const r3 = await runHarness(driver, agent, { reachableGate: false });
+  assert.equal(r3.pass, true, 'reachableGate:false disables the gate');
+});
+
 test('agent.next absent ⇒ exactly one round (default policy)', async () => {
   const { scene } = fixture();
   const driver = localDriver(scene, fakeRuntime());
