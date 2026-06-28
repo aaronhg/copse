@@ -54,7 +54,7 @@ test('tools registry: each tool has name/description/object inputSchema; core to
     assert.equal(typeof t.run, 'function');
   }
   const names = TOOLS.map((t) => t.name);
-  for (const n of ['connect', 'reload', 'snapshot', 'interactive', 'click_surface', 'resolve', 'press', 'get', 'call', 'reachable', 'node', 'logs', 'close',
+  for (const n of ['connect', 'reload', 'snapshot', 'interactive', 'click_surface', 'resolve', 'coverage', 'press', 'get', 'call', 'reachable', 'node', 'logs', 'close',
     'break_at', 'break_in', 'break_exceptions', 'wait_pause', 'eval_frame', 'debug_step', 'clear_breakpoints']) {
     assert.ok(names.includes(n), `missing tool ${n}`);
   }
@@ -93,6 +93,15 @@ test('tools/call dispatches to the Driver and wraps the result as MCP text conte
   // force:true → { force:true }; call spreads args; get passes the selector through
   await handle({ id: 5, method: 'tools/call', params: { name: 'press', arguments: { ref: 'X', force: true } } });
   assert.deepEqual(cp.calls.at(-1), ['press', 'X', { force: true }]);
+  // reachableGate:true → { reachableGate:true } reaches the driver (the harness's gate, now on the primitive)
+  await handle({ id: 5.5, method: 'tools/call', params: { name: 'press', arguments: { ref: 'X', reachableGate: true } } });
+  assert.deepEqual(cp.calls.at(-1), ['press', 'X', { reachableGate: true }]);
+  // coverage: runs clickSurface on the live session + coverageJoin against coir's static rows → buckets
+  const cov = await handle({ id: 5.7, method: 'tools/call', params: { name: 'coverage', arguments: { staticRows: [{ nodePath: 'Canvas/Btn', method: 'onBuy' }] } } });
+  const buckets = JSON.parse(cov.result.content[0].text);
+  assert.deepEqual(Object.keys(buckets).sort(), ['ambiguous', 'blocked', 'codeOnly', 'codeRegistered', 'covered', 'uncertain', 'unreached']);
+  assert.equal(buckets.covered.length, 1); // exact (Canvas/Btn,onBuy) match, reachable:true → covered
+  assert.equal(buckets.covered[0].nodePath, 'Canvas/Btn');
   await handle({ id: 6, method: 'tools/call', params: { name: 'call', arguments: { sel: 'Canvas/Mgr:Ctrl.buy', args: [30] } } });
   assert.deepEqual(cp.calls.at(-1), ['call', 'Canvas/Mgr:Ctrl.buy', [30]]);
 

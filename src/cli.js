@@ -49,10 +49,11 @@ const USAGE = `copse — drive & assert a running Cocos game
 
   one-shot (connect → run one op → print JSON → close; pipe to jq):
   copse get   <url> <path:Comp.member>      read a member, e.g. Canvas/Score:Label.string
-  copse press <url> <ref> [--force]         press a button (runs its clickEvents + emits CLICK)
+  copse press <url> <ref> [--force] [--reachable-gate]  press a button (clickEvents + CLICK); --reachable-gate refuses a covered button
   copse call  <url> <path:Comp.method> [args…]  invoke a method (each arg JSON-parsed, else string)
   copse node  <url> <ref>                    node intrinsics (active/opacity/scale/worldPos/size)
   copse reachable <url> <ref>                best-effort: is the button covered by an overlay?
+  copse coverage <url> <coir-rows.json>      coir×copse join → coverage buckets (rows = coir's static ClickEvent JSON; file or inline)
 
   common:  --version|-V   print the copse version    (--verbose|-v is untruncated step results)
            -o|--output <folder>   append the run log to <folder>/<cmd>.log
@@ -139,13 +140,32 @@ if (cmd === 'mcp') {
   const { connect } = await import('./drivers/puppeteer.js');
   const cp = await connect(target, connectOpts);
   try {
-    const r = cmd === 'press' ? await cp.press(sel, has('--force') ? { force: true } : {})
+    const r = cmd === 'press' ? await cp.press(sel, { force: has('--force'), reachableGate: has('--reachable-gate') })
       : cmd === 'call' ? await cp.call(sel, ...callArgs)
         : cmd === 'get' ? await cp.get(sel)
           : cmd === 'node' ? await cp.node(sel)
             : await cp.reachable(sel);
     console.log(J(r));
     process.exitCode = (r && r.ok === false) ? 1 : 0; // ok:false → non-zero so scripts can branch
+  } finally { await cp.close(); }
+} else if (cmd === 'coverage') {
+  // The combined coir×copse capability at the shell: connect → clickSurface(live) → coverageJoin(coir's
+  // static rows) → the coverage buckets as JSON. <rows> is coir's ClickEvent JSON ([{nodePath, method}]) —
+  // a file path or inline; get it from coir's CLI/MCP. --no-reachable skips the reachable pass.
+  const target = url || connectOpts.match;
+  if (!target) { console.error(`coverage: a <url> (or --attach --match <substr>) is required\n\n${USAGE}`); process.exit(1); }
+  const positionals = rest.filter((a, i) => !/^-/.test(a) && !VAL_FLAGS.has(rest[i - 1]) && a !== url);
+  const src = positionals[0];
+  if (!src) { console.error(`coverage: a coir static-rows JSON (file path or inline) is required, e.g. copse coverage ${target} coir-rows.json\n\n${USAGE}`); process.exit(1); }
+  let raw = src; try { raw = readFileSync(src, 'utf8'); } catch { /* not a file → treat the arg as inline JSON */ }
+  let staticRows; try { staticRows = JSON.parse(raw); } catch (e) { console.error(`coverage: couldn't parse static rows from "${src}" — need a JSON file path or inline JSON array ([{nodePath, method}]): ${e.message}`); process.exit(1); }
+  if (!Array.isArray(staticRows)) { console.error('coverage: static rows must be a JSON ARRAY of {nodePath, method} (coir\'s ClickEvent edges)'); process.exit(1); }
+  const { coverageJoin } = await import('./coverage.js');
+  const { connect } = await import('./drivers/puppeteer.js');
+  const cp = await connect(target, connectOpts);
+  try {
+    const surface = await cp.clickSurface({ reachability: !has('--no-reachable') });
+    console.log(J(coverageJoin(staticRows, surface)));
   } finally { await cp.close(); }
 } else {
   console.error(`unknown command: ${cmd}\n\n` + USAGE); process.exit(1);

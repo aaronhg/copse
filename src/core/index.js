@@ -29,7 +29,7 @@
  * @property {(n:any,b:any)=>void} emitClick             // emit CLICK for code-registered listeners
  * @property {(n:any)=>boolean} [emitTouch]              // OPTIONAL: synthesize a tap (touch-start→end) for touch-wired buttons
  * @property {(n:any)=>{type:string,fn?:string,target?:string}[]} [codeHandlers]  // OPTIONAL: user node.on() listeners (engine-internal + Button's own filtered out)
- * @property {(n:any)=>{reachable:boolean|'unsure',blockedBy?:string|null,occludedBy?:string|null,visible?:boolean}} [reachable]     // OPTIONAL: can a TOUCH reach it (z-order / BlockInputEvents)? tri-state true|false|'unsure' (fail loud on can't-judge); `occludedBy` = an opaque sprite hiding it visually; `visible` (opacity/scale!==0) — all separate signals
+ * @property {(n:any)=>{reachable:boolean|'unsure',reachableFraction?:number,partial?:boolean,blockedBy?:string|null,occludedBy?:string|null,visible?:boolean,reason?:string,via?:{consumer:string,camera:string}}} [reachable]     // OPTIONAL: can a TOUCH reach it (z-order / BlockInputEvents)? tri-state true|false|'unsure' (fail loud on can't-judge). `reachableFraction`/`partial` = multi-point coverage; `blockedBy` = top covering consumer; `occludedBy` = an opaque sprite hiding it visually; `visible` (opacity/scale!==0); `via` = which detection tier resolved it (cross-version provenance) — all separate signals
  * @property {(n:any)=>object} [nodeInfo]  // OPTIONAL: node intrinsics (active/activeInHierarchy/opacity/scale/worldPos/size/onScreen)
  */
 
@@ -176,16 +176,25 @@ export function resolve(root, rt, path) {
  * `click` (e.g. some games) — synthesize a tap so they actuate too (`rt.emitTouch`,
  * best-effort, engine-only). Honors `interactable` unless `force`. Returns
  * `{ok, ref, fired, touched?}` or `{ok:false, ref, reason}`.
- * NOTE this tests the handler LOGIC, not whether a player could reach the button
- * (z-order / overlap / on-screen are not checked — see README "What it can't test").
- * @param {any} root @param {Runtime} rt @param {string} path @param {{force?:boolean}} [opts]
+ * NOTE this tests the handler LOGIC, not whether a player could reach the button. By default z-order /
+ * overlap / on-screen are NOT checked (see README "What it can't test"); pass `reachableGate:true` to refuse
+ * a press to a button that's a confident `reachable:false` (covered) — the same gate runHarness applies.
+ * @param {any} root @param {Runtime} rt @param {string} path @param {{force?:boolean, reachableGate?:boolean}} [opts]
  */
-export function press(root, rt, path, { force = false } = {}) {
+export function press(root, rt, path, { force = false, reachableGate = false } = {}) {
   const node = resolve(root, rt, path);
   if (!node) return { ok: false, ref: path, reason: 'not-found' };
   const btn = rt.asButton(node);
   if (!btn) return { ok: false, ref: path, reason: 'not-a-button' };
   if (!force && !rt.isInteractable(btn)) return { ok: false, ref: path, reason: 'disabled' };
+  // OPT-IN reachability gate — the same protection runHarness applies, now available on the bare primitive
+  // (so MCP/CLI `press` can refuse driving a button a player can't reach: covered / off-screen). OFF by
+  // default, because copse's whole point is to drive the handler LOGIC regardless of reachability (`force`
+  // also skips it). Gates only on a confident `reachable:false` (names blockedBy); 'unsure' is not a refusal.
+  if (reachableGate && !force && rt.reachable) {
+    const r = rt.reachable(node);
+    if (r.reachable === false) return { ok: false, ref: path, reason: 'unreachable', blockedBy: r.blockedBy ?? null };
+  }
   const fired = rt.fireClickHandlers(btn);
   const code = (rt.codeHandlers ? rt.codeHandlers(node) : null) || [];
   const droveClick = code.some((h) => h.type === 'click'); // a real user on('click') that emitClick will reach
@@ -215,7 +224,9 @@ export function press(root, rt, path, { force = false } = {}) {
  * (`press`) ≠ a player being able to reach the button; this asks whether the button is
  * actually on top at its own center, or covered by an overlay / BlockInputEvents / a
  * later-drawn panel. Engine-coupled via `rt.reachable`; the pure core just resolves and
- * delegates. Returns `{ok, ref, reachable, blockedBy}` (blockedBy = the covering node's ref).
+ * delegates. Returns `{ok, ref, reachable, reachableFraction?, partial?, blockedBy, occludedBy?,
+ * visible, reason?, via?}` — `via:{consumer,camera}` = which detection tier resolved it (cross-
+ * version provenance); `reason` names a can't-judge ('unsure'/false) cause.
  * @param {any} root @param {Runtime} rt @param {string} path
  */
 export function reachable(root, rt, path) {
@@ -224,7 +235,15 @@ export function reachable(root, rt, path) {
   if (!rt.reachable) return { ok: false, ref: path, reason: 'unsupported' };
   const r = rt.reachable(node);
   // reachable is tri-state: true | false | 'unsure' (can't judge → fail loud, not a confident pass).
-  return { ok: true, ref: path, reachable: r.reachable, blockedBy: r.blockedBy ?? null, visible: r.visible ?? true, ...(r.occludedBy ? { occludedBy: r.occludedBy } : {}) };
+  // Pass the full signal set through (fraction/partial/reason/via) so provenance is visible to callers.
+  return {
+    ok: true, ref: path, reachable: r.reachable, blockedBy: r.blockedBy ?? null, visible: r.visible ?? true,
+    ...(r.reachableFraction != null ? { reachableFraction: r.reachableFraction } : {}),
+    ...(r.partial ? { partial: true } : {}),
+    ...(r.occludedBy ? { occludedBy: r.occludedBy } : {}),
+    ...(r.reason ? { reason: r.reason } : {}),
+    ...(r.via ? { via: r.via } : {}),
+  };
 }
 
 // "Canvas/Score:Label.string" → { path, comp, member }
@@ -261,6 +280,9 @@ export function call(root, rt, sel, args = []) {
   if (!node) return { ok: false, ref: sel, reason: 'not-found' };
   const c = rt.getComponent(node, comp);
   if (!c) return { ok: false, ref: sel, reason: 'no-component' };
+  // A green {ok:true} must mean the method EXISTED and ran — not "value:undefined because it's missing/typo'd"
+  // (the old behaviour made a misspelled method indistinguishable from a real void method).
+  if (typeof rt.readProp(c, member) !== 'function') return { ok: false, ref: sel, reason: 'no-method' };
   return { ok: true, ref: sel, value: rt.callMethod(c, member, args) };
 }
 

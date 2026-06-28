@@ -61,35 +61,51 @@ coir's ClickEvent wiring shows up as edges of kind `script` whose location `prop
 The exact calls don't matter to the join — only that you end up with `(nodePath, method)` + the
 real class name. `scripts/coverage-demo.js` uses a fixture standing in for this assembled result.
 
-## The four quadrants
+## The buckets
 
 Join copse's `click_surface` against coir's static map on `(nodePath, method)`. The pure helper
 **`coverageJoin(staticRows, runtimeRows)`** (`copse/src/coverage.js`, exported from the barrel)
-does it — no engine, no deps — bucketing every wired button:
+does it — no engine, no deps — bucketing every wired button into **seven** buckets:
 
-| Quadrant | Condition | What it means / do next |
+| Bucket | Condition | What it means / do next |
 | --- | --- | --- |
-| ✅ **Covered** | in both, `reachable` & `interactable` | press it, assert the state delta. `via:'exact'` (scene-level) or `via:'prefix'` (prefab-internal, with the inferred `mount`) |
-| ⛔ **Blocked / dead wiring** | in both, but `reachable:false` / `interactable:false` | wired & live but a player can't reach it — verify it's intended |
-| 🧭 **Unreached surface** | coir only (not in the runtime rows) | statically wired but not live in this scene (panel closed / other scene) — navigate to it, re-snapshot |
-| ❓ **Ambiguous** | >1 runtime button suffix-matched a prefab-internal path | the fuzzy match found several candidates — resolve by hand (never silently guessed) |
-| 👻 **Code-only** | copse only (`method:null`, or no static match) | live but invisible to coir's static map (touch-/code-wired) — copse's `listeners`/`codeHandlers` is the lens |
+| ✅ **covered** | in both, `reachable` & `interactable` | press it, assert the state delta. `via:'exact'` (scene-level) or `via:'prefix'` (prefab-internal, with the inferred `mount`) |
+| ⛔ **blocked** | in both, but `reachable:false` / `interactable:false` | wired & live but a player can't reach it — verify it's intended |
+| ⚠️ **uncertain** | in both, but `reachable:'unsure'` or `occludedBy` set | copse can't confirm a player reaches/sees it — verify, NOT a confident covered |
+| 🧭 **unreached** | coir only (not in the runtime rows) | statically wired but not live in this scene (panel closed / other scene) — navigate to it, re-snapshot |
+| ❓ **ambiguous** | can't attribute 1:1 — `reason:'fan-out'` (one static row tail-matched >1 live row) or `reason:'fan-in'` (one live button claimed by >1 static row, e.g. same-named across scenes) | resolve by hand; never silently guessed OR double-counted |
+| 🧩 **codeRegistered** | copse only — `method:null` but has live `codeHandlers` | wired in code (`node.on`); registration alone ≠ an action, so NOT covered — `listeners` is the lens |
+| 👻 **codeOnly** | copse only — `method:null`, no detectable code handler | live but bare/unknown (touch-wired or possibly dead) |
 
-`coverageJoin` matches in two tiers: **exact** (`runtimeRef === nodePath`), then a **symmetric tail**
-match (the shorter path is a segment-suffix of the longer, `[i]` ignored) — which absorbs the two
-tools' different rootings: coir's path can be *longer* (it includes the scene/prefab-file root copse
-omits → reported as `dropped`) or *shorter* (a prefab instantiated under a scene parent adds a `mount`
-copse sees but coir can't know). See the caveat below.
+`coverageJoin` matches in two tiers: **exact** (`runtimeRef === nodePath`), then a **symmetric tail** match
+(the shorter path is a segment-suffix of the longer, `[i]` ignored) with a **min-overlap floor** — a lone
+generic leaf (`btn`/`close`) won't fuzzy-match an unrelated deep ref; only a tail ≥2 segments, or a full
+exact-length 1-segment alignment, passes. It absorbs the two tools' different rootings: coir's path can be
+*longer* (it includes the scene/prefab-file root copse omits → reported as `dropped`) or *shorter* (a prefab
+instantiated under a scene parent adds a `mount` copse sees but coir can't know). Bounded BOTH ways: >1 live
+row tail-matches one static row → `ambiguous` (`fan-out`); one live button claimed by >1 static row →
+`ambiguous` (`fan-in`, never a silent double-count). See the caveats below.
 
-## Run the demo
+## Run it
+
+**One call, live** — the whole join is a first-class entry (no barrel-wiring by hand):
 
 ```bash
-node scripts/coverage-demo.js     # zero deps, no browser, no CLI — proves the join end-to-end
+copse coverage <url> coir-rows.json     # connect → clickSurface(live) → coverageJoin → buckets JSON
 ```
 
-It builds a fake live scene (real copse `snapshot` + `clickSurface`) + a coir static fixture, joins
-them, and prints the four quadrants. For a live game, swap the fake scene for a `connect()` Driver
-(or the `click_surface` MCP tool) and feed coir's real edges — the join logic is identical.
+`coir-rows.json` is coir's static ClickEvent rows (`[{nodePath, method}]`, a file path or inline JSON — get
+it from coir's CLI/MCP). The MCP edge exposes the same op as the **`coverage`** tool (`{staticRows}` →
+buckets), so an MCP client runs the cross-reference in one step. `--no-reachable` skips the reachable pass.
+
+**Offline demo** (no browser/coir/deps — proves the join end-to-end):
+
+```bash
+node scripts/coverage-demo.js
+```
+
+It builds a fake live scene (real copse `snapshot` + `clickSurface`) + a coir static fixture, joins them,
+and prints the buckets — the same logic the `coverage` tool/CLI run against a real game.
 
 ## Caveats (be honest)
 
