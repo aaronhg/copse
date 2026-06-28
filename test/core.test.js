@@ -170,6 +170,32 @@ test('get / call: read state, drive arbitrary methods', () => {
   assert.equal(ctrl.comps[0].gold, 70);
 });
 
+test('call: a missing/typo\'d method is {ok:false, reason:no-method} — a green {ok:true} means it EXISTED + ran', () => {
+  const { scene } = fixture();
+  const rt = fakeRuntime();
+  assert.equal(call(scene, rt, 'Canvas/Mgr:ShopController.buy', [30]).ok, true);   // real method → ok:true
+  const miss = call(scene, rt, 'Canvas/Mgr:ShopController.byu', [30]);             // typo → not a silent undefined
+  assert.equal(miss.ok, false);
+  assert.equal(miss.reason, 'no-method');
+});
+
+test('press: reachableGate refuses a covered button (opt-in); OFF by default; force bypasses', () => {
+  const { scene, shopBtn, handler } = fixture();
+  const rt = fakeRuntime();
+  rt.reachable = (n) => (n === shopBtn ? { reachable: false, blockedBy: 'Canvas/Overlay' } : { reachable: true, blockedBy: null });
+  // default: NO gate → presses despite being covered (copse drives handler logic regardless of reach)
+  assert.equal(press(scene, rt, 'Canvas/ShopBtn').ok, true);
+  // reachableGate:true → refuses, names the blocker, does NOT fire the handler
+  const before = handler.fired;
+  const g = press(scene, rt, 'Canvas/ShopBtn', { reachableGate: true });
+  assert.equal(g.ok, false);
+  assert.equal(g.reason, 'unreachable');
+  assert.equal(g.blockedBy, 'Canvas/Overlay');
+  assert.equal(handler.fired, before, 'a gated press must not fire the handler');
+  // force bypasses the gate
+  assert.equal(press(scene, rt, 'Canvas/ShopBtn', { reachableGate: true, force: true }).ok, true);
+});
+
 test('member selector validation', () => {
   const { scene } = fixture();
   assert.throws(() => get(scene, fakeRuntime(), 'Canvas/Score'), /Comp\.member/);

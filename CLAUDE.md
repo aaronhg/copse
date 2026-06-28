@@ -45,7 +45,7 @@ npm run build      # esbuild src/cocos/inject.js → dist/copse.inject.js (one I
 ```
 
 Run it: `copse ai <url> --goal "…"` / `copse scan <url>` / `copse mcp [url]` / single-shot
-`copse get|press|call|node|reachable <url> <sel>`
+`copse get|press|call|node|reachable <url> <sel>` / `copse coverage <url> <coir-rows.json>` (the coir×copse join)
 (the CLI is `src/cli.js`, runs directly; only `dist/copse.inject.js` is ever built). MCP: `claude mcp add copse -- node <abs>/src/cli.js mcp`
 or a project `.mcp.json` — then any MCP client (Claude Code / browser-use) drives the canvas (see `docs/MCP.md`).
 
@@ -114,15 +114,16 @@ Layout (grouped by concern; `src/index.js` is the public barrel):
   MCP tools so ANY MCP client (Claude Code / browser-use / Stagehand / a plain tool-use loop) drives
   the canvas. `server.js` = hand-rolled JSON-RPC-over-stdio (mirrors coir's `mcp/server.js`: stderr-only
   logging, serialized handler, `createDispatcher(state)` exported for tests; gates debug-tagged tools
-  out of `tools/list` unless `state.debug`); `tools.js` = the tool registry — 16 testing primitives by
-  default (`connect`/`reload`/`snapshot`/`interactive`/`click_surface`/`press`/`get`/`call`/`reachable`/`node`/`diff`/
+  out of `tools/list` unless `state.debug`); `tools.js` = the tool registry — 18 testing primitives by
+  default (`connect`/`reload`/`snapshot`/`interactive`/`click_surface`/`resolve`/`coverage`/`press`/`get`/`call`/`reachable`/`node`/`diff`/
   `listeners`/`hijack`/`captured`/`logs`/`close`) + 7 `debug:true`-tagged Debugger tools (`break_*`/`wait_pause`/
   `eval_frame`/`debug_step`/`clear_breakpoints`) **hidden unless `copse mcp --debug`** — over a live
   `connect()` session (the MCP tool names match the library 1:1, incl. `connect`). The valuable part of copse is this bridge; the
   agent loop is replaceable.
 - `src/cli.js` — the **CLI** (registered as `copse`; runs directly, no build): `copse ai <url> --goal …`
   / `copse scan <url>` / `copse mcp [url] [--debug]` / single-shot `copse get|press|call|node|reachable
-  <url> <sel>` (connect → one primitive → JSON → close, for shell/jq) / `--version`.
+  <url> <sel>` (connect → one primitive → JSON → close, for shell/jq) / `copse coverage <url> <coir-rows.json>`
+  (connect → clickSurface + coverageJoin → buckets — the coir×copse capability at the shell) / `--version`.
   Thin wrapper over `connect` + `makeClaudeAgent` + `runHarness`;
   heavy/optional bits (puppeteer driver, claude agent, MCP server) are **lazy-imported** per command so
   `copse --help` / `copse mcp` don't require puppeteer-core. (Layout matches coir: no `bin/` dir.)
@@ -161,7 +162,7 @@ __copse.clickSurface()             // join-ready: one row per editor-wired click
 __copse.press('Canvas/ShopBtn')    // run clickEvents + emit CLICK → { ok, ref, fired }  (honors interactable; {force:true} to override)
 __copse.get('Canvas/Score:Label.string')          // { ok, value }  — for assertions
 __copse.call('Canvas/Mgr:ShopController.buy', 30)  // invoke ANY method on ANY component → { ok, value }
-__copse.reachable('Canvas/ShopBtn')               // { ok, reachable, blockedBy, visible } — covered (z-order/BlockInputEvents)? + visible=opacity/scale!==0
+__copse.reachable('Canvas/ShopBtn')  // { ok, reachable:true|false|'unsure', reachableFraction, partial?, blockedBy, occludedBy?, visible, reason?, via:{consumer,camera} } — centre-primary z-order; via = which detection tier resolved it
 __copse.node('Canvas/Panel')                      // node intrinsics → { active, activeInHierarchy, opacity, scale, worldPos, size }
 __copse.get('Canvas/Panel:Node.active')           // read a single node intrinsic via the `Node` pseudo-component
 __copse.diff(before, after)                       // → { appeared, disappeared, activated, deactivated (node descriptors w/ label/click), labelChanged }
@@ -185,15 +186,24 @@ component reference, `call` drives *any* method — a general "drive the logical
 assert state" harness, not just buttons.
 
 **Best-effort now (was the headline caveat) ⚠️**: **reachability** — calling the handler
-≠ a player reaching the button. `reachable(ref)` / `interactive()` flag a button that's
-covered by an overlay / `BlockInputEvents` / a later-drawn panel (`blockedBy`), via a *geometric
-heuristic*: hitTest at the button's center, draw-order = **[camera priority, …sibling-index]** so it
-DOES resolve cross-camera/Layer z-order. Still: no alpha hit-areas, and — key boundary — `reachable`
-answers "would a **touch** reach it" (input ignores opacity), so a button **visually** covered by an
-opaque sprite (no input-consumer on top) reads `reachable:true`. A separate **`visible`** field
-(`opacity/scale!==0`, on `interactable`/`reachable`) catches buttons hidden by an opacity/scale toggle —
-combine `reachable && visible` — but neither sees opaque-sprite visual occlusion (that's pixels, not the
-logic tree). Treat `reachable:false` as a strong signal to verify, not gospel.
+≠ a player reaching the button. `reachable(ref)` / `interactive()` flag a button covered by an
+overlay / `BlockInputEvents` / a later-drawn panel (`blockedBy`) by **replaying the engine's input
+z-order** over the live tree (Rung 2+3): the consumer set comes from a version-adaptive ladder (the
+engine's own `shouldHandleEventTouch` → a user touch/click listener → `Button`/`BlockInputEvents`, so a
+raw `node.on(TOUCH_*)` scrim now blocks too — not just `cc.Button`s), ordered by **[render-camera
+priority, …sibling-index]** (resolves cross-camera/Layer z-order), sampled at **multiple points** across
+the button's own rect — the **centre decides** (tappable point): centre free → `reachable:true` (a covered
+corner only flags `partial:true` + a `reachableFraction`); centre covered → `reachable:false` (names
+`blockedBy`); centre miss → `'unsure'`. (Centre-primary, NOT all-points: a button packed among neighbours
+whose bbox corners overlap them isn't a false `'unsure'`.) `via:{consumer,camera}` records which tier
+resolved it (cross-version provenance); caps
+are **feature-probed, never version-branched**, and degrade to a public-API floor or fail **loud**
+(`'unsure'` + a `reason`). Still: no alpha hit-areas, no `preventSwallow`/event-penetration, single-frame;
+and — key boundary — `reachable` answers "would a **touch** reach it" (input ignores opacity), so a button
+**visually** covered by an opaque sprite (no input-consumer on top) reads `reachable:true`. A separate
+**`visible`** field (`opacity/scale!==0`) catches opacity/scale toggles, and **`occludedBy`** flags an
+opaque renderer drawn on top (best-effort, bbox, no pixels) — combine `reachable && visible`. Treat
+`reachable:false`/`'unsure'` as a strong signal to verify, not gospel.
 
 **Code-registered handlers ⚠️**: `codeHandlers`/`listeners` surface `node.on()` listeners
 (via `_eventProcessor`), but filtering only drops engine-internal events + cc.Button's own
@@ -240,9 +250,16 @@ Remaining:
 
 1. **Synthetic `TOUCH_*`** — `press` fires serialized clickEvents + emits CLICK, but not raw
    `on(TOUCH_*)` listeners; emit a synthetic touch for those.
-2. **Better z-order in `reachable`** — ✅ cross-camera / Layer ordering done (camera priority →
-   sibling-index) + `visible` (opacity/scale). Remaining: alpha hit-areas, and opaque-sprite visual
-   occlusion (a button covered by an opaque image with no input-consumer on top reads `reachable:true`).
+2. **Reachability `reachable`** — ✅ Rung 2+3: cross-camera/Layer z-order; **version-adaptive caps**
+   (feature-probe, never version-branch; `cc.UITransform`/`Camera` class-name-string fallback so a
+   tree-shaken minified build — where the global class is `undefined` — still resolves `getComponent`);
+   **engine-tier consumer** (`shouldHandleEventTouch`, ADDITIVE — catches a raw `node.on(TOUCH_*)` overlay a
+   class check misses, never excludes a Button); **authoritative render camera** (`getFirstRenderCamera`,
+   mapped back to its cc.Camera **component** because the raw render-camera's `worldToScreen` returns (0,0));
+   **centre-primary** multi-point sampling (`reachableFraction`/`partial`); provenance `via:{consumer,camera}`;
+   fail-loud `'unsure'`+`reason`; `visible` (opacity/scale). Remaining: alpha hit-areas, opaque-sprite visual
+   occlusion (`occludedBy` is bbox best-effort), and `preventSwallow`/event-penetration (decided in-handler →
+   statically unknowable).
 3. ✅ **Wire `reachable` into the harness** — a press to a covered/unreachable button is now a HARD fail in
    `runHarness` (overrides judge+report; surfaced as `out.unreachable`; `force`/`reachableGate:false` opt out).
 4. **MCP v2** — ✅ `diff`/`listeners`/`hijack`/`captured` tools added; debug tools gated behind `--debug`.

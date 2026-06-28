@@ -12,7 +12,7 @@
 // (server.js filters by this tag). They stay callable by name regardless, so tests/power-users
 // aren't blocked.
 
-import { resolveCoirPath } from '../coverage.js';
+import { resolveCoirPath, coverageJoin } from '../coverage.js';
 
 const needCp = (state) => {
   if (!state.cp) throw new Error('no open game — call the `connect` tool with a url first');
@@ -95,10 +95,16 @@ export const TOOLS = [
     run: async (state, a) => ({ data: resolveCoirPath(a.path, await needCp(state).snapshot({ includeInactive: true })) }),
   },
   {
+    name: 'coverage',
+    description: "THE coir×copse coverage join, as one call — cross-reference coir's STATIC ClickEvent map against copse's LIVE click surface and bucket every wired button. Pass coir's static rows as `staticRows` ([{nodePath, method, component?}], from coir's `click → method()` edges); copse runs clickSurface() on the connected scene and joins on (nodePath, method) with a symmetric tail match (absorbs coir's scene/prefab-file root + a prefab mount). Returns {covered, blocked, uncertain, unreached, ambiguous, codeRegistered, codeOnly}: covered = wired+live+reachable&interactable (press & assert a state delta); blocked = wired+live but reachable:false/disabled; uncertain = reachable:'unsure'/occluded (verify, NOT a confident pass); unreached = coir-only, not live in this scene (navigate there, re-snapshot); ambiguous = can't attribute 1:1 — `reason:'fan-out'` (one static row tail-matched >1 live button) or `reason:'fan-in'` (one live button claimed by >1 static row, e.g. same-named across scenes), resolve by hand, never silently double-counted; codeRegistered = live, method:null but has a code handler; codeOnly = live, no detectable handler. This is the combined coir+copse capability behind docs/COVERAGE.md, invokable directly. Get coir's rows from coir's MCP/CLI; reachability:false skips the reachable pass.",
+    inputSchema: { type: 'object', properties: { staticRows: { type: 'array', description: "coir's static ClickEvent rows: [{nodePath, method, component?}]", items: { type: 'object' } }, reachability: { type: 'boolean', description: 'compute reachable on the live surface (default true)' }, includeInactive: { type: 'boolean', description: 'also walk hidden subtrees when building the live surface' } }, required: ['staticRows'] },
+    run: async (state, a) => ({ data: coverageJoin(a.staticRows, await needCp(state).clickSurface({ reachability: a.reachability, includeInactive: a.includeInactive })) }),
+  },
+  {
     name: 'press',
-    description: "Press a button by ref — runs its wired clickEvents + emits CLICK (NOT a coordinate click). Returns {ok, fired, drove, wired?, changed?, errors?}; `drove` = what actuated: ['clickEvent'] (serialized) / ['click'] (a real on('click')) / ['touch'] (a synthetic tap, best-effort) / 'nothing' — so a press that did NOTHING isn't misread as a pass (the harness hard-fails drove:'nothing'); `wired:false` on the ambiguous cases flags a button with no visible handler. `changed` auto-reports what the action did once the tree settles (appeared/disappeared/activated/deactivated/labelChanged as node descriptors, so you can read a panel's contents straight from it). `errors` lists any console-error / uncaught pageerror the handler produced during the press — present even when the engine swallowed the throw and `fired` looks fine, so a crashing handler is NOT a silent pass (the harness hard-fails on it). Honors interactable unless force:true.",
-    inputSchema: { type: 'object', properties: { ref: { type: 'string', description: 'node ref, e.g. Canvas/Panel/CloseBtn' }, force: { type: 'boolean', description: 'press even if interactable:false' } }, required: ['ref'] },
-    run: async (state, a) => ({ data: await needCp(state).press(a.ref, a.force ? { force: true } : {}) }),
+    description: "Press a button by ref — runs its wired clickEvents + emits CLICK (NOT a coordinate click). Returns {ok, fired, drove, wired?, changed?, errors?}; `drove` = what actuated: ['clickEvent'] (serialized) / ['click'] (a real on('click')) / ['touch'] (a synthetic tap, best-effort) / 'nothing' — so a press that did NOTHING isn't misread as a pass (the harness hard-fails drove:'nothing'); `wired:false` on the ambiguous cases flags a button with no visible handler. `changed` auto-reports what the action did once the tree settles (appeared/disappeared/activated/deactivated/labelChanged as node descriptors, so you can read a panel's contents straight from it). `errors` lists any console-error / uncaught pageerror the handler produced during the press — present even when the engine swallowed the throw and `fired` looks fine, so a crashing handler is NOT a silent pass (the harness hard-fails on it). Honors interactable unless force:true. Set reachableGate:true to ALSO refuse a button a player can't reach (a confident reachable:false → {ok:false, reason:'unreachable', blockedBy}) — the same gate runHarness applies, off by default since press is for driving handler logic regardless of reach.",
+    inputSchema: { type: 'object', properties: { ref: { type: 'string', description: 'node ref, e.g. Canvas/Panel/CloseBtn' }, force: { type: 'boolean', description: 'press even if interactable:false' }, reachableGate: { type: 'boolean', description: 'refuse the press if the button is a confident reachable:false (covered/off-screen)' } }, required: ['ref'] },
+    run: async (state, a) => { const o = {}; if (a.force) o.force = true; if (a.reachableGate) o.reachableGate = true; return { data: await needCp(state).press(a.ref, o) }; },
   },
   {
     name: 'get',

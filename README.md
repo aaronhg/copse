@@ -82,7 +82,7 @@ __copse.press('Canvas/ShopBtn')    // run its clickEvents + emit CLICK → { ok,
 __copse.press('Canvas/BuyBtn', { force: true })   // ignore interactable
 __copse.get('Canvas/Score:Label.string')          // { ok, value }
 __copse.call('Canvas/Mgr:ShopController.buy', 30)  // invoke any method → { ok, value }
-__copse.reachable('Canvas/ShopBtn')               // { ok, reachable, blockedBy, visible } — covered (z-order/BlockInputEvents)? + opacity/scale visible
+__copse.reachable('Canvas/ShopBtn')  // { ok, reachable:true|false|'unsure', reachableFraction, partial?, blockedBy, occludedBy?, visible, via:{consumer,camera} } — centre-primary z-order
 __copse.node('Canvas/Panel')                      // node intrinsics → { active, activeInHierarchy, opacity, scale, worldPos, size }
 __copse.diff(before, after)                        // → { appeared, activated, deactivated (node descriptors), labelChanged, ... }
 __copse.listeners('Canvas/ShopBtn')               // user node.on() handlers (best-effort; see caveat)
@@ -138,9 +138,10 @@ npx copse ai   <url> --goal "verify the buy flow clamps gold at 0" \
 
 # one-shot primitives — connect, run one op, print JSON, close (pipe to jq, use in shell scripts):
 npx copse get   <url> Canvas/Score:Label.string       # read a member  → {ok,value}
-npx copse press <url> Canvas/ShopBtn [--force]         # press a button → {ok,fired,changed?}
-npx copse call  <url> Canvas/Mgr:Shop.buy 30           # invoke a method (each arg JSON-parsed) → {ok,value,changed?}
-npx copse node  <url> Canvas/Panel                     # node intrinsics; copse reachable <url> <ref> for coverage
+npx copse press <url> Canvas/ShopBtn [--force] [--reachable-gate]  # press a button → {ok,fired,changed?}; --reachable-gate refuses a covered one
+npx copse call  <url> Canvas/Mgr:Shop.buy 30           # invoke a method (arg JSON-parsed) → {ok,value,changed?}; missing method → {ok:false,reason:'no-method'}
+npx copse node  <url> Canvas/Panel                     # node intrinsics; copse reachable <url> <ref> for reachability
+npx copse coverage <url> coir-rows.json                # coir×copse join → coverage buckets (coir's static ClickEvent JSON: file or inline)
 ```
 
 (`copse --version` prints the version; `copse --help` lists everything.)

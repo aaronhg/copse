@@ -31,9 +31,10 @@ The default tool set is the 14 testing primitives below. The tool names match th
 | `connect(url, {headed?, fps?, browserURL?, attach?, match?})` | launch/attach Chrome, load the game, inject copse, wait until ready. **Call first.** (same op as the library's `connect()`) |
 | `snapshot({relevant?=true, includeInactive?, components?})` | slim live node tree |
 | `interactive()` | buttons + `reachable`/`blockedBy` |
-| `press(ref, {force?})` | fire the wired handler (NOT a coordinate click) → `{ok, fired, changed}` |
-| `get(sel)` / `call(sel, args)` | read a member / invoke any method |
+| `press(ref, {force?, reachableGate?})` | fire the wired handler (NOT a coordinate click) → `{ok, fired, changed}`; `reachableGate:true` refuses a covered (`reachable:false`) button — the same gate `runHarness` applies |
+| `get(sel)` / `call(sel, args)` | read a member / invoke any method (`call` on a missing method → `{ok:false, reason:'no-method'}`, not a silent `value:undefined`) |
 | `reachable(ref)` / `node(ref)` | best-effort reachability / node intrinsics |
+| `coverage(staticRows)` | join coir's static ClickEvent rows against the live click surface → buckets `{covered, blocked, uncertain, unreached, ambiguous, codeRegistered, codeOnly}` — the coir×copse capability in one call (see [`COVERAGE.md`](COVERAGE.md)) |
 | `diff(before, after)` | diff two snapshots → `appeared/disappeared/activated/deactivated/labelChanged` (for manual before→act→after comparisons; `press`/`call` already attach this as `changed`) |
 | `listeners(ref)` | user `node.on()` handlers `[{type, fn?, target?}]` (minified builds strip names) |
 | `hijack()` / `captured(ref)` | opt-in: record `node.on()` registrations made *after* `hijack`, then read them — mainly for wiring that happens on a later scene/panel load |

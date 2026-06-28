@@ -38,12 +38,12 @@ const visibleOf = (node, UIOpacity) => {
   }
   return true;
 };
-// node → draw-order key: [camera priority, …sibling indices from the scene root]; later/higher = on top.
-// Camera priority leads so a node on a higher-priority camera is on top regardless of sibling order.
-const orderKey = (node, root, cams) => {
+// node -> the sibling-index chain from the scene root (the draw-order key's TAIL). The HEAD is the
+// node's render-camera priority, prepended in reachable (so cross-camera/Layer z-order resolves).
+const siblingKey = (node, root) => {
   const chain = []; let n = node;
   while (n && n !== root) { chain.unshift(n); n = n.parent; }
-  let cur = root; const k = [cams ? (camOf(node, cams).priority || 0) : 0];
+  let cur = root; const k = [];
   for (const ch of chain) { k.push((cur.children || []).indexOf(ch)); cur = ch; }
   return k;
 };
@@ -80,6 +80,95 @@ export function cocosRuntime(cc) {
   const BTN = Button || 'cc.Button';
   const CLICK = Button?.EventType?.CLICK ?? 'click';
   const typeName = (c) => c?.constructor?.name || 'Unknown';
+
+  // ---- version-adaptive reachability primitives (Rung 2+3) -----------------------------------
+  // Cross-Cocos-version strategy: PROBE capabilities at runtime, never branch on a version string
+  // (protected/forked builds lie). Every signal degrades down a ladder to a public-API floor, and an
+  // unresolvable case fails LOUD ('unsure') instead of guessing. Caps are probed once, lazily, cached.
+  const batcher2d = () => { const r = cc.director && cc.director.root; return (r && (r.batcher2D || r._batcher)) || null; };
+  let _caps = null;
+  const caps = (sampleUT) => {
+    if (_caps) return _caps;
+    const b = batcher2d();
+    let hasCamPrio = false; try { hasCamPrio = !!sampleUT && typeof sampleUT.cameraPriority === 'number'; } catch { /* */ }
+    _caps = {
+      version: cc.ENGINE_VERSION || '?',
+      hasGetFirstRenderCamera: !!b && typeof b.getFirstRenderCamera === 'function',
+      hasCameraPriority: hasCamPrio,
+    };
+    return _caps;
+  };
+  // Does a node carry a USER pointer listener (a custom button's click / touch-* on()), not cc.Button's
+  // own? Same _eventProcessor walk + identity filter as codeHandlers — the listener-table consumer tier.
+  const hasPtrListener = (n) => {
+    const ep = n._eventProcessor; if (!ep) return false;
+    const btn = Button ? n.getComponent(Button) : null;
+    for (const key of ['capturingTarget', 'bubblingTarget', '_capturingTarget', '_bubblingTarget']) {
+      const inv = ep[key]; if (!inv) continue;
+      const table = inv._callbackTable || inv.callbackTable; if (!table) continue;
+      for (const type of Object.keys(table)) {
+        if (type !== 'click' && type.indexOf('touch-') !== 0) continue;
+        const infos = (table[type].callbackInfos || table[type]._callbackInfos) || [];
+        for (const ci of infos) if (ci && !(btn && ci.target === btn)) return true;
+      }
+    }
+    return false;
+  };
+  // Is `n` an input consumer, by which tier? Ladder, all feature-detected (most -> least authoritative):
+  //   engine   — NodeEventProcessor.shouldHandleEventTouch (3.4+) = the engine's own pointer-dispatch-list
+  //              membership, the exact criterion (catches a raw touch-listener overlay a class check misses)
+  //   listener — a user node.on('click'/'touch-*') (older engines, or when shouldHandleEventTouch is mangled)
+  //   class    — a cc.Button / cc.BlockInputEvents (the public-API floor)
+  const consumerTier = (n) => {
+    const ep = n._eventProcessor;
+    // ADDITIVE: shouldHandleEventTouch===true catches a raw touch-listener overlay the class check misses,
+    // but a `false` must NOT short-circuit — a cc.Button is a consumer even when the getter momentarily
+    // reads false (returning the raw value here wrongly EXCLUDED the action button on a live build).
+    if (ep && ep.shouldHandleEventTouch === true) return 'engine';
+    if (hasPtrListener(n)) return 'listener';
+    if (n.getComponent(BTN) || n.getComponent(BIE)) return 'class';
+    return null;
+  };
+  // node -> its render camera. Authoritative via batcher2D.getFirstRenderCamera (3.6+): a NULL result means
+  // the node isn't rendered -> not hittable (no cams[0] guess). Older engines fall back to the camOf heuristic.
+  // IMPORTANT: getFirstRenderCamera returns the low-level render-pipeline Camera, NOT the cc.Camera COMPONENT —
+  // and only the component's worldToScreen is correct (the raw one returned (0,0) on a live 3.x preview). So we
+  // map the returned scene-camera back to its owning component (`comp.camera === raw`) for projection; the raw
+  // result is used only for the authoritative rendered/not-rendered decision.
+  const renderCamOf = (n, cams) => {
+    const b = batcher2d();
+    if (b && typeof b.getFirstRenderCamera === 'function') {
+      let raw; try { raw = b.getFirstRenderCamera(n); } catch { raw = undefined; }
+      if (raw !== undefined) {
+        if (!raw) return { cam: null, authoritative: true }; // engine says it isn't rendered
+        const comp = cams.find((c) => c === raw || c.camera === raw || c._camera === raw);
+        return { cam: comp || camOf(n, cams), authoritative: true };
+      }
+    }
+    return { cam: camOf(n, cams), authoritative: false };
+  };
+  // node -> draw-order camera priority: authoritative UITransform.cameraPriority (3.6+) else camOf's.
+  const camPriorityOf = (n, cams, c) => {
+    if (c.hasCameraPriority) { try { const ut = n.getComponent(UIT); const p = ut && ut.cameraPriority; if (typeof p === 'number') return p; } catch { /* */ } }
+    const cam = camOf(n, cams); return (cam && cam.priority) || 0;
+  };
+  // World sample points across the node's rect: corners (inset, so they land INSIDE the rect, not on
+  // the exact boundary) + center, from `getBoundingBoxToWorld` — the same world-AABB projection the
+  // single-point check used (proven to hitTest on real builds), now scale/rotation-aware via the engine.
+  // Multi-point so a PARTIAL overlay (covers part of the button, maybe not the center) is detected, not
+  // collapsed to a boolean. (Caveat: getBoundingBoxToWorld is the node's own rect; a wildly-overflowing
+  // child can widen it — acceptable best-effort.)
+  const samplePoints = (n) => {
+    const ut = n.getComponent(UIT); if (!ut) return [];
+    let box; try { box = ut.getBoundingBoxToWorld(); } catch { return []; }
+    if (!box) return [];
+    const out = [];
+    for (const f of [[0.05, 0.05], [0.95, 0.05], [0.05, 0.95], [0.95, 0.95], [0.5, 0.5]]) {
+      out.push(new Vec3(box.x + f[0] * box.width, box.y + f[1] * box.height, 0));
+    }
+    return out;
+  };
+
   return {
     name: (n) => n.name,
     children: (n) => n.children || [],
@@ -174,50 +263,86 @@ export function cocosRuntime(cc) {
       return out;
     },
 
-    // Best-effort geometric reachability: is `n` the top-most input consumer at its own center, or
-    // covered by an overlay / BlockInputEvents / later-drawn panel? Draw-order = [camera priority,
-    // …sibling-index] so it resolves cross-camera/Layer z-order (#3). Three signals, kept separate:
-    //   • reachable: true | false | 'unsure' — would a TOUCH reach it. 'unsure' (NOT true) when we
-    //     genuinely can't judge (no UITransform / camera / projection) — fail LOUD on uncertainty, not
-    //     open; a consumer treats 'unsure' as "verify", not a confident pass.
-    //   • blockedBy — an INPUT consumer (Button/BlockInputEvents) drawn on top that swallows the touch.
-    //   • occludedBy — an opaque RENDERER drawn on top that hides the button VISUALLY (input ignores
-    //     opacity, so reachable can be true while a player can't see/tap it). Best-effort; no alpha hit-areas.
+    // Best-effort geometric reachability (Rung 2+3): replay the engine's input z-order over the live
+    // tree. Consumer set = consumerTier (engine shouldHandleEventTouch -> listener -> Button/BIE),
+    // ordered top-most first by [render-camera priority, …sibling-index]. Sample the button's OWN rect at
+    // multiple points; the CENTRE (the tappable point) DECIDES, the corners only inform the fraction. Signals:
+    //   • reachable: true | 'unsure' | false — would a TOUCH reach it. CENTRE self -> true (corners covered
+    //     -> still tappable, flagged partial); CENTRE blocked -> false (names blockedBy); CENTRE missed ->
+    //     'unsure' (no UITransform/camera/projection/hit, authoritative getFirstRenderCamera===null, or covered
+    //     by a non-consumer) — fail LOUD, never a confident pass. (Centre-primary, NOT frac===1, so a button
+    //     packed among neighbours whose bbox corners overlap them isn't a false 'partial'/'unsure'.)
+    //   • reachableFraction (0..1) + partial; blockedBy — the top INPUT consumer covering the centre / most corners.
+    //   • occludedBy — an opaque RENDERER drawn on top, hiding it VISUALLY (input ignores opacity, so
+    //     this never flips reachable). Best-effort, centre-point, no alpha hit-areas.
+    //   • via:{consumer,camera} — which detection tier resolved it (provenance for cross-version trust).
     reachable: (n) => {
       const visible = visibleOf(n, UIOpacity); // separate signal (opacity/scale === 0) — never affects `reachable`
       const root = cc.director.getScene();
-      const ui = n.getComponent(UIT); if (!ui) return { reachable: 'unsure', blockedBy: null, visible };
-      const box = ui.getBoundingBoxToWorld();
-      const cams = []; (function walk(x) { const c = x.getComponent && x.getComponent(Camera); if (c) cams.push(c); (x.children || []).forEach(walk); })(root);
-      if (!cams.length) return { reachable: 'unsure', blockedBy: null, visible };
-      let sp;
-      try { const o = new Vec3(); camOf(n, cams).worldToScreen(new Vec3(box.x + box.width / 2, box.y + box.height / 2, 0), o); sp = new Vec2(o.x, o.y); }
-      catch { return { reachable: 'unsure', blockedBy: null, visible }; }
-      const myKey = orderKey(n, root, cams);
-      let top = null, topKey = null;   // top-most INPUT consumer at center
-      let occ = null, occKey = null;   // top-most OPAQUE renderer drawn ABOVE the button (visual occluder)
+      const ui = n.getComponent(UIT); if (!ui) return { reachable: 'unsure', blockedBy: null, visible, reason: 'no-uitransform' };
+      const c = caps(ui);
+      const cams = []; (function walk(x) { const cam = x.getComponent && x.getComponent(Camera); if (cam) cams.push(cam); (x.children || []).forEach(walk); })(root);
+      if (!cams.length) return { reachable: 'unsure', blockedBy: null, visible, reason: 'no-camera' };
+      const rc = renderCamOf(n, cams);
+      const via = { consumer: consumerTier(n) || 'forced', camera: rc.authoritative ? 'render' : 'heuristic' };
+      // authoritative getFirstRenderCamera returned null → the engine wouldn't render/hit-test it → not reachable.
+      if (rc.authoritative && !rc.cam) return { reachable: false, blockedBy: null, visible, reason: 'no-render-camera', via };
+      const useCam = rc.cam || camOf(n, cams);
+      const drawKey = (x) => [camPriorityOf(x, cams, c), ...siblingKey(x, root)];
+      // INPUT consumers (+ the target itself, always), ordered top-most first by [cameraPriority, …sibling-index].
+      const cands = [];
       (function walk(x) {
-        const u = x.activeInHierarchy && x.getComponent && x.getComponent(UIT);
-        if (u) {
-          const consumer = x.getComponent(BTN) || x.getComponent(BIE);
-          const renderer = x.getComponent(UIR);
-          if (consumer || renderer) {
-            let hit = false; try { hit = u.hitTest(sp); } catch { /* coord-space mismatch */ }
-            if (hit && consumer) { const k = orderKey(x, root, cams); if (!top || cmpKey(k, topKey) > 0) { top = x; topKey = k; } }
-            // a visual occluder: a hit, opaque renderer above the button, from a different subtree
-            if (hit && renderer && x !== n && !isAncestor(n, x) && !isAncestor(x, n) && visibleOf(x, UIOpacity)) {
-              const k = orderKey(x, root, cams); if (cmpKey(k, myKey) > 0 && (!occ || cmpKey(k, occKey) > 0)) { occ = x; occKey = k; }
-            }
+        if (x.activeInHierarchy !== false) {
+          const u = x.getComponent && x.getComponent(UIT);
+          if (u && (x === n || consumerTier(x))) cands.push({ node: x, ut: u, key: drawKey(x) });
+        }
+        (x.children || []).forEach(walk);
+      })(root);
+      if (!cands.some((q) => q.node === n)) cands.push({ node: n, ut: ui, key: drawKey(n) });
+      cands.sort((a, b) => cmpKey(b.key, a.key)); // top-most first
+      // MULTI-POINT: over the button's own rect, what FRACTION of sample points have it (or anc/desc) on top?
+      // A single centre point can't see a partial overlay; sampling the corners+centre can.
+      // CENTRE-primary: the centre (sample index 4) is the tappable truth and DECIDES reachable; the corners
+      // only inform the fraction. (Multi-point-strict mis-fires 'partial' for a button packed among neighbours,
+      // whose bbox CORNERS overlap adjacent consumers — the centre is what a tap actually hits.)
+      const pts = samplePoints(n);
+      const screen = [];
+      let self = 0, blocked = 0; const blockers = {};
+      let centerState = 'miss', centerBlocker = null;
+      for (let i = 0; i < pts.length; i++) {
+        let sp = null; try { const o = new Vec3(); useCam.worldToScreen(pts[i], o); sp = new Vec2(o.x, o.y); } catch { /* projection failed */ }
+        screen.push(sp); if (!sp) continue;
+        let top = null;
+        for (const q of cands) { let hit = false; try { hit = q.ut.hitTest(sp); } catch { /* coord-space mismatch */ } if (hit) { top = q.node; break; } }
+        let state = 'miss';
+        if (top) { if (top === n || isAncestor(n, top) || isAncestor(top, n)) { state = 'self'; self++; } else { state = 'blocked'; blocked++; const ref = refOf(top, root); blockers[ref] = (blockers[ref] || 0) + 1; } }
+        if (i === 4) { centerState = state; if (state === 'blocked') centerBlocker = refOf(top, root); }
+      }
+      // occludedBy — best-effort VISUAL occlusion at the centre (an opaque renderer drawn ABOVE; input ignores
+      // opacity, so this is a SEPARATE signal that never flips `reachable`). No alpha hit-areas.
+      let occ = null, occKey = null; const myKey = drawKey(n); const cp = screen[4];
+      if (cp) (function walk(x) {
+        if (x.activeInHierarchy !== false) {
+          const u = x.getComponent && x.getComponent(UIT), r = x.getComponent && x.getComponent(UIR);
+          if (u && r && x !== n && !isAncestor(n, x) && !isAncestor(x, n) && visibleOf(x, UIOpacity)) {
+            let hit = false; try { hit = u.hitTest(cp); } catch { /* */ }
+            if (hit) { const k = drawKey(x); if (cmpKey(k, myKey) > 0 && (!occ || cmpKey(k, occKey) > 0)) { occ = x; occKey = k; } }
           }
         }
         (x.children || []).forEach(walk);
       })(root);
-      // Nothing — not even the button itself — hit its own center: a coord-space mismatch / zero-size / off-screen
-      // projection. That's "can't judge", NOT a confident false. So `reachable:false` ALWAYS names a blocker.
-      if (!top) return { reachable: 'unsure', blockedBy: null, visible };
-      const ok = top === n || isAncestor(n, top) || isAncestor(top, n);
-      const out = { reachable: ok, blockedBy: ok ? null : refOf(top, root), visible };
-      if (ok && occ) out.occludedBy = refOf(occ, root); // touch reaches but an opaque sprite hides it
+      // The CENTRE decides reachable: self → true (corners covered → still tappable at the centre, flagged
+      // `partial`); blocked → false (an overlay covers the tap point; names the blocker); missed → 'unsure'
+      // (coord-space mismatch / off-screen / covered by a non-consumer) — never a confident false. The corners
+      // only inform reachableFraction. fail-LOUD: 'unsure' is never coerced to a pass.
+      const considered = self + blocked;
+      const frac = considered ? self / considered : 0;
+      const reachable = /** @type {boolean|'unsure'} */ (centerState === 'self' ? true : centerState === 'blocked' ? false : 'unsure');
+      const out = { reachable, reachableFraction: Math.round(frac * 100) / 100, visible, via };
+      if (reachable === 'unsure' && considered === 0) out.reason = 'no-hit';
+      if (reachable === false) out.blockedBy = centerBlocker;
+      else if (reachable === true && frac < 1) { out.partial = true; out.blockedBy = Object.keys(blockers).sort((a, b) => blockers[b] - blockers[a])[0] || null; }
+      if (occ) out.occludedBy = refOf(occ, root); // touch may reach but an opaque sprite hides it
       return out;
     },
 

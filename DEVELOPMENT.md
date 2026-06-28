@@ -162,16 +162,28 @@ copse's headline caveat was "**calling a handler ≠ a player reaching the butto
 covered by an overlay / `BlockInputEvents` / a later-drawn panel **passes** here but fails for a
 real player. We turned this from "can't test" into "best-effort checkable".
 
-Mechanism (engine-coupled, `runtime.js`): the node's world-bbox centre → `camera.worldToScreen`
-→ a screen point; walk all active input-consumers (Button / `BlockInputEvents`), `UITransform.
-hitTest(point)`; resolve the **top-most** by a draw-order key (sibling-index path, lexicographic);
-if the top hit isn't the node (or an ancestor/descendant), it's **blocked** → report `blockedBy`.
+Mechanism (engine-coupled, `runtime.js`), now **Rung 2+3** — replay the engine's own input z-order:
+- **Consumer set** (`consumerTier`): the engine's `NodeEventProcessor.shouldHandleEventTouch` (the exact
+  pointer-dispatch-list membership — catches a raw `node.on(TOUCH_*)` overlay a class check misses) → a user
+  click/touch listener → `Button`/`BlockInputEvents`. **ADDITIVE**: a `false` from the engine getter must NOT
+  exclude a `cc.Button` (returning the raw getter value once wrongly dropped a live action button).
+- **Order** = `[render-camera priority, …sibling-index]` (resolves cross-camera/Layer). The render camera is
+  `batcher2D.getFirstRenderCamera(node)` — ⚠ that returns the low-level render-pipeline camera whose
+  `worldToScreen` yields **(0,0)**; map it back to its `cc.Camera` **component** (whose `worldToScreen` is
+  correct + is what `hitTest` inverts). `getFirstRenderCamera===null` ⇒ not rendered ⇒ not reachable (no `cams[0]` guess).
+- **Sampling**: the node's own rect at multiple points, but the **CENTRE decides** (centre free → reachable,
+  a covered corner only flags `partial`+`reachableFraction`; centre covered → blocked). Centre-primary, NOT
+  all-points — a button packed among neighbours whose bbox corners overlap them mustn't read a false `partial`.
+- **Caps**: feature-probed, never version-branched. ⚠ On a tree-shaken minified build the
+  `cc.UITransform`/`Camera` GLOBALS can be `undefined` → `getComponent(undefined)`→null → every node reads
+  "no UITransform" → all `'unsure'`. Fix: pass the registered class-NAME string (`cc.X || 'cc.X'`).
+- **fail-LOUD**: any can't-judge → `'unsure'`+`reason`, never a confident pass. `via:{consumer,camera}` records
+  which detection tier resolved it (cross-version trust).
 
-**We verified the engine internals on a real running build before shipping** — a separate throwaway
-probe confirmed: `UITransform.hitTest` works with `worldToScreen` points; `cc.BlockInputEvents`
-exists; the draw-order heuristic resolves the real case. Result on a dev/preview build: `btn_open`
-`reachable:true` on Home, then `reachable:false, blockedBy:"Canvas/Popup/mask"` once a panel
-opened. Caveats kept honest: it's a geometric heuristic — treat `reachable:false` as a strong signal, not gospel.
+Verified on a dev/preview build: `btn_open` `reachable:true` on Home, then `reachable:false,
+blockedBy:"…/mask"` once a panel opened. The geometry has no real-engine CI, so a fake-cc fixture
+(`test/reachable.test.js`) pins the ladder logic — but the camera-component and tree-shake gotchas above only
+surface on a **live minified build**. Treat `reachable:false`/`'unsure'` as a strong signal, not gospel.
 
 **Later upgraded (a multi-camera real slot forced it):** the draw-order key became `[camera priority,
 …sibling-index]` — `camOf(node)` picks the node's rendering camera (visibility-mask ∩ `node.layer`, top
