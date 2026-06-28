@@ -100,7 +100,9 @@ export async function connect(url, opts = {}) {
   // run it as a promise and (in attach mode) don't force-await it: if you're sitting in the debugger it
   // stalls, connect returns anyway, and this finishes later when you resume (the queued evaluates run →
   // __copse installs → `ready` resolves). See the pause auto-detect below.
-  const ready = (async () => {
+  // Find the cc frame → inject the bundle → install __copse → settle to a UI scene. Factored out so
+  // `cp.reload()` can re-run it after a navigation (a reload replaces the frames + wipes __copse).
+  const bootInPage = async () => {
     for (let i = 0, n = opts.bootTries ?? 40; i < n; i++) {
       let found = null;
       for (const f of page.frames()) { if (await hasCc(f)) { found = f; break; } }
@@ -115,7 +117,8 @@ export async function connect(url, opts = {}) {
       if (await rawEv(() => { try { return window.__copse.interactive().length > 0; } catch { return false; } })) break;
       await sleep(1000);
     }
-  })();
+  };
+  const ready = bootInPage();
 
   // Public evaluator: in-page calls wait for init, so a paused/deferred attach auto-unblocks them once
   // you resume. For launch + a live attach, `ready` is already settled → no extra delay.
@@ -162,19 +165,40 @@ export async function connect(url, opts = {}) {
   // result — so callers/agents get "what this did" without manual snapshot/diff steps.
   async function mutate(action) {
     const before = settleCfg ? await snapDiff() : null;
+    const errFrom = logs.length;          // mark the log buffer so we can attribute new errors to THIS action
     const r = await action();
     await settle();
     if (before && r && typeof r === 'object') {
       const c = coreDiff(before, await snapDiff());
       if (c.appeared.length || c.disappeared.length || c.activated.length || c.deactivated.length || c.labelChanged.length) r.changed = c;
     }
+    // doesn't-crash signal: any error console / uncaught pageerror during the action+settle window. Catches a
+    // handler that THREW even when the engine swallowed it to console.error — `press` still returns ok:true, but
+    // `errors` surfaces it (and the harness hard-fails on it). Captured out-of-band over CDP, so it's reliable.
+    if (r && typeof r === 'object') {
+      const errs = logs.slice(errFrom).filter((l) => l.level === 'error' || l.level === 'pageerror');
+      if (errs.length) r.errors = errs.map((l) => ({ level: l.level, text: l.text, ...(l.stack ? { stack: l.stack } : {}) }));
+    }
     return r;
   }
 
   /** @type {any} */
   const cp = {
+    // CDP reload: reload the attached tab (re-fetches the preview → picks up the editor's CURRENT
+    // scene) and re-inject copse. Use after opening a different scene in Cocos Creator, or to recover a
+    // wedged / empty / half-loaded preview (the case where attach found getScene()===null). Re-finds the
+    // cc frame post-navigation and re-installs __copse. Returns a readiness summary.
+    reload: async (o = {}) => {
+      await page.reload({ waitUntil: o.waitUntil || 'load' });
+      frame = page.mainFrame();   // the navigation replaced every frame; bootInPage re-finds the cc one
+      await bootInPage();
+      const snap = await ev(() => window.__copse.snapshot({ relevant: true }));
+      const inter = await ev(() => window.__copse.interactive());
+      return { ok: true, reloaded: true, url: page.url(), relevantNodes: snap.length, buttons: inter.length };
+    },
     snapshot: (o) => ev((o) => window.__copse.snapshot(o), o ?? {}),
     interactive: () => ev(() => window.__copse.interactive()),
+    clickSurface: (o) => ev((o) => window.__copse.clickSurface(o), o ?? {}), // join-ready (ref, method) rows for coir cross-reference
     press: (ref, o) => mutate(() => ev(([r, o]) => window.__copse.press(r, o), [ref, o ?? {}])),
     call: (sel, ...a) => mutate(() => ev(([s, a]) => window.__copse.call(s, ...a), [sel, a])),
     get: (sel) => ev((s) => window.__copse.get(s), sel),

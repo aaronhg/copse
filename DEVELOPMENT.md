@@ -131,16 +131,17 @@ npm dependency** (uses the local Claude Code login) and matches gstack's `skill-
 
 ---
 
-## 7. Driving Real Games
+## 7. Driving Games End-to-End
 
-The validation that mattered: drive **real** games via system Chrome (puppeteer-core over CDP,
-kept as a throwaway driver outside the repo until §13 packaged it). Three games, escalating:
+The validation that mattered: drive a running game via system Chrome (puppeteer-core over CDP,
+kept as a throwaway driver outside the repo until §13 packaged it), on a dev/preview build where
+`cc` is reachable. Escalating checks:
 
-| Game | Finding |
-|---|---|
-| a web-mobile release build | `cc` **reachable on a release build** (`window.cc` present) — contradicting the documented "released builds tree-shake cc". Q'd 62 nodes; `press('…/btn_panel')` fired `PanelUI.show`. |
-| a remote slot | A real **`press → get` state round-trip through real handler logic**: `press(spin)` → balance `1,000,000 → 999,700` (−300 = the bet). Win-rollup timing nuance: the `wins` label updates at result time but the **balance credit lags** → assert on the result label, not balance. |
-| a second remote slot | The buy-feature saga (§17) — open/close verified end-to-end via the AI loop. |
+- **snapshot** — walked the live tree, `press('…/btn_panel')` fired the panel's `PanelUI.show`.
+- **`press → get` state round-trip** through real handler logic: an action mutated a component
+  field, read back off the component. Timing nuance: a directly-set value updates at action time
+  while a derived total lags → assert on the direct result, not the lagging total.
+- **panel open/close** — the open/close saga (§17), verified end-to-end via the AI loop.
 
 Two pitfalls surfaced here that shaped later design:
 
@@ -150,7 +151,7 @@ Two pitfalls surfaced here that shaped later design:
   Loader scene** (a paused director won't run scene transitions / tweens), so it became **fps-cap only**.
 - **Release builds minify component class names** (`constructor.name` → `e`/`n`/`t`), so the
   snapshot's raw `components` are noise — but **serialized ClickEvent handler names survive**
-  (`ShopUI.openShop`, `SlotUI.spin`), because they're serialized *data*,
+  (`ShopUI.openShop`, `MenuUI.toggle`), because they're serialized *data*,
   not class identifiers. `getComponent('Label')` and `@ccclass` names still resolve.
 
 ---
@@ -166,9 +167,9 @@ Mechanism (engine-coupled, `runtime.js`): the node's world-bbox centre → `came
 hitTest(point)`; resolve the **top-most** by a draw-order key (sibling-index path, lexicographic);
 if the top hit isn't the node (or an ancestor/descendant), it's **blocked** → report `blockedBy`.
 
-**We verified the engine internals on the real build before shipping** — a separate throwaway
+**We verified the engine internals on a real running build before shipping** — a separate throwaway
 probe confirmed: `UITransform.hitTest` works with `worldToScreen` points; `cc.BlockInputEvents`
-exists; the draw-order heuristic resolves the real case. Result on web-mobile: `btn_open`
+exists; the draw-order heuristic resolves the real case. Result on a dev/preview build: `btn_open`
 `reachable:true` on Home, then `reachable:false, blockedBy:"Canvas/Popup/mask"` once a panel
 opened. Caveats kept honest: it's a geometric heuristic — treat `reachable:false` as a strong signal, not gospel.
 
@@ -202,14 +203,14 @@ Probe finding (and a corrected assumption): on the slot, the `click:[]` buttons 
 **genuinely unwired** (only the Button's own touch listeners), not secretly code-registered.
 `press` covers `on('click')` via the emitted CLICK, and now also **synthesizes a `TOUCH_START`→`END`
 tap** (`rt.emitTouch`, called only when no serialized clickEvent fired) so touch-wired buttons — common
-in real-money slots — actuate too. `EventTouch` is resolved across shapes (`cc.EventTouch` /
+in some games — actuate too. `EventTouch` is resolved across shapes (`cc.EventTouch` /
 `cc.Event.EventTouch` / `cc.internal`) for minified builds; `press` returns `touched:true` when it took that path.
 
 ---
 
 ## 10. Node Intrinsics + `diff` — Panel Open/Close Detection
 
-"Press buyfeature → its window opens" is the UI **state-machine** dimension, which buttons+labels
+"Press a panel button → its window opens" is the UI **state-machine** dimension, which buttons+labels
 alone don't cover. Two additions:
 
 - **`node(ref)`** → node intrinsics `{active, activeInHierarchy, opacity, scale, worldPos, size}`
@@ -320,10 +321,10 @@ plain tool-use loop) the harness — no need to grow copse's own loop.
 - **Tested** over a fake Driver (`test/mcp.test.js`): `initialize` / `tools/list` / `tools/call` dispatch,
   arg mapping (`force`, `call` arg-spread, `snapshot` defaulting `relevant:true`), unknown-tool and
   no-session errors, `close` teardown, notification = no-reply.
-- **Verified end-to-end driving a live slot game natively from Claude Code** (registered via a project
+- **Verified end-to-end driving a running game natively from Claude Code** (registered via a project
   `.mcp.json`): Claude called `open` → `press` (dismiss start page, `changed.disappeared`) → `interactive`
-  (**saw the BUY FEATURE toggle was still `interactable:false`, waited until it enabled** — the adaptive
-  move a blind script can't make) → `press` boost (panel open, `changed.appeared` = title/costs/close) →
+  (**saw a toggle was still `interactable:false`, waited until it enabled** — the adaptive
+  move a blind script can't make) → `press` the toggle (panel open, `changed.appeared` = title/costs/close) →
   `press` close (`changed.disappeared`) → `close`. The payoff of the whole design: **Claude itself is the
   harness, copse the eyes+hands, no browser-use.** See `docs/MCP.md`.
 - **Pitfall (config write-back race)**: adding the server to `~/.claude.json` via `claude mcp add` while a
@@ -367,21 +368,21 @@ Compared to `canvas-ai-testing-plan.md`:
 
 ---
 
-## 17. Worked Example: The Buy-Feature Saga (the loop maturing)
+## 17. Worked Example: The Panel Open/Close Saga (the loop maturing)
 
-Testing "does the BUY FEATURE window open and close?" took four runs, each failing differently and
+Testing "does the panel window open and close?" took four runs, each failing differently and
 each pointing at a real improvement — a good record of why the pieces above exist:
 
 1. **sonnet, 1 round** — the AI pressed the toggle *and* redundantly called its handler ("for
    safety"); a toggle invoked twice = net no-op → false negative. Also the `next` stage **hallucinated**
    a fake success. (→ the toggle-once + "use real results" lessons; report stage stayed honest.)
 2. **opus, 1 round** — pressed once (OPEN verified via `changed.appeared`), but the close-button ref
-   was **mis-cased** (`BuyFeaturePanel` vs `buyFeaturePanel`) → not-found. (→ "copy refs verbatim" prompt.)
+   was **mis-cased** (`ShopPanel` vs `shopPanel`) → not-found. (→ "copy refs verbatim" prompt.)
 3. **opus, 1 round, descriptor-rich `changed` + verbatim prompt** — OPEN cleanly verified with
    contents read straight from `changed`; but the plan **never included a close step** — the close ref
    only exists *after* opening, which a single upfront plan can't reference.
-4. **opus, 2 rounds + stop** — **PASS.** Round 0 opens (`changed.appeared` = the `buyFeaturePanel`
-   subtree: title "BUY FEATURE", two options with costs) and leaves it open;
+4. **opus, 2 rounds + stop** — **PASS.** Round 0 opens (`changed.appeared` = the panel
+   subtree: a title, two options with costs) and leaves it open;
    round 1 re-observes, presses the now-visible close button verbatim, and `changed.disappeared`
    confirms CLOSE. No purchase, no hallucination.
 
@@ -421,8 +422,8 @@ end. (The Network edge — a passive asset/RPC tap — was split out into the se
 - **Probe-before-ship**: engine internals (`_eventProcessor` field names, `UITransform.hitTest` coord
   space, hijack timing) were verified on the real build with throwaway probes before being written into
   `runtime.js`.
-- **Real-game end-to-end**: snapshot/press/get/reachable/node/diff and the full AI loop run against a
-  web-mobile build and remote live games; the buy-feature flow PASSes open+close.
+- **End-to-end**: snapshot/press/get/reachable/node/diff and the full AI loop run against a running
+  game on a dev/preview build; the panel open/close flow PASSes.
 - **Build / typecheck**: `npm run build` (esbuild), `npm run typecheck` (`tsc --noEmit`, JSDoc +
   `// @ts-check`; the browser-glue driver opts out — its `page.evaluate` callbacks are browser code).
 
@@ -436,7 +437,7 @@ end. (The Network edge — a passive asset/RPC tap — was split out into the se
 - **Types** via JSDoc + `// @ts-check` (no `.ts`); `tsc --noEmit` with `allowJs`/`checkJs:false`/
   `strict:false` — same posture as coir.
 - **Selector grammar shared with coir** — `Parent/Child:Comp.prop` + `[i]`, so the two interoperate.
-- Reaching `cc`: build-setting dependent (verified on a web-mobile release build); if `window.cc` is
+- Reaching `cc`: build-setting dependent (verified on a dev/preview build); if `window.cc` is
   missing, try `System.import('cc')` and pass the module to `install(...)`.
 
 ---

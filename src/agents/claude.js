@@ -20,7 +20,7 @@ const SYS =
   'them; you usually do NOT need separate snapshot/diff steps. A toggle opens/closes with the SAME control: ' +
   'press once and read `changed`; do not press twice or also call its handler. ' +
   'CRITICAL: every ref/sel MUST be copied VERBATIM from a snapshot or a `changed` entry — never ' +
-  'retype, abbreviate, guess, or change the capitalisation of a path (e.g. buyFeaturePanel ≠ BuyFeaturePanel).';
+  'retype, abbreviate, guess, or change the capitalisation of a path (e.g. shopPanel ≠ ShopPanel).';
 
 const trim = (snap) => (snap || []).filter((d) => d.button || d.label || d.interactable)
   .map((d) => ({ ref: d.ref, button: d.button, interactable: d.interactable, reachable: d.reachable, label: d.label, click: d.click }));

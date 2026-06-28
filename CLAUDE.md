@@ -22,18 +22,18 @@ inspired by gstack's `/qa`); copse is the **runtime-pure-logic** route from it.
 
 ## Status
 
-**Working tool**, driven end-to-end against real games:
+**Working tool**, verified end-to-end on a **dev/preview build** (the editor-preview rig in
+`docs/runtime-verification/`):
 
-- **Live games**: verified on a web-mobile release build + remote slot games. snapshot /
-  `press → get` round-trips through real handler logic (a real spin deducting the bet:
-  balance `1,000,000 → 999,700`), reachability flagging a covered button, and panel
-  open/close via `changed`.
-- **AI-driver** (`copse ai`): multi-round flows on a live slot — buyfeature window
-  open+close, bet switching (`300 ↔ 400`), one-spin deduction — all PASS (report-driven verdict).
-- **MCP** (`copse mcp`): the bridge as MCP tools; verified driving a live slot **natively
-  from Claude Code** (open → dismiss → press boost → panel via `changed.appeared` → press
-  close → `changed.disappeared`), no browser-use, adaptive (waited for the toggle to enable).
-- **CI**: 48 `node:test` cases green, `npm run typecheck` clean, `npm run build` → a
+- **Live verification**: snapshot / `press → get` round-trips through real handler logic (a
+  state-delta mutation read back off a component), reachability flagging a covered button
+  (`blockedBy`), and panel open/close via `changed`.
+- **AI-driver** (`copse ai`): multi-round flows on a running game — panel open+close, a
+  setting toggle, a one-action state delta — all PASS (report-driven verdict).
+- **MCP** (`copse mcp`): the bridge as MCP tools; verified driving a running game **natively
+  from Claude Code** (open → dismiss → press → panel via `changed.appeared` → press
+  close → `changed.disappeared`), no browser-use, adaptive (waited for a toggle to enable).
+- **CI**: 67 `node:test` cases green, `npm run typecheck` clean, `npm run build` → a
   self-contained `dist/copse.inject.js` (one IIFE, auto-installs `window.__copse` once `cc` is live).
 
 ## Commands
@@ -67,11 +67,19 @@ Node against plain-object trees.
 
 Layout (grouped by concern; `src/index.js` is the public barrel):
 
-- `src/core/index.js` — **pure core**, engine-free. `snapshot` / `resolve` / `press` /
-  `get` / `call` / `reachable` / `node` / `diff`, all over a `Runtime` adapter (the
+- `src/core/index.js` — **pure core**, engine-free. `snapshot` / `clickSurface` / `resolve` /
+  `press` / `get` / `call` / `reachable` / `node` / `diff`, all over a `Runtime` adapter (the
   `@typedef` at the top is the whole contract). Addressing: `Parent/Child` paths relative
   to the scene root, `[i]` for same-name siblings, `path:Comp.member` (or `path:Node.prop`)
-  for a member. `#N` absolute indices are intentionally unsupported (no stable index).
+  for a member. `#N` absolute indices are intentionally unsupported (no stable index). The full
+  grammar copse implements (a subset of coir's) + divergences are in `docs/SELECTORS.md`, pinned
+  by `test/selectors.test.js`.
+- `src/coverage.js` — **pure** coir × copse bridge: `coverageJoin(staticRows, runtimeRows)` buckets
+  every wired button into covered / blocked / unreached / ambiguous / code-only on the shared key
+  `(nodePath, method)`. Two-tier match: exact + **symmetric tail** (shorter path is a segment-suffix of the
+  longer, `[i]` fuzzy) — absorbs the two rootings: coir's scene/prefab-file root (`dropped`) and a prefab's
+  instantiation `mount`; >1 tail candidate → ambiguous. `clickSurface` produces its copse side. Verified
+  live (the symmetric case is what a real scene needs — coir paths carry the scene-root prefix). See `docs/COVERAGE.md`.
 - `src/cocos/` — the **engine-coupled** layer (the only place that touches `cc.*`):
   - `runtime.js` — `cocosRuntime(cc)` implements the `Runtime` adapter (incl. optional
     `codeHandlers` via `_eventProcessor`, geometric `reachable` via `UITransform.hitTest` +
@@ -80,7 +88,7 @@ Layout (grouped by concern; `src/index.js` is the public barrel):
     `findCC()` (walk same-origin (i)frames → the game's `cc`), and `startLogCapture()` (patch
     `console.*` + error events into a buffer). `install(cc)` exposes `window.__copse`
     (`snapshot`/`interactive`/`press`/`get`/`call`/`reachable`/`node`/`diff`/`listeners`/`logs`/
-    `hijack`/`captured`). All verified on a live build.
+    `hijack`/`captured`). All verified on a dev/preview build.
   - `inject.js` — the **build entry** (not public API): re-exports the in-page surface on
     `globalThis.copse` + auto-installs `window.__copse` once `cc` boots. esbuild → `dist/copse.inject.js`.
 - `src/harness.js` — **pure AI-driver loop** (`runHarness`), decoupled like the core: over a
@@ -91,6 +99,8 @@ Layout (grouped by concern; `src/index.js` is the public barrel):
   passed verbatim to every stage. No engine/LLM dep — those live at the adapter edges below.
 - `src/drivers/puppeteer.js` — **optional** driver (`copse/driver-puppeteer`): `connect(url)`
   launches system Chrome (puppeteer-core peerDep), injects the bundle → a `Driver` for runHarness.
+  `cp.reload()` (factored `bootInPage`) re-navigates the tab + re-injects — picks up the editor's CURRENT
+  scene after `scene_open_scene`, and recovers a wedged/empty preview (attach-found-`getScene()===null`).
   Browser-glue, so deliberately not `@ts-check`ed.
 - `src/agents/claude.js` — **optional** agent (`copse/agent-claude`): `makeClaudeAgent({goal,
   stopCondition,reportFormat})` → an `Agent` backed by the `claude -p` CLI (no npm dep).
@@ -104,9 +114,9 @@ Layout (grouped by concern; `src/index.js` is the public barrel):
   MCP tools so ANY MCP client (Claude Code / browser-use / Stagehand / a plain tool-use loop) drives
   the canvas. `server.js` = hand-rolled JSON-RPC-over-stdio (mirrors coir's `mcp/server.js`: stderr-only
   logging, serialized handler, `createDispatcher(state)` exported for tests; gates debug-tagged tools
-  out of `tools/list` unless `state.debug`); `tools.js` = the tool registry — 14 testing primitives by
-  default (`connect`/`snapshot`/`interactive`/`press`/`get`/`call`/`reachable`/`node`/`diff`/`listeners`/
-  `hijack`/`captured`/`logs`/`close`) + 7 `debug:true`-tagged Debugger tools (`break_*`/`wait_pause`/
+  out of `tools/list` unless `state.debug`); `tools.js` = the tool registry — 16 testing primitives by
+  default (`connect`/`reload`/`snapshot`/`interactive`/`click_surface`/`press`/`get`/`call`/`reachable`/`node`/`diff`/
+  `listeners`/`hijack`/`captured`/`logs`/`close`) + 7 `debug:true`-tagged Debugger tools (`break_*`/`wait_pause`/
   `eval_frame`/`debug_step`/`clear_breakpoints`) **hidden unless `copse mcp --debug`** — over a live
   `connect()` session (the MCP tool names match the library 1:1, incl. `connect`). The valuable part of copse is this bridge; the
   agent loop is replaceable.
@@ -116,9 +126,18 @@ Layout (grouped by concern; `src/index.js` is the public barrel):
   Thin wrapper over `connect` + `makeClaudeAgent` + `runHarness`;
   heavy/optional bits (puppeteer driver, claude agent, MCP server) are **lazy-imported** per command so
   `copse --help` / `copse mcp` don't require puppeteer-core. (Layout matches coir: no `bin/` dir.)
-- `test/core.test.js` — `node:test` over a fake tree (the place to add core tests).
+- `test/core.test.js` — `node:test` over a fake tree (the place to add core tests; incl. `clickSurface`).
+- `test/selectors.test.js` — selector-grammar conformance: copse's `[i]`/member/divergence semantics +
+  an interop corpus (coir-emitted paths must resolve in copse). Pins the contract in `docs/SELECTORS.md`.
+- `test/coverage.test.js` — the `coverageJoin` buckets incl. the prefab-internal prefix match + ambiguity.
 - `test/harness.test.js` — the harness loop over a fake driver + deterministic agent.
 - `test/mcp.test.js` — the MCP JSON-RPC dispatcher (`createDispatcher`) over a fake driver.
+- `docs/COVERAGE.md` — the **coir × copse** join recipe: `clickSurface`/`click_surface` → `coverageJoin`
+  cross-references copse's runtime click surface with coir's static ClickEvent map on `(nodePath, method)`
+  → buckets (covered / blocked / unreached / ambiguous / code-only). Runnable proof: `scripts/coverage-demo.js`.
+- `docs/SELECTORS.md` — copse's selector grammar as a **subset of coir's** (canonical: coir/docs/EDITING.md §3):
+  the shared core, copse's divergences (no `#N`/component-`[i]`/array-`[i]`, always index-parses `[i]`,
+  minified comp names) + its `Node` pseudo-component. Pinned by `test/selectors.test.js`.
 - `docs/MCP.md` — drive copse from any MCP client (Claude Code / browser-use); incl. **attach** mode
   for Cloudflare/login sites (attach to your own browser over CDP, no navigation).
 - `docs/DEBUG.md` — `copse/debug` (CDP Debugger): breakpoints (incl. `break_in path:Comp.method`) +
@@ -129,12 +148,16 @@ Layout (grouped by concern; `src/index.js` is the public barrel):
 - `scripts/ai-driver-demo.js` — **runnable** end-to-end demo: `localDriver` over a fake
   shop scene + the `claude -p` agent. `node scripts/ai-driver-demo.js` runs the whole AI
   loop with no browser/game/npm-deps (needs the `claude` CLI). Throwaway-free smoke.
+- `scripts/coverage-demo.js` — **runnable** proof of the coir × copse join: real `snapshot`+`clickSurface`
+  over a fake scene + a coir static fixture → the four-quadrant coverage report. `node scripts/coverage-demo.js`,
+  zero deps, no browser, **no CLI** (unlike ai-driver-demo). See `docs/COVERAGE.md`.
 
 `window.__copse` API once installed:
 ```js
 __copse.snapshot()                 // slim: [{ ref, active?(only false), button?, interactable?, click?, label?, codeHandlers? }] — name=ref tail; components OFF by default
 __copse.snapshot({ relevant:true, components:true })  // relevant: only button|label|codeHandlers nodes (cuts noise); components: include raw type list
 __copse.interactive()              // snapshot filtered to buttons, WITH reachable/blockedBy + visible:false (reachability:true)
+__copse.clickSurface()             // join-ready: one row per editor-wired clickEvent [{ref, method, component?, interactable, reachable?...}] — key (ref,method) cross-refs coir's static map (docs/COVERAGE.md)
 __copse.press('Canvas/ShopBtn')    // run clickEvents + emit CLICK → { ok, ref, fired }  (honors interactable; {force:true} to override)
 __copse.get('Canvas/Score:Label.string')          // { ok, value }  — for assertions
 __copse.call('Canvas/Mgr:ShopController.buy', 30)  // invoke ANY method on ANY component → { ok, value }
@@ -146,11 +169,10 @@ __copse.listeners('Canvas/ShopBtn')               // user node.on() handlers (en
 __copse.logs(sinceTs?)                            // captured console.* + uncaught errors → [{level,text,t,stack?}] (started on inject load)
 __copse.hijack(); __copse.captured('Canvas/X')    // opt-in: patch Node.prototype.on, then read what registered since (post-install only)
 ```
-Panel open/close ("press buyfeature → its block opens") = snapshot `{includeInactive:true}`
+Panel open/close ("press a panel button → its block opens") = snapshot `{includeInactive:true}`
 → act → snapshot → `diff`: the panel's subtree shows up in `activated`/`appeared`. Verified
-on a live slot: pressing the menu toggle put 21 menu nodes in `diff.activated`.
-Verified against a live web-mobile build: `reachable` correctly flags a
-home button as `blockedBy:"Canvas/Popup/mask"` once a panel opens. Caveats below.
+on a dev/preview build: pressing a menu toggle put its menu subtree (21 nodes) in `diff.activated`,
+and `reachable` correctly flags a button as `blockedBy:"…/mask"` once a panel opens. Caveats below.
 
 ## Capability boundary (be honest in docs/replies)
 
@@ -196,9 +218,9 @@ or playtest QA.
   (`src/drivers/puppeteer.js` opts out — its `page.evaluate` callbacks are browser code.)
 - **Selector grammar is shared with coir** — keep `Parent/Child:Comp.prop` + `[i]`
   aligned so the two tools interoperate.
-- Reaching `cc`: **build-setting dependent**, not preview-only. Verified working on a real
-  **web-mobile release build** (`window.cc` was present). If `window.cc` is missing, try
-  `System.import('cc')` and pass the module to `install(...)`. **Iframed games**: the game's
+- Reaching `cc`: **build-setting dependent**. Verified on a **dev/preview build** (`window.cc`
+  was present); a release build may tree-shake `cc` away (see `docs/INJECT.md`). If `window.cc`
+  is missing, try `System.import('cc')` and pass the module to `install(...)`. **Iframed games**: the game's
   `cc` lives in the iframe's window — the inject bundle's `findCC()` walks **same-origin**
   (i)frames; the puppeteer driver scans `page.frames()` (handles **cross-origin** + nested too,
   per-frame `evaluate` isn't SOP-bound) and drives that frame. Note: release builds **minify component class
@@ -207,12 +229,12 @@ or playtest QA.
 
 ## Open next steps
 
-Done so far: build step → `dist/copse.inject.js`; real-game `press → get` incl. a **state-delta**
-mutation (a spin deducting the bet, balance `1,000,000 → 999,700`); code-registered handlers
+Done so far: build step → `dist/copse.inject.js`; `press → get` incl. a **state-delta**
+mutation (read back off a component); code-registered handlers
 (`codeHandlers`/`listeners`/`hijack`); AI-driver harness (`runHarness` + `copse ai`, report-driven
 verdict, evidence-fed `next`); best-effort reachability (`reachable`/`blockedBy`); slim snapshot +
 settle + descriptor-rich `changed`; **MCP** (`copse mcp`, hand-rolled stdio, verified driving a
-live slot natively from Claude Code).
+running game natively from Claude Code).
 
 Remaining:
 

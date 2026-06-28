@@ -342,8 +342,8 @@ Three inputs shape every plan (all reach the stage via `ctx`):
 | **GOAL** (in `ctx.context` or baked by the factory) | "test the buy clamp" / "explore the home UI, avoid spending" | what to achieve |
 | **snapshot** (the live tree) | `ref / button / interactable / label / click` per node | what's actually on screen *now* |
 
-So the model picks targets **from the current snapshot**. Worked example — a real
-web-mobile run, Round 0: the snapshot showed `…/btn_panel` with
+So the model picks targets **from the current snapshot**. Worked example — a
+dev/preview run, Round 0: the snapshot showed `…/btn_panel` with
 `click:[{component:"PanelUI", handler:"show"}]` and `…/coinLabel` with
 `label:"1000"`, so the plan chose `press btn_panel` (to open a panel) and
 `get …/coinLabel:Label.string` (to read state) — both inferred from the snapshot,
