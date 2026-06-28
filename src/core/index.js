@@ -29,7 +29,7 @@
  * @property {(n:any,b:any)=>void} emitClick             // emit CLICK for code-registered listeners
  * @property {(n:any)=>boolean} [emitTouch]              // OPTIONAL: synthesize a tap (touch-start→end) for touch-wired buttons
  * @property {(n:any)=>{type:string,fn?:string,target?:string}[]} [codeHandlers]  // OPTIONAL: user node.on() listeners (engine-internal + Button's own filtered out)
- * @property {(n:any)=>{reachable:boolean,blockedBy?:string|null,visible?:boolean}} [reachable]     // OPTIONAL: can a player reach it (z-order / BlockInputEvents)? + `visible` (opacity/scale!==0), a separate signal
+ * @property {(n:any)=>{reachable:boolean|'unsure',blockedBy?:string|null,occludedBy?:string|null,visible?:boolean}} [reachable]     // OPTIONAL: can a TOUCH reach it (z-order / BlockInputEvents)? tri-state true|false|'unsure' (fail loud on can't-judge); `occludedBy` = an opaque sprite hiding it visually; `visible` (opacity/scale!==0) — all separate signals
  * @property {(n:any)=>object} [nodeInfo]  // OPTIONAL: node intrinsics (active/activeInHierarchy/opacity/scale/worldPos/size/onScreen)
  */
 
@@ -91,7 +91,7 @@ export function snapshot(root, rt, { onlyInteractive = false, includeInactive = 
       if (components) desc.components = rt.components(node).map((c) => c.type);
       if (btn) {
         desc.button = true; desc.interactable = rt.isInteractable(btn); desc.click = rt.clickHandlers(btn).map(slimClick);
-        if (reachability && rt.reachable) { const r = rt.reachable(node); desc.reachable = r.reachable; if (!r.reachable && r.blockedBy) desc.blockedBy = r.blockedBy; if (r.visible === false) desc.visible = false; }
+        if (reachability && rt.reachable) { const r = rt.reachable(node); desc.reachable = r.reachable; if (r.reachable === false && r.blockedBy) desc.blockedBy = r.blockedBy; if (r.occludedBy) desc.occludedBy = r.occludedBy; if (r.visible === false) desc.visible = false; }
       }
       if (labelStr != null) desc.label = labelStr;
       if (hasCode) desc.codeHandlers = ch;
@@ -103,6 +103,50 @@ export function snapshot(root, rt, { onlyInteractive = false, includeInactive = 
   const top = rt.children(root);
   for (const ch of top) visit(ch, segOf(ch, top, rt));
   return out;
+}
+
+/**
+ * Flatten a snapshot into a join-ready "click surface": one row per editor-wired
+ * clickEvent, keyed by `(ref, method)`. This is the bridge to coir (copse's static
+ * sibling): coir emits the SAME key statically — its `loc.nodePath` plus the method
+ * inside its `click → method()` ClickEvent edge — so an agent can cross-reference
+ * what's *wired* (coir, every scene/prefab) against what's *live & pressable now*
+ * (copse, this scene). `method` is the serialized handler name, which survives
+ * minification (unlike `component`, the handler class — mangled to `t`/`e` on release
+ * builds, where coir is the one that still has the real name).
+ *
+ * Pass an `interactive()` result (or `snapshot({reachability:true})`) so each button's
+ * `reachable`/`blockedBy`/`visible` ride along — that's what turns the join into a
+ * verdict: wired+live+reachable = covered; wired+live+`reachable:false` = blocked/dead
+ * wiring; wired but absent from this surface = a statically-wired button not reachable
+ * in the current scene state (navigate to it). A button with NO serialized clickEvent
+ * (touch-wired / code-registered — outside coir's static ClickEvent surface) emits one
+ * row with `method:null`.
+ * @param {Array<any>} snap a snapshot()/interactive() result
+ * @returns {Array<{ref:string, method:string|null, component?:string, target?:string, data?:any, interactable?:boolean, reachable?:boolean, blockedBy?:string, visible?:boolean}>}
+ */
+export function clickSurface(snap) {
+  const rows = [];
+  for (const d of snap || []) {
+    if (!d || !d.button) continue;
+    const flags = {};                                       // runtime signals that ride along (omit-default, like snapshot)
+    if (d.interactable != null) flags.interactable = d.interactable;
+    if (d.reachable != null) flags.reachable = d.reachable;
+    if (d.blockedBy != null) flags.blockedBy = d.blockedBy;
+    if (d.occludedBy != null) flags.occludedBy = d.occludedBy;
+    if (d.visible != null) flags.visible = d.visible;
+    if (d.codeHandlers) flags.codeHandlers = d.codeHandlers; // node.on() listeners — lets the join call a method:null button "code-registered" (NOT covered)
+    const clicks = Array.isArray(d.click) ? d.click : [];
+    if (!clicks.length) { rows.push({ ref: d.ref, method: null, ...flags }); continue; } // touch-/code-wired button
+    for (const h of clicks) {
+      const row = { ref: d.ref, method: h.handler ?? null };
+      if (h.component) row.component = h.component;
+      if (h.target) row.target = h.target;
+      if (h.data != null && h.data !== '') row.data = h.data;
+      rows.push({ ...row, ...flags });
+    }
+  }
+  return rows;
 }
 
 /**
@@ -129,7 +173,7 @@ export function resolve(root, rt, path) {
  * editor-wired handlers — what coir sees statically) AND emit CLICK (so code-
  * registered `node.on(CLICK, …)` listeners fire too). If nothing was serialized
  * (`fired===0`) — typical of buttons wired via raw `touch-start/end` rather than
- * `click` (e.g. many real-money slots) — synthesize a tap so they actuate too (`rt.emitTouch`,
+ * `click` (e.g. some games) — synthesize a tap so they actuate too (`rt.emitTouch`,
  * best-effort, engine-only). Honors `interactable` unless `force`. Returns
  * `{ok, ref, fired, touched?}` or `{ok:false, ref, reason}`.
  * NOTE this tests the handler LOGIC, not whether a player could reach the button
@@ -143,9 +187,26 @@ export function press(root, rt, path, { force = false } = {}) {
   if (!btn) return { ok: false, ref: path, reason: 'not-a-button' };
   if (!force && !rt.isInteractable(btn)) return { ok: false, ref: path, reason: 'disabled' };
   const fired = rt.fireClickHandlers(btn);
+  const code = (rt.codeHandlers ? rt.codeHandlers(node) : null) || [];
+  const droveClick = code.some((h) => h.type === 'click'); // a real user on('click') that emitClick will reach
   rt.emitClick(node, btn);
   const res = { ok: true, ref: path, fired };
-  if (fired === 0 && typeof rt.emitTouch === 'function' && rt.emitTouch(node)) res.touched = true;
+  // Synthesize a tap ONLY when nothing else drove the button (no serialized clickEvent AND no code on('click')).
+  let touched = false;
+  if (fired === 0 && !droveClick && typeof rt.emitTouch === 'function') touched = !!rt.emitTouch(node);
+  if (touched) res.touched = true;
+  // `drove` = what the press actually actuated — so a press that drove NOTHING is never misread as a pass.
+  const drove = [];
+  if (fired > 0) drove.push('clickEvent');   // ran serialized clickEvents (solid)
+  if (droveClick) drove.push('click');       // emitClick reached a real on('click') listener
+  if (touched) drove.push('touch');          // dispatched a synthetic tap (best-effort — confirm via `changed`)
+  res.drove = drove.length ? drove : 'nothing';
+  // `wired` (only on the ambiguous cases): did the button have ANY handler at all (serialized clickEvent OR
+  // code-registered)? drove:'nothing' + wired:false = a button wired to NOTHING (dead — a real finding);
+  // drove:['touch'] + wired:false = a synthetic tap into a button with no visible handler (suspect, verify).
+  if (!drove.length || drove.includes('touch')) {
+    res.wired = ((rt.clickHandlers ? rt.clickHandlers(btn) : []).length > 0) || code.length > 0;
+  }
   return res;
 }
 
@@ -162,7 +223,8 @@ export function reachable(root, rt, path) {
   if (!node) return { ok: false, ref: path, reason: 'not-found' };
   if (!rt.reachable) return { ok: false, ref: path, reason: 'unsupported' };
   const r = rt.reachable(node);
-  return { ok: true, ref: path, reachable: r.reachable, blockedBy: r.blockedBy ?? null, visible: r.visible ?? true };
+  // reachable is tri-state: true | false | 'unsure' (can't judge → fail loud, not a confident pass).
+  return { ok: true, ref: path, reachable: r.reachable, blockedBy: r.blockedBy ?? null, visible: r.visible ?? true, ...(r.occludedBy ? { occludedBy: r.occludedBy } : {}) };
 }
 
 // "Canvas/Score:Label.string" → { path, comp, member }
@@ -218,7 +280,7 @@ export function node(root, rt, path) {
 
 /**
  * Diff two snapshots → what an action changed. The general way to judge UI
- * state-machine transitions ("press mainfeature → its block opens"): snapshot
+ * state-machine transitions ("press a panel button → its block opens"): snapshot
  * (ideally `{includeInactive:true}`), act, snapshot, diff.
  *  - appeared/disappeared/activated/deactivated: the node **descriptors** (each carries
  *    `ref` + `label`/`button`/`click`…), NOT bare refs — so opening a panel hands you its

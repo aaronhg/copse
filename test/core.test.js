@@ -1,7 +1,7 @@
 // copse pure core, tested in Node over a fake `cc`-shaped tree (no engine needed).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { snapshot, resolve, press, get, call, reachable, node as nodeInfo, diff } from '../src/core/index.js';
+import { snapshot, clickSurface, resolve, press, get, call, reachable, node as nodeInfo, diff } from '../src/core/index.js';
 
 // A plain-object node tree + a Runtime adapter over it (mirrors what runtime.js
 // does for real `cc.Node`s). Components are `{ type, ...props }`.
@@ -59,6 +59,36 @@ test('interactive(): only the buttons', () => {
   assert.deepEqual(refs, ['Canvas/BuyBtn', 'Canvas/ShopBtn']);
 });
 
+test('clickSurface: flattens a snapshot into join-ready (ref, method) rows', () => {
+  const snap = [
+    { ref: 'Canvas/ShopBtn', button: true, interactable: true, reachable: 'unsure', occludedBy: 'Canvas/Banner', click: [{ component: 't', handler: 'openShop', target: 'Mgr' }] },
+    { ref: 'Canvas/BuyBtn', button: true, interactable: false, reachable: false, blockedBy: 'Canvas/Popup/mask', click: [{ handler: 'buy' }, { handler: 'log' }] },
+    { ref: 'Canvas/TouchBtn', button: true, interactable: true, click: [], codeHandlers: [{ type: 'touch-start', fn: 'onTouchDown', target: 'BtnScaler' }] }, // touch-/code-wired
+    { ref: 'Canvas/Score', label: '0' },                                     // non-button → ignored
+  ];
+  const rows = clickSurface(snap);
+  // one row per clickEvent; (ref, method) is the join key; non-buttons dropped
+  assert.deepEqual(rows.map((r) => `${r.ref}:${r.method}`),
+    ['Canvas/ShopBtn:openShop', 'Canvas/BuyBtn:buy', 'Canvas/BuyBtn:log', 'Canvas/TouchBtn:null']);
+  assert.equal(rows[0].component, 't');          // minified at runtime — coir supplies the real class name
+  assert.equal(rows[0].interactable, true);
+  assert.equal(rows[0].reachable, 'unsure');     // tri-state rides along the join surface
+  assert.equal(rows[0].occludedBy, 'Canvas/Banner'); // visual occlusion surfaced on the join row
+  const touch = rows.find((r) => r.ref === 'Canvas/TouchBtn');
+  assert.equal(touch.method, null);              // no editor clickEvent
+  assert.equal(touch.codeHandlers[0].fn, 'onTouchDown'); // but its live node.on() listeners ride along → the join can call it code-registered
+  assert.equal(rows[1].reachable, false);        // wired + live but blocked → dead/blocked wiring
+  assert.equal(rows[1].blockedBy, 'Canvas/Popup/mask');
+});
+
+test('clickSurface: composes with a real snapshot (handler survives, ride-along flags kept)', () => {
+  const scene = node('Scene', [node('Canvas', [
+    node('ShopBtn', [], [{ type: 'Button', interactable: true, clickEvents: [{ handler: 'openShop', component: 'ShopController' }] }]),
+  ])]);
+  const rows = clickSurface(snapshot(scene, fakeRuntime(), { onlyInteractive: true }));
+  assert.deepEqual(rows, [{ ref: 'Canvas/ShopBtn', method: 'openShop', component: 'ShopController', interactable: true }]);
+});
+
 test('snapshot: slim shape — no name, active omitted when true, components opt-in; relevant filters noise', () => {
   const { scene } = fixture();
   const rt = fakeRuntime();
@@ -88,7 +118,7 @@ test('press: fires serialized handlers AND emits click; respects disabled unless
   const { scene, handler, buyHandler, shopBtn, buyBtn } = fixture();
   const rt = fakeRuntime();
   const r = press(scene, rt, 'Canvas/ShopBtn');
-  assert.deepEqual(r, { ok: true, ref: 'Canvas/ShopBtn', fired: 1 });
+  assert.deepEqual(r, { ok: true, ref: 'Canvas/ShopBtn', fired: 1, drove: ['clickEvent'] });
   assert.equal(handler.fired, 1);
   assert.equal(shopBtn.clicked, 1);                          // emitClick ran
 
@@ -117,7 +147,7 @@ test('press: synthesizes a tap (emitTouch) only when no serialized clickEvents f
   // touch-wired button: empty clickEvents → fired:0 → falls back to emitTouch
   const touchBtn = node('TouchBtn', [], [{ type: 'Button', interactable: true, clickEvents: [] }]);
   const s1 = node('Scene', [node('Canvas', [touchBtn])]);
-  assert.deepEqual(press(s1, rt, 'Canvas/TouchBtn'), { ok: true, ref: 'Canvas/TouchBtn', fired: 0, touched: true });
+  assert.deepEqual(press(s1, rt, 'Canvas/TouchBtn'), { ok: true, ref: 'Canvas/TouchBtn', fired: 0, touched: true, drove: ['touch'], wired: false });
   assert.equal(touched, 1);
 
   // click-wired button: clickEvents present → fired>0 → NO touch fallback
@@ -158,6 +188,21 @@ test('snapshot: optional codeHandlers + reachability attach only when the runtim
   // non-button node: no reachable field; node without code handlers: no codeHandlers field
   assert.equal('reachable' in map.get('Canvas/Score'), false);
   assert.equal('codeHandlers' in map.get('Canvas/Score'), false);
+});
+
+test('snapshot: reachable is TRI-STATE (unsure, not coerced to true) + occludedBy surfaces a visual occluder', () => {
+  const { scene, shopBtn, buyBtn } = fixture();
+  const rt = fakeRuntime();
+  rt.reachable = (n) => {
+    if (n === shopBtn) return { reachable: 'unsure', blockedBy: null };                                  // can't judge → NOT a confident pass
+    if (n === buyBtn) return { reachable: true, blockedBy: null, occludedBy: 'Canvas/Overlay/banner' };  // touch reaches but visually hidden
+    return { reachable: true, blockedBy: null };
+  };
+  const map = new Map(snapshot(scene, rt, { reachability: true }).map((d) => [d.ref, d]));
+  assert.equal(map.get('Canvas/ShopBtn').reachable, 'unsure');           // fail-loud on uncertainty, not fail-open to true
+  assert.equal('blockedBy' in map.get('Canvas/ShopBtn'), false);         // 'unsure' carries no blocker
+  assert.equal(map.get('Canvas/BuyBtn').reachable, true);
+  assert.equal(map.get('Canvas/BuyBtn').occludedBy, 'Canvas/Overlay/banner'); // visual occlusion, distinct from blockedBy
 });
 
 test('snapshot: reachability is opt-in (off by default even if rt.reachable exists)', () => {

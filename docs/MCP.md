@@ -74,8 +74,8 @@ claude mcp add copse -- npx copse mcp
 
 Then just ask Claude:
 
-> Use copse: `connect` https://your-game/ , then verify the BUY FEATURE window opens and closes —
-> press the boost toggle once (read `changed` for the panel), then press the panel's close button
+> Use copse: `connect` https://your-game/ , then verify a panel window opens and closes —
+> press the toggle once (read `changed` for the panel), then press the panel's close button
 > once (read `changed`). Don't buy or spend.
 
 Claude calls `mcp__copse__connect` → `snapshot` → `press` → reads `changed` → `press` close → done.

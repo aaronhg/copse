@@ -12,10 +12,10 @@ can query — and both speak the **same selector grammar** (`Parent/Child:Comp.p
 `[i]` to disambiguate same-name siblings).
 
 > Status: **working.** Pure core + Cocos adapter + AI-driver harness + CLI/library/**MCP**
-> entry, verified end-to-end against live builds (a web-mobile game and remote live games):
-> snapshot, `press → get` state round-trips (a real action deducting the amount), reachability,
-> panel open/close detection, and an AI loop driving mainfeature open+close to a PASS — plus
-> driving the live game natively from Claude Code over MCP.
+> entry, verified end-to-end on a **dev/preview build**: snapshot, `press → get` state
+> round-trips (a state-delta mutation), reachability, panel open/close detection, and an AI
+> loop driving a panel open+close to a PASS — plus driving the running game natively from
+> Claude Code over MCP.
 
 ## Why this shape
 
@@ -37,7 +37,7 @@ live object graph** — fast, deterministic, no GPU.
 - **Button enable logic** — is Buy `interactable:false` when gold is short?
 - **Panel open/close & visibility** — `node(ref)` reads `active`/`activeInHierarchy`/
   `opacity`/`scale`/`worldPos`; `diff(before, after)` shows which subtree activated/appeared
-  after an action (e.g. press mainfeature → its block opens).
+  after an action (e.g. press a panel button → its block opens).
 - **Doesn't-crash** — pressing a button throws? caught.
 - **Idempotency / races** — hammer a handler twice; does it double-charge?
 - **Regression** — snapshot the logical state tree before/after a change and diff.
@@ -63,6 +63,8 @@ copse trades away the whole visual/spatial/timing dimension:
   exposed on a component (closures, locals).
 - **What a button does** is opaque at runtime (you press and observe a state delta) —
   coir's *static* ClickEvent map (`click→method()`) is the complement if you want that.
+  Cross-reference the two on the shared key `(nodePath, method)` via `clickSurface()` /
+  the `click_surface` MCP tool — see [`docs/COVERAGE.md`](docs/COVERAGE.md).
 
 → Use copse for **logic/flow integration testing**, not visual or playtest QA.
 
@@ -88,7 +90,7 @@ __copse.logs()                                     // captured console.* + uncau
 __copse.hijack(); __copse.captured('Canvas/X')    // opt-in: record node.on() registrations made after install
 ```
 
-To check a panel opened ("press mainfeature → its block appears"): `snapshot({includeInactive:true})`
+To check a panel opened ("press a panel button → its block appears"): `snapshot({includeInactive:true})`
 → press → `snapshot` → `diff` — the panel's subtree turns up in `activated`/`appeared`.
 
 Addressing matches coir: `Parent/Child` node paths, `[i]` for same-name siblings,
@@ -146,7 +148,7 @@ npx copse node  <url> Canvas/Panel                     # node intrinsics; copse 
 **Watch it run:** add `--headed` for a visible browser window (default is headless), and
 `--fps 30` to raise the fps cap (default 10) so it's smooth. Headed uses the real GPU —
 actually *cooler* than headless software WebGL. Note: copse calls handlers directly, so you
-see the game *react* (panels open, reels action, numbers change) — not a moving cursor or a
+see the game *react* (panels open, sprites move, numbers change) — not a moving cursor or a
 button-press animation. Or `--browser-url http://127.0.0.1:9222` to drive **your own** Chrome
 (launched with `--remote-debugging-port=9222`) and watch it there.
 
@@ -164,7 +166,7 @@ Stagehand or Cursor becomes the brain while copse stays the eyes + hands into th
 tool names match the library 1:1 (including `connect`), so the two surfaces read the same:
 
 ```bash
-claude mcp add copse -- npx copse mcp        # then: "Use copse: connect <url>, test the buy-feature window"
+claude mcp add copse -- npx copse mcp        # then: "Use copse: connect <url>, test a panel window"
 ```
 
 The default tool set is the 14 testing primitives. The CDP **debugger** tools are **hidden from the

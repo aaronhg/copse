@@ -61,7 +61,7 @@ test('runs the plan in order; judge sees the results; buy flow passes', async ()
   assert.equal(report.rounds.length, 1);
   assert.equal(handler.fired, 1, 'press ran the real handler');
   const [pressR, callR, getR] = report.rounds[0].steps.map((s) => s.result);
-  assert.deepEqual(pressR, { ok: true, ref: 'Canvas/ShopBtn', fired: 1 });
+  assert.deepEqual(pressR, { ok: true, ref: 'Canvas/ShopBtn', fired: 1, drove: ['clickEvent'] });
   assert.equal(callR.value, 70);
   assert.equal(getR.value, 70);
   assert.equal(report.rounds[0].verdict.scope, 'logic');
@@ -152,6 +152,65 @@ test('a press to an UNREACHABLE button is a hard fail — overrides a passing ju
   // reachableGate:false disables it entirely
   const r3 = await runHarness(driver, agent, { reachableGate: false });
   assert.equal(r3.pass, true, 'reachableGate:false disables the gate');
+});
+
+test('a press whose handler ERRORED (engine-swallowed throw caught via the log-diff) is a hard fail — overrides judge AND report', async () => {
+  const { scene } = fixture();
+  const base = localDriver(scene, fakeRuntime());
+  // simulate the driver's mutate() log-diff catching a console.error the engine swallowed during the press:
+  // press returns ok:true/fired:1 (looks fine) BUT carries `errors`.
+  const driver = { ...base, press: (ref) => ({ ok: true, ref, fired: 1, errors: [{ level: 'error', text: "TypeError: cannot read 'x' of undefined" }] }) };
+  const agent = {
+    plan: () => ({ steps: [{ op: 'press', ref: 'Canvas/ShopBtn' }] }),
+    judge: () => ({ pass: true }),                         // ok:true → judge is happy
+    report: () => ({ pass: true, summary: 'looks good' }), // report tries to pass too
+  };
+  const report = await runHarness(driver, agent);
+  assert.equal(report.pass, false, 'a handler that logged an error is not a pass, even over judge+report');
+  assert.equal(report.errored[0].ref, 'Canvas/ShopBtn');
+  assert.match(report.errored[0].error, /TypeError/);
+
+  // errorGate:false disables it
+  const r2 = await runHarness(driver, agent, { errorGate: false });
+  assert.equal(r2.pass, true, 'errorGate:false disables the error gate');
+});
+
+test('a press that drove NOTHING (drove:"nothing") is a hard fail — a fired:0 misread as pass is closed', async () => {
+  const { scene } = fixture();
+  const base = localDriver(scene, fakeRuntime());
+  // a button copse couldn't actuate: no clickEvent fired, no on('click'), no synthetic tap
+  const driver = { ...base, press: (ref) => ({ ok: true, ref, fired: 0, drove: 'nothing', wired: false }) };
+  const agent = {
+    plan: () => ({ steps: [{ op: 'press', ref: 'Canvas/DeadBtn' }] }),
+    judge: () => ({ pass: true }),                          // ok:true, fired:0 — the classic misread
+    report: () => ({ pass: true, summary: 'looks good' }),
+  };
+  const report = await runHarness(driver, agent);
+  assert.equal(report.pass, false, 'a press that actuated nothing is not a pass, even over judge+report');
+  assert.deepEqual(report.undriven, [{ ref: 'Canvas/DeadBtn' }]);
+  const r2 = await runHarness(driver, agent, { driveGate: false });
+  assert.equal(r2.pass, true, 'driveGate:false disables it');
+});
+
+test("a press copse can't confirm reachable (reachable:'unsure') is SURFACED as out.uncertain — verified, not a silent pass, not a hard fail", async () => {
+  const { scene } = fixture();
+  const base = localDriver(scene, fakeRuntime());
+  const driver = { ...base, reachable: (ref) => ({ ok: true, ref, reachable: 'unsure', blockedBy: null }) };
+  const agent = { plan: () => ({ steps: [{ op: 'press', ref: 'Canvas/ShopBtn' }] }), judge: () => ({ pass: true }) };
+  const report = await runHarness(driver, agent);
+  assert.equal(report.pass, true, "'unsure' is NOT hard-failed (we can't confirm it's blocked)");
+  assert.deepEqual(report.uncertain, [{ ref: 'Canvas/ShopBtn', why: 'unsure' }]); // but it IS surfaced for verification
+  assert.equal(report.rounds[0].steps[0].result.uncertain, 'unsure');
+});
+
+test('a synthetic tap into a no-visible-handler button (drove:[touch], wired:false) is surfaced as out.uncertain', async () => {
+  const { scene } = fixture();
+  const base = localDriver(scene, fakeRuntime());
+  const driver = { ...base, press: (ref) => ({ ok: true, ref, fired: 0, touched: true, drove: ['touch'], wired: false }) };
+  const agent = { plan: () => ({ steps: [{ op: 'press', ref: 'Canvas/MaybeDead' }] }), judge: () => ({ pass: true }) };
+  const report = await runHarness(driver, agent);
+  assert.equal(report.pass, true, 'not hard-failed — copse may just not see the touch handler');
+  assert.deepEqual(report.uncertain, [{ ref: 'Canvas/MaybeDead', why: 'touch-into-void' }]);
 });
 
 test('agent.next absent ⇒ exactly one round (default policy)', async () => {

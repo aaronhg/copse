@@ -12,6 +12,8 @@
 // (server.js filters by this tag). They stay callable by name regardless, so tests/power-users
 // aren't blocked.
 
+import { resolveCoirPath } from '../coverage.js';
+
 const needCp = (state) => {
   if (!state.cp) throw new Error('no open game — call the `connect` tool with a url first');
   return state.cp;
@@ -63,6 +65,12 @@ export const TOOLS = [
     },
   },
   {
+    name: 'reload',
+    description: "Reload the attached tab over CDP and re-inject copse. Use it to (1) pick up a DIFFERENT scene after opening it in Cocos Creator (the preview serves the editor's current scene — reload to load it), and (2) recover a wedged / empty / half-loaded preview (e.g. attach found the scene still null, or the renderer was mid-transition). Re-finds the cc frame and re-installs __copse after the navigation. Returns {ok, reloaded, url, relevantNodes, buttons}. Needs an open session (connect first).",
+    inputSchema: { type: 'object', properties: { waitUntil: { type: 'string', description: "navigation wait condition: 'load' (default) | 'domcontentloaded' | 'networkidle0' | 'networkidle2'" } } },
+    run: async (state, a) => ({ data: await needCp(state).reload(a.waitUntil ? { waitUntil: a.waitUntil } : {}) }),
+  },
+  {
     name: 'snapshot',
     description: 'Slim live node-tree snapshot: [{ref, button?, interactable?, click?, label?, codeHandlers?}]. Default relevant:true (only nodes with a testable surface — buttons/labels/code-handlers). includeInactive:true also walks hidden subtrees; components:true adds raw component types.',
     inputSchema: { type: 'object', properties: { relevant: { type: 'boolean' }, includeInactive: { type: 'boolean' }, components: { type: 'boolean' } } },
@@ -75,8 +83,20 @@ export const TOOLS = [
     run: async (state) => ({ data: await needCp(state).interactive() }),
   },
   {
+    name: 'click_surface',
+    description: "Join-ready RUNTIME click surface for cross-referencing with coir (copse's static sibling). One row per editor-wired clickEvent: [{ref, method, component?, target?, interactable, reachable?(true|false|'unsure'), blockedBy?, occludedBy?, visible?}]. `method` (the serialized handler name) joins 1:1 to coir's static ClickEvent map — coir's `loc.nodePath` + the method inside its `click → method()` edge — so you can compare what's WIRED (coir, every scene/prefab) against what's LIVE & pressable now (copse, this scene). Buttons wired via raw touch/code (outside coir's static surface) get method:null — and carry `codeHandlers` (their live node.on() listeners) when present, so coverageJoin can call them `codeRegistered` (has a code handler) vs bare `codeOnly` (none) rather than one opaque bucket. `component` is minified on release builds — coir holds the real handler-class name. Set reachability:false to skip the O(buttons×nodes) reachable pass.",
+    inputSchema: { type: 'object', properties: { reachability: { type: 'boolean', description: 'include reachable/blockedBy/visible (default true)' }, includeInactive: { type: 'boolean', description: 'also walk hidden subtrees' } } },
+    run: async (state, a) => ({ data: await needCp(state).clickSurface({ reachability: a.reachability, includeInactive: a.includeInactive }) }),
+  },
+  {
+    name: 'resolve',
+    description: "Translate a coir STATIC nodePath into the live copse `ref` by matching it against the running tree (symmetric tail match — absorbs coir's scene/prefab-file root prefix and a prefab's instantiation mount, the two reasons a raw coir path won't resolve in press/get). Pass a coir nodePath (e.g. 'home/Canvas/Home/lower/main_btns/layout/btn_shop'); returns {ref, mount, dropped} for a unique hit, {ambiguous:[refs]} for >1, or null. Feed the returned `ref` straight into press/get/reachable.",
+    inputSchema: { type: 'object', properties: { path: { type: 'string', description: 'a coir static nodePath' } }, required: ['path'] },
+    run: async (state, a) => ({ data: resolveCoirPath(a.path, await needCp(state).snapshot({ includeInactive: true })) }),
+  },
+  {
     name: 'press',
-    description: 'Press a button by ref — runs its wired clickEvents + emits CLICK (NOT a coordinate click). Returns {ok, fired, changed?}; `changed` auto-reports what the action did once the tree settles (appeared/disappeared/activated/deactivated/labelChanged as node descriptors, so you can read a panel\'s contents straight from it). Honors interactable unless force:true.',
+    description: "Press a button by ref — runs its wired clickEvents + emits CLICK (NOT a coordinate click). Returns {ok, fired, drove, wired?, changed?, errors?}; `drove` = what actuated: ['clickEvent'] (serialized) / ['click'] (a real on('click')) / ['touch'] (a synthetic tap, best-effort) / 'nothing' — so a press that did NOTHING isn't misread as a pass (the harness hard-fails drove:'nothing'); `wired:false` on the ambiguous cases flags a button with no visible handler. `changed` auto-reports what the action did once the tree settles (appeared/disappeared/activated/deactivated/labelChanged as node descriptors, so you can read a panel's contents straight from it). `errors` lists any console-error / uncaught pageerror the handler produced during the press — present even when the engine swallowed the throw and `fired` looks fine, so a crashing handler is NOT a silent pass (the harness hard-fails on it). Honors interactable unless force:true.",
     inputSchema: { type: 'object', properties: { ref: { type: 'string', description: 'node ref, e.g. Canvas/Panel/CloseBtn' }, force: { type: 'boolean', description: 'press even if interactable:false' } }, required: ['ref'] },
     run: async (state, a) => ({ data: await needCp(state).press(a.ref, a.force ? { force: true } : {}) }),
   },
@@ -88,13 +108,13 @@ export const TOOLS = [
   },
   {
     name: 'call',
-    description: 'Invoke any method on any component: path:Comp.method(...args) — drives game logic beyond buttons. Returns {ok, value, changed?}.',
+    description: 'Invoke any method on any component: path:Comp.method(...args) — drives game logic beyond buttons. Returns {ok, value, changed?, errors?} (`errors` = any console-error / uncaught pageerror the method produced — surfaces a swallowed throw the same way press does).',
     inputSchema: { type: 'object', properties: { sel: { type: 'string', description: 'path:Comp.method selector' }, args: { type: 'array', items: {}, description: 'method arguments' } }, required: ['sel'] },
     run: async (state, a) => ({ data: await needCp(state).call(a.sel, ...(a.args || [])) }),
   },
   {
     name: 'reachable',
-    description: 'Best-effort: is this button actually reachable by a player, or covered by an overlay / BlockInputEvents / a later-drawn panel? Returns {ok, reachable, blockedBy}. A geometric heuristic — treat reachable:false as a strong signal to verify, not gospel.',
+    description: "Best-effort geometric reachability. Returns {ok, reachable, blockedBy?, occludedBy?, visible}. `reachable` is TRI-STATE: true | false | 'unsure' — 'unsure' (NOT true) when it genuinely can't judge (no UITransform/camera/projection), so uncertainty fails LOUD, not open. `blockedBy` = an input-consumer (overlay / BlockInputEvents) swallowing the touch. `occludedBy` = an opaque sprite drawn OVER the button hiding it VISUALLY while a touch still passes through (reachable:true but a player can't see it). Treat reachable:false / 'unsure' / occludedBy as signals to verify, not gospel — no alpha hit-areas.",
     inputSchema: { type: 'object', properties: { ref: { type: 'string' } }, required: ['ref'] },
     run: async (state, a) => ({ data: await needCp(state).reachable(a.ref) }),
   },

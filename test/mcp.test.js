@@ -10,8 +10,10 @@ function fakeCp() {
   return {
     calls: [],
     closed: false,
+    reload(o) { this.calls.push(['reload', o]); return { ok: true, reloaded: true, url: 'http://localhost:7456/', relevantNodes: 29, buttons: 14 }; },
     snapshot(o) { this.calls.push(['snapshot', o]); return [{ ref: 'Canvas/Btn', button: true }]; },
     interactive() { this.calls.push(['interactive']); return [{ ref: 'Canvas/Btn', reachable: true }]; },
+    clickSurface(o) { this.calls.push(['clickSurface', o]); return [{ ref: 'Canvas/Btn', method: 'onBuy', reachable: true }]; },
     press(ref, o) { this.calls.push(['press', ref, o]); return { ok: true, ref, fired: 1, changed: { appeared: [{ ref: 'Canvas/Panel' }] } }; },
     get(sel) { this.calls.push(['get', sel]); return { ok: true, value: '42' }; },
     call(sel, ...a) { this.calls.push(['call', sel, a]); return { ok: true, value: a[0] }; },
@@ -52,7 +54,7 @@ test('tools registry: each tool has name/description/object inputSchema; core to
     assert.equal(typeof t.run, 'function');
   }
   const names = TOOLS.map((t) => t.name);
-  for (const n of ['connect', 'snapshot', 'interactive', 'press', 'get', 'call', 'reachable', 'node', 'logs', 'close',
+  for (const n of ['connect', 'reload', 'snapshot', 'interactive', 'click_surface', 'resolve', 'press', 'get', 'call', 'reachable', 'node', 'logs', 'close',
     'break_at', 'break_in', 'break_exceptions', 'wait_pause', 'eval_frame', 'debug_step', 'clear_breakpoints']) {
     assert.ok(names.includes(n), `missing tool ${n}`);
   }
@@ -97,6 +99,23 @@ test('tools/call dispatches to the Driver and wraps the result as MCP text conte
   // snapshot defaults relevant:true
   await handle({ id: 7, method: 'tools/call', params: { name: 'snapshot', arguments: {} } });
   assert.deepEqual(cp.calls.at(-1), ['snapshot', { relevant: true, includeInactive: undefined, components: undefined }]);
+
+  // click_surface: opts pass through; returns join-ready (ref, method) rows
+  const cs = await handle({ id: 7.5, method: 'tools/call', params: { name: 'click_surface', arguments: {} } });
+  assert.deepEqual(cp.calls.at(-1), ['clickSurface', { reachability: undefined, includeInactive: undefined }]);
+  assert.equal(JSON.parse(cs.result.content[0].text)[0].method, 'onBuy');
+
+  // reload: no waitUntil → called with {}; waitUntil passes through
+  const rl = await handle({ id: 7.6, method: 'tools/call', params: { name: 'reload', arguments: {} } });
+  assert.deepEqual(cp.calls.at(-1), ['reload', {}]);
+  assert.equal(JSON.parse(rl.result.content[0].text).buttons, 14);
+  await handle({ id: 7.7, method: 'tools/call', params: { name: 'reload', arguments: { waitUntil: 'networkidle0' } } });
+  assert.deepEqual(cp.calls.at(-1), ['reload', { waitUntil: 'networkidle0' }]);
+
+  // resolve: snapshots the live tree (includeInactive) → tail-matches a coir path to the runtime ref
+  const rv = await handle({ id: 7.8, method: 'tools/call', params: { name: 'resolve', arguments: { path: 'home/Canvas/Btn' } } });
+  assert.deepEqual(cp.calls.at(-1), ['snapshot', { includeInactive: true }]);
+  assert.deepEqual(JSON.parse(rv.result.content[0].text), { ref: 'Canvas/Btn', mount: '', dropped: 'home' });
 
   // logs: since index passes through; result is the captured console/errors (field is `level`)
   const lg = await handle({ id: 8, method: 'tools/call', params: { name: 'logs', arguments: { since: 1 } } });

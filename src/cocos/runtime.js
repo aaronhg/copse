@@ -2,7 +2,7 @@
 // The Cocos `cc.*` adapter for copse + the `window.__copse` installer. This is the
 // ONLY engine-coupled file; everything in core/ is pure over the Runtime shape.
 // Injected into a running Cocos 3.x WebGL game (dev/preview, where `cc` is reachable).
-import { snapshot, resolve, press, get, call, reachable, node, diff } from '../core/index.js';
+import { snapshot, clickSurface, resolve, press, get, call, reachable, node, diff } from '../core/index.js';
 
 const stripCc = (t) => (typeof t === 'string' && t.startsWith('cc.') ? t.slice(3) : t);
 
@@ -70,6 +70,14 @@ const refOf = (node, root) => {
 /** Build a copse Runtime over a live `cc`. @param {any} cc @returns {import('../core/index.js').Runtime} */
 export function cocosRuntime(cc) {
   const { Button, UITransform, BlockInputEvents, Camera, UIOpacity, Vec2, Vec3 } = cc;
+  const UIRenderer = cc.UIRenderer || cc.Renderable2D; // the 2D-renderable base (Sprite/Label/…) — visual-occlusion probe
+  // Some builds don't expose every class as a `cc.*` global (tree-shaking) — `cc.UITransform` was UNDEFINED on a
+  // real 3.8.6 preview, which silently made reachable() return 'unsure' for EVERY button. getComponent accepts the
+  // registered class-NAME string regardless, so fall back to it (verified: 'cc.UITransform' resolves when the class doesn't).
+  const UIT = UITransform || 'cc.UITransform';
+  const UIR = UIRenderer || 'cc.UIRenderer';
+  const BIE = BlockInputEvents || 'cc.BlockInputEvents';
+  const BTN = Button || 'cc.Button';
   const CLICK = Button?.EventType?.CLICK ?? 'click';
   const typeName = (c) => c?.constructor?.name || 'Unknown';
   return {
@@ -106,7 +114,7 @@ export function cocosRuntime(cc) {
     },
 
     // Synthesize a tap (touch-start → touch-end) on the node so buttons wired via raw
-    // `node.on(TOUCH_*)` (not `click`) actuate — many real-money slots do this. The touch
+    // `node.on(TOUCH_*)` (not `click`) actuate — some games do this. The touch
     // is placed at the node's screen centre (same space worldToScreen/hitTest use) so a
     // handler's inside-node check on TOUCH_END passes. Best-effort: returns false if the
     // engine shapes don't line up (older/newer EventTouch signatures, no camera).
@@ -120,7 +128,7 @@ export function cocosRuntime(cc) {
       const END = ET.TOUCH_END || 'touch-end';
       let x = 0, y = 0;
       try {
-        const ui = UITransform && n.getComponent(UITransform);
+        const ui = n.getComponent(UIT);
         const root = cc.director.getScene();
         const cams = []; (function walk(z) { const c = z.getComponent && z.getComponent(Camera); if (c) cams.push(c); (z.children || []).forEach(walk); })(root);
         if (ui && cams.length) {
@@ -166,34 +174,51 @@ export function cocosRuntime(cc) {
       return out;
     },
 
-    // Best-effort geometric reachability: is `n` the top-most input consumer at its own
-    // center, or covered by an overlay / BlockInputEvents / later-drawn panel? When we
-    // can't judge (no UITransform / camera / projection) we return reachable:true rather
-    // than risk a false "unreachable". Draw-order = [camera priority, …sibling-index] so it resolves
-    // cross-camera/Layer z-order (#3). Still geometric — opacity does NOT gate input (a transparent
-    // BlockInputEvents still swallows touches) so blockers aren't opacity-filtered; no alpha hit-areas.
+    // Best-effort geometric reachability: is `n` the top-most input consumer at its own center, or
+    // covered by an overlay / BlockInputEvents / later-drawn panel? Draw-order = [camera priority,
+    // …sibling-index] so it resolves cross-camera/Layer z-order (#3). Three signals, kept separate:
+    //   • reachable: true | false | 'unsure' — would a TOUCH reach it. 'unsure' (NOT true) when we
+    //     genuinely can't judge (no UITransform / camera / projection) — fail LOUD on uncertainty, not
+    //     open; a consumer treats 'unsure' as "verify", not a confident pass.
+    //   • blockedBy — an INPUT consumer (Button/BlockInputEvents) drawn on top that swallows the touch.
+    //   • occludedBy — an opaque RENDERER drawn on top that hides the button VISUALLY (input ignores
+    //     opacity, so reachable can be true while a player can't see/tap it). Best-effort; no alpha hit-areas.
     reachable: (n) => {
       const visible = visibleOf(n, UIOpacity); // separate signal (opacity/scale === 0) — never affects `reachable`
-      if (!UITransform) return { reachable: true, blockedBy: null, visible };
       const root = cc.director.getScene();
-      const ui = n.getComponent(UITransform); if (!ui) return { reachable: true, blockedBy: null, visible };
+      const ui = n.getComponent(UIT); if (!ui) return { reachable: 'unsure', blockedBy: null, visible };
       const box = ui.getBoundingBoxToWorld();
       const cams = []; (function walk(x) { const c = x.getComponent && x.getComponent(Camera); if (c) cams.push(c); (x.children || []).forEach(walk); })(root);
-      if (!cams.length) return { reachable: true, blockedBy: null, visible };
+      if (!cams.length) return { reachable: 'unsure', blockedBy: null, visible };
       let sp;
       try { const o = new Vec3(); camOf(n, cams).worldToScreen(new Vec3(box.x + box.width / 2, box.y + box.height / 2, 0), o); sp = new Vec2(o.x, o.y); }
-      catch { return { reachable: true, blockedBy: null, visible }; }
-      let top = null, topKey = null;
+      catch { return { reachable: 'unsure', blockedBy: null, visible }; }
+      const myKey = orderKey(n, root, cams);
+      let top = null, topKey = null;   // top-most INPUT consumer at center
+      let occ = null, occKey = null;   // top-most OPAQUE renderer drawn ABOVE the button (visual occluder)
       (function walk(x) {
-        const u = x.activeInHierarchy && x.getComponent && x.getComponent(UITransform);
-        if (u && (x.getComponent(Button) || (BlockInputEvents && x.getComponent(BlockInputEvents)))) {
-          let hit = false; try { hit = u.hitTest(sp); } catch { /* coord-space mismatch */ }
-          if (hit) { const k = orderKey(x, root, cams); if (!top || cmpKey(k, topKey) > 0) { top = x; topKey = k; } }
+        const u = x.activeInHierarchy && x.getComponent && x.getComponent(UIT);
+        if (u) {
+          const consumer = x.getComponent(BTN) || x.getComponent(BIE);
+          const renderer = x.getComponent(UIR);
+          if (consumer || renderer) {
+            let hit = false; try { hit = u.hitTest(sp); } catch { /* coord-space mismatch */ }
+            if (hit && consumer) { const k = orderKey(x, root, cams); if (!top || cmpKey(k, topKey) > 0) { top = x; topKey = k; } }
+            // a visual occluder: a hit, opaque renderer above the button, from a different subtree
+            if (hit && renderer && x !== n && !isAncestor(n, x) && !isAncestor(x, n) && visibleOf(x, UIOpacity)) {
+              const k = orderKey(x, root, cams); if (cmpKey(k, myKey) > 0 && (!occ || cmpKey(k, occKey) > 0)) { occ = x; occKey = k; }
+            }
+          }
         }
         (x.children || []).forEach(walk);
       })(root);
-      const ok = top && (top === n || isAncestor(n, top) || isAncestor(top, n));
-      return { reachable: !!ok, blockedBy: ok ? null : (top ? refOf(top, root) : null), visible };
+      // Nothing — not even the button itself — hit its own center: a coord-space mismatch / zero-size / off-screen
+      // projection. That's "can't judge", NOT a confident false. So `reachable:false` ALWAYS names a blocker.
+      if (!top) return { reachable: 'unsure', blockedBy: null, visible };
+      const ok = top === n || isAncestor(n, top) || isAncestor(top, n);
+      const out = { reachable: ok, blockedBy: ok ? null : refOf(top, root), visible };
+      if (ok && occ) out.occludedBy = refOf(occ, root); // touch reaches but an opaque sprite hides it
+      return out;
     },
 
     // Node intrinsics that get/snapshot don't expose — the basis for "did this panel
@@ -205,7 +230,7 @@ export function cocosRuntime(cc) {
       if (op) info.opacity = op.opacity;
       try { const s = n.scale; if (s) info.scale = { x: s.x, y: s.y }; } catch { /* */ }
       try { const wp = n.worldPosition; if (wp) info.worldPos = { x: Math.round(wp.x), y: Math.round(wp.y) }; } catch { /* */ }
-      const ui = UITransform ? n.getComponent(UITransform) : null;
+      const ui = n.getComponent(UIT);
       if (ui && ui.contentSize) info.size = { w: ui.contentSize.width, h: ui.contentSize.height };
       return info;
     },
@@ -301,6 +326,9 @@ export function install(cc, target = globalThis) {
   const api = {
     snapshot: (opts) => snapshot(root(), rt, opts),
     interactive: (opts) => snapshot(root(), rt, { onlyInteractive: true, reachability: true, ...opts }), // pressable list, with reachability
+    // join-ready click surface: one row per editor-wired clickEvent, keyed (ref, method) — the same
+    // key coir emits statically, so an agent can cross-reference static wiring with what's live now.
+    clickSurface: (opts) => clickSurface(snapshot(root(), rt, { onlyInteractive: true, reachability: (opts && opts.reachability) !== false, includeInactive: opts && opts.includeInactive })),
     press: (path, opts) => press(root(), rt, path, opts),
     get: (sel) => get(root(), rt, sel),
     call: (sel, ...args) => call(root(), rt, sel, args),

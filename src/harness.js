@@ -87,12 +87,19 @@ async function execStep(driver, step, reachableGate) {
         // A button copse CAN press (it calls the handler directly) but a player CANNOT reach (covered by an
         // overlay / off-screen) is a REAL fail, not a pass. Check before pressing; honor `force` (explicit
         // override) and skip silently when the driver has no reachability (degrades to today's behavior).
-        let unreachable = null;
+        let unreachable = null, uncertain = null;
         if (reachableGate && !(step.opts && step.opts.force) && typeof driver.reachable === 'function') {
-          try { const rr = await driver.reachable(step.ref); if (rr && rr.reachable === false) unreachable = rr.blockedBy || true; } catch { /* best-effort */ }
+          try {
+            const rr = await driver.reachable(step.ref);
+            if (rr && rr.reachable === false) unreachable = rr.blockedBy || true;
+            else if (rr && (rr.reachable === 'unsure' || rr.occludedBy)) uncertain = rr.occludedBy ? `occluded:${rr.occludedBy}` : 'unsure'; // can't confirm a player reaches/sees it
+          } catch { /* best-effort */ }
         }
         const r = await driver.press(step.ref, step.opts);
         if (unreachable && r && typeof r === 'object') r.unreachable = unreachable; // surfaced to judge + hard-failed below
+        // a synthetic tap into a button with no VISIBLE handler — verify, don't hard-fail (copse's codeHandlers can miss a real one)
+        if (!uncertain && r && Array.isArray(r.drove) && r.drove.length === 1 && r.drove[0] === 'touch' && r.wired === false) uncertain = 'touch-into-void';
+        if (uncertain && r && typeof r === 'object') r.uncertain = uncertain; // surfaced as out.uncertain (verify), NOT hard-failed
         return r;
       }
       case 'get':         return await driver.get(step.sel);
@@ -117,10 +124,12 @@ async function execStep(driver, step, reachableGate) {
  *        (e.g. `{ diff, goal, stopCondition, reportFormat }`) — passed verbatim to every stage.
  * @param {number} [opts.maxRounds]  hard cap on iterations (default 1)
  * @param {boolean} [opts.reachableGate]  hard-fail a press to a covered/unreachable button (default true)
- * @returns {Promise<{pass:boolean, rounds:Array<{round:number, rationale?:string, steps:Array<{step:Step, result:any}>, verdict:Verdict}>, snapshot:any, summary?:any, unreachable?:Array<{ref:string, blockedBy:any}>}>}
+ * @param {boolean} [opts.errorGate]  hard-fail a step whose handler threw / logged an error (default true)
+ * @param {boolean} [opts.driveGate]  hard-fail a press that drove NOTHING (drove:'nothing') (default true)
+ * @returns {Promise<{pass:boolean, rounds:Array<{round:number, rationale?:string, steps:Array<{step:Step, result:any}>, verdict:Verdict}>, snapshot:any, summary?:any, unreachable?:Array<{ref:string, blockedBy:any}>, errored?:Array<{ref:string, error:string}>, undriven?:Array<{ref:string}>, uncertain?:Array<{ref:string, why:string}>}>}
  */
 export async function runHarness(driver, agent, opts = {}) {
-  const { context = null, maxRounds = 1, reachableGate = true } = opts;
+  const { context = null, maxRounds = 1, reachableGate = true, errorGate = true, driveGate = true } = opts;
   const rounds = [];
   let snapshot = await driver.snapshot();
 
@@ -147,8 +156,25 @@ export async function runHarness(driver, agent, opts = {}) {
   // the flow isn't actually exercisable. This overrides even a passing judge/report (it's a fact, not an
   // opinion). The offending refs are surfaced so the report can explain it. Disable with reachableGate:false.
   const unreachablePresses = rounds.flatMap((r) => (r.steps || []).filter((s) => s.result && s.result.unreachable).map((s) => ({ ref: s.step.ref, blockedBy: s.result.unreachable })));
-  const out = { pass: pass && unreachablePresses.length === 0, rounds, snapshot };
+  // A step whose handler THREW (execStep caught it → reason:'threw') or whose action logged an error / uncaught
+  // pageerror (the driver's log-diff → result.errors, catching an engine-swallowed throw a passing ok:true hides)
+  // is a HARD fail — "doesn't-crash" must be a fact, not the judge's opinion. Override with errorGate:false.
+  const erroredSteps = rounds.flatMap((r) => (r.steps || [])
+    .filter((s) => s.result && ((s.result.errors && s.result.errors.length) || s.result.reason === 'threw'))
+    .map((s) => ({ ref: s.step.ref || s.step.sel || s.step.op, error: s.result.reason === 'threw' ? s.result.error : s.result.errors[0].text })));
+  // A press that actuated NOTHING (drove:'nothing' — no clickEvent fired, no on('click'), no synthetic tap)
+  // can't be a passing test: nothing was exercised. Surfaced + hard-failed (a misread `fired:0` as pass is the
+  // exact trap this closes). The richer per-step `drove`/`wired` lets the agent reason about the touch-into-void
+  // case (drove:['touch'], wired:false). Override with driveGate:false.
+  const undrivenPresses = rounds.flatMap((r) => (r.steps || []).filter((s) => s.result && s.result.drove === 'nothing').map((s) => ({ ref: s.step.ref })));
+  // SURFACED but NOT hard-failed: a press copse couldn't confirm a player reaches/sees (reachable:'unsure' / occludedBy)
+  // or a synthetic tap into a no-visible-handler button. Fail-loud uncertainty reaches the report instead of a silent pass.
+  const uncertainSteps = rounds.flatMap((r) => (r.steps || []).filter((s) => s.result && s.result.uncertain).map((s) => ({ ref: s.step.ref, why: s.result.uncertain })));
+  const out = { pass: pass && unreachablePresses.length === 0 && (!errorGate || erroredSteps.length === 0) && (!driveGate || undrivenPresses.length === 0), rounds, snapshot };
   if (unreachablePresses.length) out.unreachable = unreachablePresses;
+  if (erroredSteps.length) out.errored = erroredSteps;
+  if (undrivenPresses.length) out.undriven = undrivenPresses;
+  if (uncertainSteps.length) out.uncertain = uncertainSteps;
   // AI ④ (optional). Returning `{ pass, summary }` sets the OVERALL verdict + summary
   // (overrides the per-round AND); any other return value is treated as the summary.
   if (agent.report) {
@@ -157,6 +183,8 @@ export async function runHarness(driver, agent, opts = {}) {
     else out.summary = rep;
   }
   if (unreachablePresses.length) out.pass = false; // hard gate: not even the report can pass over an unreachable press
+  if (errorGate && erroredSteps.length) out.pass = false; // hard gate: a handler that threw / logged an error is never a pass
+  if (driveGate && undrivenPresses.length) out.pass = false; // hard gate: a press that drove nothing isn't a pass
   return out;
 }
 
