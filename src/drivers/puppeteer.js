@@ -23,7 +23,7 @@ async function loadPuppeteer() {
 /**
  * Launch (or connect to) a browser, load the game, inject copse → a Driver for
  * runHarness. The returned object is the Driver (snapshot/interactive/press/get/call/
- * reachable/node/diff/listeners/hijack/captured/logs) plus `page`, `frame` (the frame cc was found in — may be a
+ * reachable/node/diff/listeners/probe/logs) plus `page`, `frame` (the frame cc was found in — may be a
  * nested/cross-origin iframe), `browser`, and `close()`.
  * @param {string} url
  * @param {{bundlePath?:string|URL, executablePath?:string, browserURL?:string, browserWSEndpoint?:string, attach?:boolean, match?:string, attachTries?:number, headless?:any, viewport?:any, fpsCap?:number, timeout?:number, bootTries?:number, readyTries?:number, maxLogs?:number, settle?:boolean|{maxMs?:number,interval?:number}}} [opts]
@@ -206,8 +206,7 @@ export async function connect(url, opts = {}) {
     node: (sel) => ev((s) => window.__copse.node(s), sel),
     diff: (a, b) => ev(([a, b]) => window.__copse.diff(a, b), [a, b]),
     listeners: (sel) => ev((s) => window.__copse.listeners(s), sel),   // user node.on() handlers (best-effort)
-    hijack: () => ev(() => window.__copse.hijack()),                   // opt-in: record node.on() made AFTER this
-    captured: (sel) => ev((s) => window.__copse.captured(s), sel),     // what hijack() recorded for this node
+    probe: () => ev(() => window.__copse.probe()),                     // engine-coupling self-diagnostic (version + per-capability resolution)
     logs: (since = 0) => logs.slice(since),               // console + page errors (all frames); since = index already seen
     // attach mode drives the user's own browser → disconnect, don't close it.
     page, get frame() { return frame; }, browser, ready, paused, // `paused`: attached while halted in the debugger → inject deferred

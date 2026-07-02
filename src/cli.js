@@ -53,6 +53,7 @@ const USAGE = `copse — drive & assert a running Cocos game
   copse call  <url> <path:Comp.method> [args…]  invoke a method (each arg JSON-parsed, else string)
   copse node  <url> <ref>                    node intrinsics (active/opacity/scale/worldPos/size)
   copse reachable <url> <ref>                best-effort: is the button covered by an overlay?
+  copse probe <url>                          engine-coupling self-diagnostic (version + which internals resolve)
   copse coverage <url> <coir-rows.json>      coir×copse join → coverage buckets (rows = coir's static ClickEvent JSON; file or inline)
 
   common:  --version|-V   print the copse version    (--verbose|-v is untruncated step results)
@@ -148,6 +149,14 @@ if (cmd === 'mcp') {
     console.log(J(r));
     process.exitCode = (r && r.ok === false) ? 1 : 0; // ok:false → non-zero so scripts can branch
   } finally { await cp.close(); }
+} else if (cmd === 'probe') {
+  // single-shot with NO selector: connect → __copse.probe() → print the engine-coupling diagnostic.
+  // Run it on an unfamiliar build to see whether copse's version-sensitive internals resolve here.
+  const target = url || connectOpts.match;
+  if (!target) { console.error(`probe: a <url> (or --attach --match <substr>) is required\n\n${USAGE}`); process.exit(1); }
+  const { connect } = await import('./drivers/puppeteer.js');
+  const cp = await connect(target, connectOpts);
+  try { console.log(J(await cp.probe())); } finally { await cp.close(); }
 } else if (cmd === 'coverage') {
   // The combined coir×copse capability at the shell: connect → clickSurface(live) → coverageJoin(coir's
   // static rows) → the coverage buckets as JSON. <rows> is coir's ClickEvent JSON ([{nodePath, method}]) —

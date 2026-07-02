@@ -21,8 +21,7 @@ function fakeCp() {
     node(ref) { this.calls.push(['node', ref]); return { ok: true, active: true }; },
     diff(a, b) { this.calls.push(['diff', a, b]); return { appeared: [{ ref: 'Canvas/Panel' }], disappeared: [], activated: [], deactivated: [], labelChanged: [] }; },
     listeners(ref) { this.calls.push(['listeners', ref]); return [{ type: 'click', fn: 'onBuy' }]; },
-    hijack() { this.calls.push(['hijack']); return { ok: true }; },
-    captured(ref) { this.calls.push(['captured', ref]); return []; },
+    probe() { this.calls.push(['probe']); return { version: '3.8.6', ok: true }; },
     logs(since = 0) { this.calls.push(['logs', since]); return [{ level: 'error', text: 'boom' }, { level: 'log', text: 'ok' }].slice(since); },
     close() { this.closed = true; },
   };
@@ -54,7 +53,7 @@ test('tools registry: each tool has name/description/object inputSchema; core to
     assert.equal(typeof t.run, 'function');
   }
   const names = TOOLS.map((t) => t.name);
-  for (const n of ['connect', 'reload', 'snapshot', 'interactive', 'click_surface', 'resolve', 'coverage', 'press', 'get', 'call', 'reachable', 'node', 'logs', 'close',
+  for (const n of ['connect', 'reload', 'snapshot', 'interactive', 'click_surface', 'resolve', 'coverage', 'press', 'get', 'call', 'reachable', 'node', 'probe', 'logs', 'close',
     'break_at', 'break_in', 'break_exceptions', 'wait_pause', 'eval_frame', 'debug_step', 'clear_breakpoints']) {
     assert.ok(names.includes(n), `missing tool ${n}`);
   }
@@ -132,7 +131,7 @@ test('tools/call dispatches to the Driver and wraps the result as MCP text conte
   assert.deepEqual(JSON.parse(lg.result.content[0].text), [{ level: 'log', text: 'ok' }]);
 });
 
-test('inspection tools dispatch to the Driver (diff/listeners/hijack/captured)', async () => {
+test('inspection tools dispatch to the Driver (diff/listeners/probe)', async () => {
   const cp = fakeCp();
   const handle = createDispatcher({ cp });
 
@@ -142,10 +141,9 @@ test('inspection tools dispatch to the Driver (diff/listeners/hijack/captured)',
 
   await handle({ id: 2, method: 'tools/call', params: { name: 'listeners', arguments: { ref: 'Canvas/Btn' } } });
   assert.deepEqual(cp.calls.at(-1), ['listeners', 'Canvas/Btn']);
-  await handle({ id: 3, method: 'tools/call', params: { name: 'hijack', arguments: {} } });
-  assert.deepEqual(cp.calls.at(-1), ['hijack']);
-  await handle({ id: 4, method: 'tools/call', params: { name: 'captured', arguments: { ref: 'Canvas/Btn' } } });
-  assert.deepEqual(cp.calls.at(-1), ['captured', 'Canvas/Btn']);
+  const p = await handle({ id: 3, method: 'tools/call', params: { name: 'probe', arguments: {} } });
+  assert.deepEqual(cp.calls.at(-1), ['probe']);
+  assert.equal(JSON.parse(p.result.content[0].text).version, '3.8.6');
 });
 
 test('tools/list hides debug tools by default; --debug (state.debug) surfaces them; hidden ≠ disabled', async () => {

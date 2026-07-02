@@ -143,16 +143,10 @@ export const TOOLS = [
     run: async (state, a) => ({ data: await needCp(state).listeners(a.ref) }),
   },
   {
-    name: 'hijack',
-    description: 'Opt-in: patch Node.prototype.on so subsequent node.on() registrations are recorded, then read them with `captured`. NOTE: only catches handlers registered AFTER this call — in a fully-booted game most wiring already happened, so this is mainly useful before a scene/panel loads. For already-registered handlers use `listeners`.',
+    name: 'probe',
+    description: "Engine-coupling self-diagnostic — run it once on an unfamiliar build to see whether copse's version-sensitive internals resolve on THIS Cocos version, instead of finding out via a silent 'unsure'. Read-only (walks + reads, patches nothing → anti-tamper safe). Returns {version, classes:{Node/Button/UITransform/Camera/EventTouch/…present?}, reach:{batcher2D, getFirstRenderCamera, cameraPriority}, events:{eventProcessor, shouldHandleEventTouch, capturingKey, tableKey, infosKey}, touch:{EventTouch, Touch, NodeEventType}}. Anything 'absent'/'unknown'/'error' is a tier that will fall back (or fail loud) here — e.g. getFirstRenderCamera:false → reachable uses the camOf heuristic (via.camera:'heuristic'); events.tableNote:'no-registered-listener-found' just means no node had wired a listener yet (open a scene with buttons and re-probe). The event key names (tableKey:'_callbackTable', infosKey:'callbackInfos' on 3.8.x) are the arms of copse's internal `||` ladders that actually matched — a shift there is exactly the drift this surfaces.",
     inputSchema: { type: 'object', properties: {} },
-    run: async (state) => ({ data: await needCp(state).hijack() }),
-  },
-  {
-    name: 'captured',
-    description: 'Read node.on() registrations recorded since `hijack` was called, for a node: [{type, fn?, target?}]. Empty unless `hijack` ran first and the node wired handlers afterward.',
-    inputSchema: { type: 'object', properties: { ref: { type: 'string' } }, required: ['ref'] },
-    run: async (state, a) => ({ data: await needCp(state).captured(a.ref) }),
+    run: async (state) => ({ data: await needCp(state).probe() }),
   },
   {
     name: 'logs',

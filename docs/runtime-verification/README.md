@@ -30,8 +30,8 @@ never by itself.
 
 | | |
 |---|---|
-| Project | `<home>/Documents/repo/NewProject_386` (Cocos Creator **3.8.6**) |
-| System under test | copse at `<home>/Documents/repo/copse` |
+| Project | `/path/to/NewProject_386` (Cocos Creator **3.8.6**) |
+| System under test | copse at `/path/to/copse` |
 | Editor bridge | `cocos-creator` MCP — editor open + preview server started (`:3000` / `:7456`) |
 | Static bridge | `coir` MCP on the same project (`mcp__coir__*`) |
 | copse bridge | `mcp__copse__*` — `connect{url:'http://localhost:7456/'}` then `reload` |

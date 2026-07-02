@@ -5,3 +5,7 @@ dist/
 # harvested third-party game data + fetched bundles — NEVER commit (public repo; contains
 # operator/game/host identifiers + copyrighted assets). Covers harvest/, harvest-headed/, etc.
 harvest*/
+# local Cocos engine source checkouts (git clone per version → reference/cocos/<ver>) used to
+# validate copse's internal-field assumptions + build real-engine test fixtures. Third-party,
+# hundreds of MB each — a local reference, never vendored into copse.
+reference/

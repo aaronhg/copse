@@ -37,7 +37,7 @@ The default tool set is the 14 testing primitives below. The tool names match th
 | `coverage(staticRows)` | join coir's static ClickEvent rows against the live click surface → buckets `{covered, blocked, uncertain, unreached, ambiguous, codeRegistered, codeOnly}` — the coir×copse capability in one call (see [`COVERAGE.md`](COVERAGE.md)) |
 | `diff(before, after)` | diff two snapshots → `appeared/disappeared/activated/deactivated/labelChanged` (for manual before→act→after comparisons; `press`/`call` already attach this as `changed`) |
 | `listeners(ref)` | user `node.on()` handlers `[{type, fn?, target?}]` (minified builds strip names) |
-| `hijack()` / `captured(ref)` | opt-in: record `node.on()` registrations made *after* `hijack`, then read them — mainly for wiring that happens on a later scene/panel load |
+| `probe()` | engine-coupling self-diagnostic: `{version, classes, reach, events, touch}` — which version-sensitive internals resolve on this build (drift → visible, not a silent `'unsure'`) |
 | `logs(since?)` | captured `console.*` + uncaught errors (all frames) `[{level, text, t, stack?}]` — check if an action errored with no visible UI change |
 | `close()` | tear down the browser (also detaches the debugger) |
 

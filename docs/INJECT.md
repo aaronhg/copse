@@ -9,10 +9,13 @@ console). Three ways, lowest-friction first.
 > it away — keep copse to dev/preview. If `window.cc` is missing, find the engine's
 > module export and pass it to `install(...)`.
 
-> Build the bundle once: `npm run build` → `dist/copse.inject.js`. It's a single
-> self-contained IIFE (no ESM) that exposes `globalThis.copse` and **auto-installs**
+> Build once: `npm run build` → `dist/copse.inject.js` (full) **and**
+> `dist/copse.inject.lite.js` (lite — `snapshot`/`press`/`get`/`call`/`node`/`diff`, with
+> reachability tree-shaken out: ~half the size + a smaller anti-tamper footprint, for a
+> `press`-only caller; `__copse.press`/`get`/`call` are byte-identical to the full one). Each is a
+> single self-contained IIFE (no ESM) that exposes `globalThis.copse` and **auto-installs**
 > `window.__copse` as soon as `cc` is live (it polls ~10s, so it's safe to inject
-> before the engine boots). All three methods below just get that one file to run in
+> before the engine boots). All three methods below just get one of those files to run in
 > the page.
 
 ## 1. DevTools console (manual, fastest to try)

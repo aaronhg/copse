@@ -86,8 +86,8 @@ __copse.reachable('Canvas/ShopBtn')  // { ok, reachable:true|false|'unsure', rea
 __copse.node('Canvas/Panel')                      // node intrinsics → { active, activeInHierarchy, opacity, scale, worldPos, size }
 __copse.diff(before, after)                        // → { appeared, activated, deactivated (node descriptors), labelChanged, ... }
 __copse.listeners('Canvas/ShopBtn')               // user node.on() handlers (best-effort; see caveat)
+__copse.probe()                                    // engine-coupling self-diagnostic → { version, classes, reach, events, touch } — which version-sensitive internals resolve on THIS build
 __copse.logs()                                     // captured console.* + uncaught errors → [{level,text,t,stack?}]
-__copse.hijack(); __copse.captured('Canvas/X')    // opt-in: record node.on() registrations made after install
 ```
 
 To check a panel opened ("press a panel button → its block appears"): `snapshot({includeInactive:true})`
@@ -210,7 +210,9 @@ Both `cp` and `agent` are just adapters — swap `connect` for a Playwright driv
 
 Paste `dist/copse.inject.js` (after `npm run build`) into the game's DevTools console
 and call `__copse.*` by hand — or inject via Playwright `addInitScript` / a dev-build
-hook. See [`docs/INJECT.md`](docs/INJECT.md).
+hook. See [`docs/INJECT.md`](docs/INJECT.md). `npm run build` also emits
+`dist/copse.inject.lite.js` — the same `press`/`get`/`call` surface with reachability
+tree-shaken out (~half the size, smaller anti-tamper footprint) for a `press`-only caller.
 
 ## Beyond testing — one CDP attach, another lens
 
@@ -229,9 +231,9 @@ driving a protected live game. See [`docs/DEBUG.md`](docs/DEBUG.md).
 ## Develop
 
 ```bash
-npm test          # node:test over a fake tree — no engine, no install
+npm test          # node:test over fake trees — no engine, no install (+ an opt-in real-engine L2 test that skips unless reference/cocos/<ver> is cloned)
 npm run typecheck # tsc --noEmit (needs `npm install` for the dev deps)
-npm run build     # bundle src/cocos/inject.js → dist/copse.inject.js (one self-contained IIFE)
+npm run build     # → dist/copse.inject.js (full) + dist/copse.inject.lite.js (lite: press-only, no reachability); both self-contained IIFEs
 ```
 
 How the design got here — decisions, pitfalls, real-game findings — is in

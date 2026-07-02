@@ -41,7 +41,7 @@ a minimal `Runtime` adapter**, so the pure core is testable in Node against plai
 
 ```
 src/core/index.js   snapshot / resolve / press / get / call / reachable / node / diff   ← pure, no engine
-src/cocos/          runtime.js (the cc.* adapter + install→window.__copse) + inject.js  ← the ONLY engine layer
+src/cocos/          runtime.js (base+lite cc.* adapter + install/installLite) · reachable.js (z-order, full-only → tree-shaken from lite) · probe.js (self-diagnostic) · inject.js/inject-lite.js (build entries)  ← the ONLY engine layer
 src/harness.js      runHarness — the AI loop, pure over a Driver + Agent adapter
 src/drivers/        puppeteer.js — optional browser driver (peer dep)
 src/agents/         claude.js   — optional claude -p agent (no npm dep)
@@ -71,12 +71,16 @@ paste, Playwright `addInitScript`, or a dev-build hook. Consequences:
 
 ---
 
-## 4. The Build Step (`dist/copse.inject.js`)
+## 4. The Build Step (`dist/copse.inject{,.lite}.js`)
 
 To make injection one self-contained file (instead of stripping ESM on the fly), `src/cocos/
 inject.js` is an **auto-installing entry**: it exposes `globalThis.copse` and polls for `cc`,
 calling `install(cc)` as soon as the engine boots (so it survives `addInitScript`, which runs
-*before* boot). `npm run build` = esbuild → a 6.5KB IIFE.
+*before* boot). `npm run build` = esbuild → two IIFEs: `dist/copse.inject.js` (full — the
+QA/coverage surface) and `dist/copse.inject.lite.js` (lite — `snapshot`/`press`/`get`/`call`/
+`node`/`diff`, with reachability tree-shaken out via a separate `reachable.js` module → ~half the
+size + a smaller anti-tamper footprint, for a `press`-only caller). `__copse.press`/`get`/`call`
+are byte-identical across the two.
 
 | Decision | Rationale |
 |---|---|
@@ -199,17 +203,21 @@ analysis — pixels, not the logic tree).
 
 ---
 
-## 9. Code-Registered Handlers (`codeHandlers` / `listeners` / `hijack`)
+## 9. Code-Registered Handlers (`codeHandlers` / `listeners`)
 
 Buttons don't always wire via serialized `clickEvents` — many register in code with
-`node.on(CLICK, …)`. Two complementary readers:
+`node.on(CLICK, …)`. The reader:
 
 - **`codeHandlers(node)`** reads the engine's `NodeEventProcessor` (`_eventProcessor` → capturing/
   bubbling `CallbacksInvoker._callbackTable`), filtering out engine-internal events + cc.Button's
-  own touch listeners → only user handlers remain. Works retroactively (reads current state).
-- **`hijack(cc)`** monkey-patches `Node.prototype.on` ("先過 inject 的 on,再往下拋") into a
-  `WeakMap` registry — captures registrations live, but **only those made after install** (so it
-  needs pre-boot injection to catch scene-load wiring).
+  own touch listeners → only user handlers remain. Works retroactively (reads current state), and its
+  `_callbackTable → callbackInfos → {callback,target}` walk is **L2-validated against real engine
+  source** (`test/real-engine.l2.test.js` constructs a real `CallbacksInvoker` from a local
+  `reference/cocos/<ver>` checkout and asserts copse parses it).
+
+  (A `hijack`/`captured` primitive — patch `Node.prototype.on` to record registrations made *after*
+  install — was removed: it overlapped `listeners`/`codeHandlers`, and patching the prototype is
+  non-native, tripping the anti-tamper `isNative` guards copse otherwise avoids.)
 
 Probe finding (and a corrected assumption): on the slot, the `click:[]` buttons turned out to be
 **genuinely unwired** (only the Button's own touch listeners), not secretly code-registered.
@@ -280,7 +288,7 @@ effect* became the delta.
 
 To make it a usable tool for outside users without polluting the zero-dep core:
 
-- **Core `copse`**: zero runtime deps; exports `runHarness`/`snapshot`/… + ships `dist/copse.inject.js`.
+- **Core `copse`**: zero runtime deps; exports `runHarness`/`snapshot`/… + ships `dist/copse.inject.js` (full) and `dist/copse.inject.lite.js` (lite).
 - **Optional subpaths**: `copse/driver-puppeteer` (`connect(url)` → a Driver; **peerDep** puppeteer-
   core, system Chrome) and `copse/agent-claude` (`makeClaudeAgent({goal,stopCondition,reportFormat})`
   → an Agent over the `claude -p` CLI, **no npm dep**).
@@ -318,8 +326,8 @@ plain tool-use loop) the harness — no need to grow copse's own loop.
   **stderr** (stdout is the protocol channel — puppeteer / the inject bundle / a chatty page must not
   corrupt it), a **serialized** handler chain (two browser ops never overlap), and `createDispatcher(state)`
   split out so the protocol is unit-testable without a browser. `src/mcp/tools.js` is the registry — the
-  **14 testing primitives** (`open`/`snapshot`/`interactive`/`press`/`get`/`call`/`reachable`/`node`/
-  `diff`/`listeners`/`hijack`/`captured`/`logs`/`close`) over a live `connect()` session in `state.cp`
+  **17 testing primitives** (`connect`/`reload`/`snapshot`/`interactive`/`click_surface`/`resolve`/`coverage`/
+  `press`/`get`/`call`/`reachable`/`node`/`diff`/`listeners`/`probe`/`logs`/`close`) over a live `connect()` session in `state.cp`
   (`press`/`call` carry the auto-`changed` delta straight through), plus **7 `debug:true`-tagged Debugger
   tools** (`break_*`/`wait_pause`/`eval_frame`/`debug_step`/`clear_breakpoints`, §18) that are **hidden
   from `tools/list` unless `copse mcp --debug`** (dev-build-only; pausing trips anti-debug). `connect` also
@@ -354,7 +362,7 @@ plain tool-use loop) the harness — no need to grow copse's own loop.
 | Minified component names | `components:["e","e"]` | Use ClickEvent handler names (serialised, survive minify); make `components` opt-in |
 | `get('…:cc.Label.string')` → no-component | OPEN read failed | The `cc.` prefix didn't resolve in that build; use the bare `Label`. AI also self-corrected |
 | Slim shape vs `diff` | activate not detected | Treat omitted `active` as active (`!== false`) in `diff` |
-| `Node.prototype.on` hijack timing | misses scene-load handlers | Only captures post-install registrations → pair with `_eventProcessor` introspection; pre-boot inject for full capture |
+| Cross-version internal drift | a `cc.*` internal renamed → silent `'unsure'` | `probe()` reports which internals resolve on a build; `codeHandlers` reads are L2-validated against real engine source |
 | `node()` on always-active container | no change seen on open | Use `diff` (scans the tree) instead, or target the actually-toggled node |
 
 ---
@@ -425,15 +433,19 @@ end. (The Network edge — a passive asset/RPC tap — was split out into the se
 
 ## 19. Validation Methodology (throughout)
 
-- **Headless tests** (`node:test`, zero deps): **32 cases** over fakes — core (addressing/`[i]`, press
+- **Headless tests** (`node:test`, zero deps): **90 cases** over fakes — core (addressing/`[i]`, press
   fire+emit+disabled/force **+ the touch fallback**, get/call, the `Node` pseudo-component, slim shape +
-  `relevant`, `reachable`/`node`/`diff` plumbing), the harness loop (plan/execute/judge, throwing-step
-  capture, the reachability hard-fail gate, iteration bound, the `report` stage), the MCP JSON-RPC
-  dispatcher (`createDispatcher`: tool dispatch, arg-mapping, debug-tool routing, error/teardown), and the
-  claude-agent factory shape (no LLM call).
-- **Probe-before-ship**: engine internals (`_eventProcessor` field names, `UITransform.hitTest` coord
-  space, hijack timing) were verified on the real build with throwaway probes before being written into
-  `runtime.js`.
+  `relevant`, `reachable`/`node`/`diff` plumbing), the geometric `reachable` over a fake `cc`, the base/lite
+  runtime split (`test/runtime-lite.test.js`), the `probe()` self-diagnostic, the harness loop (plan/execute/
+  judge, throwing-step capture, the reachability hard-fail gate, iteration bound, the `report` stage), the MCP
+  JSON-RPC dispatcher (`createDispatcher`), and the claude-agent factory shape (no LLM call).
+- **L2 — real engine**: `test/real-engine.l2.test.js` esbuild-bundles the event source from a local
+  `reference/cocos/<ver>` checkout (gitignored) and asserts copse's `codeHandlers` parses a **real**
+  `CallbacksInvoker._callbackTable` — the fragile internal read, validated against real engine code, not a
+  self-authored fake. Skips when no engine is checked out, so `npm test` stays green everywhere.
+- **`probe()`**: engine internals (`_eventProcessor` field names, `CallbacksInvoker._callbackTable` shape,
+  `UITransform.hitTest` coord space, `batcher2D.getFirstRenderCamera`) are surfaced live by `__copse.probe()`
+  — run it on an unfamiliar build to see which resolve, instead of finding out via a silent `'unsure'`.
 - **End-to-end**: snapshot/press/get/reachable/node/diff and the full AI loop run against a running
   game on a dev/preview build; the panel open/close flow PASSes.
 - **Build / typecheck**: `npm run build` (esbuild), `npm run typecheck` (`tsc --noEmit`, JSDoc +
