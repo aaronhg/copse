@@ -33,29 +33,32 @@ inspired by gstack's `/qa`); copse is the **runtime-pure-logic** route from it.
 - **MCP** (`copse mcp`): the bridge as MCP tools; verified driving a running game **natively
   from Claude Code** (open → dismiss → press → panel via `changed.appeared` → press
   close → `changed.disappeared`), no browser-use, adaptive (waited for a toggle to enable).
-- **CI**: 90 `node:test` cases green, `npm run typecheck` clean, `npm run build` → two
+- **CI**: 90 `node:test` cases green, `npm run typecheck` clean, `npm run build` → three
   self-contained IIFEs (each auto-installs `window.__copse` once `cc` is live): `dist/copse.inject.js`
-  (full — the QA/coverage surface) and `dist/copse.inject.lite.js` (lite — snapshot/press/get/call/node/diff,
-  reachability tree-shaken out; ~half the size, for a `press`-only caller like mast).
+  (full — the QA/coverage surface), `dist/copse.inject.lite.js` (lite — snapshot/press/get/call/node/diff,
+  reachability tree-shaken out; ~half the size, for a `press`-only caller like mast), and
+  `dist/copse.inject.probe.js` (probe — read+drive: reachability/`find`/`assets`/`press`, no
+  snapshot-extras/get/call/diff; for a load-metrics driver like mast's extension).
 
 ## Commands
 
 ```bash
 npm test           # node:test over FAKE trees (no engine, no install) — test/*.test.js (core + harness + mcp)
 npm run typecheck  # tsc --noEmit (JSDoc); needs `npm install` for the dev deps only
-npm run build      # build:full (inject.js → dist/copse.inject.js) + build:lite (inject-lite.js → dist/copse.inject.lite.js); both IIFEs, gitignored
+npm run build      # build:full + build:lite + build:probe → dist/copse.inject{,.lite,.probe}.js (IIFEs, gitignored)
 ```
 
 Run it: `copse ai <url> --goal "…"` / `copse scan <url>` / `copse mcp [url]` / single-shot
 `copse get|press|call|node|reachable <url> <sel>` / `copse coverage <url> <coir-rows.json>` (the coir×copse join)
-(the CLI is `src/cli.js`, runs directly; only `dist/copse.inject{,.lite}.js` are ever built). MCP: `claude mcp add copse -- node <abs>/src/cli.js mcp`
+(the CLI is `src/cli.js`, runs directly; only `dist/copse.inject{,.lite,.probe}.js` are ever built). MCP: `claude mcp add copse -- node <abs>/src/cli.js mcp`
 or a project `.mcp.json` — then any MCP client (Claude Code / browser-use) drives the canvas (see `docs/MCP.md`).
 
 There is **no runtime install** — copse is zero-dep (esbuild is a dev-only dep). To run
 against a real game you inject the bundle into the running page (console paste /
 Playwright `addInitScript` / dev-build hook — see `docs/INJECT.md`). `npm run build`
-produces `dist/copse.inject.js` (full) and `dist/copse.inject.lite.js` (lite — press-only, no
-reachability): paste one / `addInitScript` it and it exposes
+produces `dist/copse.inject.js` (full), `dist/copse.inject.lite.js` (lite — press-only, no
+reachability), and `dist/copse.inject.probe.js` (probe — read+drive metrics surface): paste one /
+`addInitScript` it and it exposes
 `globalThis.copse` and auto-installs `window.__copse` once `cc` is reachable (it polls
 ~10s for the engine to boot, since `addInitScript` runs pre-boot). The PoC driver was a
 **throwaway** in
@@ -89,7 +92,9 @@ Layout (grouped by concern; `src/index.js` is the public barrel):
     base **+ `reachable`**, `cocosRuntimeLite(cc)` = base ONLY. Plus `findCC()` (walk same-origin
     (i)frames → the game's `cc`), `startLogCapture()` (patch `console.*` + errors), and the two installers:
     `install(cc)` (full `window.__copse`: `snapshot`/`interactive`/`press`/`get`/`call`/`reachable`/`node`/`diff`/
-    `listeners`/`probe`/`logs`) and `installLite(cc)` (minimal: `snapshot`/`press`/`get`/`call`/`node`/`diff`/`listeners`).
+    `listeners`/`probe`/`logs`), `installLite(cc)` (minimal: `snapshot`/`press`/`get`/`call`/`node`/`diff`/`listeners`),
+    and `installProbe(cc)` (read+drive metrics surface: `probe`/`firstClickable`/`find`/`interactive`/`reachable`/`press`
+    + `assetsPending` — keeps reachability, drops snapshot-extras/get/call/diff/logs; for a load-metrics driver).
     All verified on a dev/preview build.
   - `reachable.js` — `makeReachable(cc)`, the geometric `reachable` signal (`UITransform.hitTest` +
     **cross-camera/Layer z-order** (camera priority → sibling-index) + a separate `visible` signal
@@ -103,6 +108,10 @@ Layout (grouped by concern; `src/index.js` is the public barrel):
     Because it never references `makeReachable`/`install`, esbuild drops reachable.js → `dist/copse.inject.lite.js`
     (~half the size, smaller anti-tamper footprint). `__copse.press`/`get`/`call` are byte-identical to full's.
     Consumed by mast's `press:` stages (`copse/inject-lite` export, full `./inject` as fallback).
+  - `inject-probe.js` — the **probe build entry**: `installProbe`'s read+drive metrics surface
+    (`probe`/`firstClickable`/`find`/`reachable`/`press` + `assetsPending`). Keeps reachable.js but drops
+    snapshot-extras/get/call/diff/logs → `dist/copse.inject.probe.js` (`copse/inject-probe` export). Consumed by
+    mast's **extension** to time a Cocos game's load (first-interactive / assets-idle) and drive past the intro.
 - `src/harness.js` — **pure AI-driver loop** (`runHarness`), decoupled like the core: over a
   `Driver` adapter (`localDriver(scene, rt)` builds one over an in-process tree) and an
   `Agent` adapter whose `plan`/`judge`/`next`/`report` are the AI seams (`next`/`report`

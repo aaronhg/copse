@@ -10,7 +10,8 @@
     "./debug": "./src/debug.js",
     "./mcp": "./src/mcp/server.js",
     "./inject": "./dist/copse.inject.js",
-    "./inject-lite": "./dist/copse.inject.lite.js"
+    "./inject-lite": "./dist/copse.inject.lite.js",
+    "./inject-probe": "./dist/copse.inject.probe.js"
   },
   "bin": {
     "copse": "src/cli.js"
@@ -23,9 +24,10 @@
     "test": "node --test test/*.test.js",
     "typecheck": "tsc --noEmit",
     "prepare": "npm run build",
-    "build": "npm run build:full && npm run build:lite",
+    "build": "npm run build:full && npm run build:lite && npm run build:probe",
     "build:full": "esbuild src/cocos/inject.js --bundle --format=iife --outfile=dist/copse.inject.js --banner:js='/* copse inject bundle (full) — exposes globalThis.copse + auto-installs window.__copse once cc is live. Rebuild: npm run build */'",
-    "build:lite": "esbuild src/cocos/inject-lite.js --bundle --format=iife --outfile=dist/copse.inject.lite.js --banner:js='/* copse inject bundle (lite) — snapshot/press/get/call/node/diff only, NO reachability. Auto-installs window.__copse once cc is live. Rebuild: npm run build */'"
+    "build:lite": "esbuild src/cocos/inject-lite.js --bundle --format=iife --outfile=dist/copse.inject.lite.js --banner:js='/* copse inject bundle (lite) — snapshot/press/get/call/node/diff only, NO reachability. Auto-installs window.__copse once cc is live. Rebuild: npm run build */'",
+    "build:probe": "esbuild src/cocos/inject-probe.js --bundle --format=iife --outfile=dist/copse.inject.probe.js --banner:js='/* copse inject bundle (probe) — load-metrics + drive surface (probe/firstClickable/find/interactive/reachable/press) for a --until driver; keeps reachability, drops snapshot-extras/get/call/diff/logs. Auto-installs window.__copse once cc is live. Rebuild: npm run build */'"
   },
   "keywords": [
     "cocos",

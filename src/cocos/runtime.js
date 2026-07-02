@@ -269,3 +269,76 @@ export function installLite(cc, target = globalThis) {
   target.__copse = api;
   return api;
 }
+
+/**
+ * Pending downloads from the asset manager (best-effort across engine versions) — the "assets-idle"
+ * signal (returns to 0 after having been >0). Engine-coupled, so it lives here beside the runtimes.
+ * @param {any} cc @returns {{known:boolean, pending:number}}
+ */
+function assetsPending(cc) {
+  const am = cc && cc.assetManager; let pend = 0, known = false;
+  if (am && am.downloader) {
+    const dl = am.downloader, dn = dl._downloading;
+    if (dn && typeof dn.count === 'number') { pend += dn.count; known = true; }
+    else if (dn && dn._map && typeof dn._map.size === 'number') { pend += dn._map.size; known = true; }
+    if (dl._queue && typeof dl._queue.length === 'number') { pend += dl._queue.length; known = true; }
+  }
+  return { known, pending: pend };
+}
+
+/**
+ * Install the PROBE bridge as `target.__copse`: a load-metrics + drive surface — no snapshot-extras/get/
+ * call/diff/clickSurface/logs, so esbuild drops those from a bundle built off this path. It KEEPS the (heavy
+ * but essential) reachability layer + `press`, which is what a `--until` playbook driver needs. Used by
+ * inject-probe.js.
+ *   probe()        → { cc, scene, assetsKnown, assetsPending, firstReachable } — one-call poll for a metrics driver
+ *   firstClickable → name of the first ACTIVE clickable (cc.Button OR code/touch-handler node) that is
+ *                    reachable at its centre under z-order (broader than interactive(), which is cc.Button only)
+ *   find(name,{enabled}) → ref of the first interactive control matching `name` that is reachable [+enabled]
+ *                    (a `--until` reachable condition / press finder), or null
+ *   interactive()  → the reachable cc.Button list (snapshot with reachability)
+ *   reachable(sel) → { reachable, blockedBy } for one selector
+ *   press(ref,opts)→ drive a node (a `--until` press: action)
+ * @param {any} cc @param {any} [target]
+ */
+export function installProbe(cc, target = globalThis) {
+  const rt = cocosRuntime(cc);            // base + reachable (reachable.js) — reachability is the reused core
+  const root = () => cc.director.getScene();
+  const firstClickable = () => {
+    const scene = root(); if (!scene) return null;
+    let hit = null;
+    const walk = (n) => {
+      if (hit || !n || !rt.isActive(n)) return;
+      const clickable = !!rt.asButton(n) || !!(rt.codeHandlers && (rt.codeHandlers(n) || []).length);
+      if (clickable) { const r = rt.reachable(n); if (r && r.reachable === true) { hit = n.name || '?'; return; } }
+      const kids = rt.children(n); for (let i = 0; i < kids.length; i++) walk(kids[i]);
+    };
+    const top = rt.children(scene); for (let i = 0; i < top.length; i++) walk(top[i]);
+    return hit;
+  };
+  // Resolve a NAME (substring, case-insensitive) to the first interactive control whose ref matches AND is
+  // reachable [and, when enabled, interactable] — returns its ref (for a `--until` reachable/press-finder).
+  const find = (name, opts) => {
+    const q = (name || '').toLowerCase(); const wantEnabled = !!(opts && opts.enabled);
+    const list = snapshot(root(), rt, { onlyInteractive: true, reachability: true });
+    for (const d of list) {
+      if (q && (d.ref || '').toLowerCase().indexOf(q) < 0) continue;
+      if (wantEnabled && d.interactable === false) continue;
+      if (d.reachable === true) return { ref: d.ref, interactable: d.interactable !== false };
+    }
+    return null;
+  };
+  const api = {
+    probe: () => { const scene = root(); const a = assetsPending(cc);
+      return { cc: true, scene: (scene && (scene.name || scene._name)) || null, assetsKnown: a.known, assetsPending: a.pending, firstReachable: firstClickable() }; },
+    firstClickable,
+    find,
+    interactive: (opts) => snapshot(root(), rt, { onlyInteractive: true, reachability: true, ...opts }),
+    reachable: (sel) => reachable(root(), rt, sel),
+    press: (path, opts) => press(root(), rt, path, opts),   // drive a node past intros (a `--until` press: action)
+    assets: () => assetsPending(cc),
+    rt,
+  };
+  target.__copse = api;
+  return api;
+}

@@ -9,10 +9,12 @@ console). Three ways, lowest-friction first.
 > it away — keep copse to dev/preview. If `window.cc` is missing, find the engine's
 > module export and pass it to `install(...)`.
 
-> Build once: `npm run build` → `dist/copse.inject.js` (full) **and**
-> `dist/copse.inject.lite.js` (lite — `snapshot`/`press`/`get`/`call`/`node`/`diff`, with
-> reachability tree-shaken out: ~half the size + a smaller anti-tamper footprint, for a
-> `press`-only caller; `__copse.press`/`get`/`call` are byte-identical to the full one). Each is a
+> Build once: `npm run build` → `dist/copse.inject.js` (full), `dist/copse.inject.lite.js` (lite —
+> `snapshot`/`press`/`get`/`call`/`node`/`diff`, reachability tree-shaken out: ~half the size + a
+> smaller anti-tamper footprint, for a `press`-only caller; `__copse.press`/`get`/`call` are
+> byte-identical to the full one), **and** `dist/copse.inject.probe.js` (probe — a read+drive metrics
+> surface: `probe`/`find`/`reachable`/`press` + `assetsPending`; keeps reachability, drops
+> snapshot-extras/get/call/diff/logs; built from `installProbe`, used by mast's extension). Each is a
 > single self-contained IIFE (no ESM) that exposes `globalThis.copse` and **auto-installs**
 > `window.__copse` as soon as `cc` is live (it polls ~10s, so it's safe to inject
 > before the engine boots). All three methods below just get one of those files to run in
