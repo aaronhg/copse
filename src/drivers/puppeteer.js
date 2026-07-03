@@ -28,8 +28,9 @@ async function loadPuppeteer() {
  * @param {string} url
  * @param {{bundlePath?:string|URL, executablePath?:string, browserURL?:string, browserWSEndpoint?:string, attach?:boolean, match?:string, attachTries?:number, headless?:any, viewport?:any, fpsCap?:number, timeout?:number, bootTries?:number, readyTries?:number, maxLogs?:number, settle?:boolean|{maxMs?:number,interval?:number}}} [opts]
  *        attach: drive an ALREADY-OPEN tab in `browserURL`'s Chrome (find it by `match` URL
- *        substring; no navigation — for Cloudflare/login sites a human got past, so a fresh
- *        goto won't re-trigger the gate). `close()` then just disconnects, leaving your browser open.
+ *        substring; omit match+url to attach the ACTIVE tab — the one you're looking at; no
+ *        navigation — for Cloudflare/login sites a human got past, so a fresh goto won't
+ *        re-trigger the gate). `close()` then just disconnects, leaving your browser open.
  *        settle: after a mutating press/call, wait until the tree stabilises (tweens) then
  *        attach a `changed` auto-diff to the result. Default on; `settle:false` to disable.
  */
@@ -53,15 +54,27 @@ export async function connect(url, opts = {}) {
   // attach mode: drive an ALREADY-OPEN tab (you passed Cloudflare / login as a human and
   // launched the game) — find it by URL substring and DON'T navigate (a fresh goto would
   // re-trigger the bot gate; CDP attach opens no DevTools panel, so anti-devtools stays dormant).
+  // No match/url → the ACTIVE tab (the one you're looking at, or one another CDP tool — e.g.
+  // chrome-devtools-mcp — brought to front): visibilityState is 'visible' only for each window's
+  // front tab; prefer the focused window when several windows qualify. Each probe is race-bounded
+  // so a tab halted at a breakpoint can't hang the scan — which also means a PAUSED tab reads
+  // 'hidden' and won't be picked: attach to a paused game via `match`.
   let page;
   if (opts.attach) {
     const needle = opts.match || url || '';
+    const probe = (pg, fn, dflt) => Promise.race([pg.evaluate(fn).then((v) => v, () => dflt), sleep(800).then(() => dflt)]);
+    const activeTab = async (pages) => {
+      const vis = [];
+      for (const pg of pages) { if (await probe(pg, () => document.visibilityState, 'hidden') === 'visible') vis.push(pg); }
+      for (const pg of vis) { if (await probe(pg, () => document.hasFocus(), false)) return pg; }
+      return vis[0] || pages[0] || null;
+    };
     for (let i = 0, n = opts.attachTries ?? 30; i < n && !page; i++) {
       const pages = await browser.pages();
-      page = pages.find((pg) => pg.url().includes(needle)) || (needle ? null : pages[0]);
+      page = needle ? (pages.find((pg) => pg.url().includes(needle)) || null) : await activeTab(pages);
       if (!page) await sleep(1000);
     }
-    if (!page) throw new Error(`attach: no open tab matching "${needle}" — open the game in that Chrome first`);
+    if (!page) throw new Error(needle ? `attach: no open tab matching "${needle}" — open the game in that Chrome first` : 'attach: no open tab in that Chrome — open the game first');
   } else {
     page = await browser.newPage();
     await page.setViewport(opts.viewport || { width: 414, height: 896, isMobile: true, hasTouch: true, deviceScaleFactor: 2 });
@@ -201,6 +214,17 @@ export async function connect(url, opts = {}) {
     clickSurface: (o) => ev((o) => window.__copse.clickSurface(o), o ?? {}), // join-ready (ref, method) rows for coir cross-reference
     press: (ref, o) => mutate(() => ev(([r, o]) => window.__copse.press(r, o), [ref, o ?? {}])),
     call: (sel, ...a) => mutate(() => ev(([s, a]) => window.__copse.call(s, ...a), [sel, a])),
+    // Arbitrary expression eval in the cc frame's MAIN WORLD (global scope) — NO pause, unlike the
+    // CDP eval_frame (which needs a breakpoint and freezes the renderer). Runs via indirect eval so
+    // cc / window / window.__copse / cc.find are all in reach; a returned thenable is awaited; the
+    // value is coerced to a JSON-safe form so a non-serialisable return doesn't blow up the bridge.
+    eval: (expr) => ev((code) => {
+      const wrap = (v) => { let value = v; try { JSON.stringify(v); } catch { try { value = String(v); } catch { value = '[unserializable]'; } } return { ok: true, value }; };
+      try {
+        const r = (0, eval)(code);
+        return (r && typeof r.then === 'function') ? r.then(wrap, (e) => ({ ok: false, error: (e && e.message) || String(e) })) : wrap(r);
+      } catch (e) { return { ok: false, error: (e && e.message) || String(e) }; }
+    }, expr),
     get: (sel) => ev((s) => window.__copse.get(s), sel),
     reachable: (sel) => ev((s) => window.__copse.reachable(s), sel),
     node: (sel) => ev((s) => window.__copse.node(s), sel),

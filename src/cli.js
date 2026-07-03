@@ -3,7 +3,7 @@
 // copse CLI — the official entry (registered as `copse`, runs this file directly; no build).
 //   copse ai   <url> --goal "<what to test>" [--stop ..] [--report ..] [--rounds N] [--model ..]
 //   copse scan <url>                          # one-shot: print snapshot/interactive/labels
-//   copse mcp  [url] [--debug]                # JSON-RPC/stdio MCP server (see examples/mcp.md)
+//   copse mcp  [url] [--no-debug]             # JSON-RPC/stdio MCP server (see examples/mcp.md)
 //   copse get/press/call/node/reachable <url> <sel>   # single-shot primitive → JSON (pipe to jq)
 //
 // Heavy/optional bits (puppeteer-core driver, the claude agent, the MCP server) are
@@ -43,9 +43,10 @@ const USAGE = `copse — drive & assert a running Cocos game
   copse ai   <url> --goal "<what to test>" [--stop "<when to stop>"] [--report "<format>"]
                    [--rounds N] [--model sonnet|opus|...] [--chrome <path>] [--browser-url <url>]
   copse scan <url> [--chrome <path>]
-  copse mcp  [url] [--debug]  start a JSON-RPC/stdio MCP server (any MCP client drives the game;
+  copse mcp  [url] [--no-debug]  start a JSON-RPC/stdio MCP server (any MCP client drives the game;
                     omit url to let the client's 'connect' tool choose — see examples/mcp.md;
-                    --debug also surfaces the CDP Debugger tools, hidden by default)
+                    the CDP Debugger tools are included by default — --no-debug hides them,
+                    e.g. against a protected / anti-debug game)
 
   one-shot (connect → run one op → print JSON → close; pipe to jq):
   copse get   <url> <path:Comp.member>      read a member, e.g. Canvas/Score:Label.string
@@ -55,13 +56,15 @@ const USAGE = `copse — drive & assert a running Cocos game
   copse reachable <url> <ref>                best-effort: is the button covered by an overlay?
   copse probe <url>                          engine-coupling self-diagnostic (version + which internals resolve)
   copse coverage <url> <coir-rows.json>      coir×copse join → coverage buckets (rows = coir's static ClickEvent JSON; file or inline)
+  copse run  <url> <script.json>             replay a frozen test script (docs/SCRIPTS.md) → result JSON; exit 0 pass / 1 fail (CI)
 
   common:  --version|-V   print the copse version    (--verbose|-v is untruncated step results)
            -o|--output <folder>   append the run log to <folder>/<cmd>.log
            --headed       show a visible browser window (default headless); --fps N raise the fps cap to watch
            --browser-url <url>   attach to your own Chrome (run it with --remote-debugging-port) and drive that
            --attach [--match <substr>]   drive an ALREADY-OPEN tab in that Chrome without navigating
-                         (for Cloudflare/login sites you got past by hand) — needs --browser-url
+                         (for Cloudflare/login sites you got past by hand) — needs --browser-url;
+                         omit --match (and <url>) to drive the ACTIVE tab (the one you're looking at)
 
 Setup:  npm run build   (produces dist/copse.inject.js)   +   npm i -D puppeteer-core
 The 'ai' command also needs the 'claude' CLI logged in.`;
@@ -72,10 +75,10 @@ if (!cmd || cmd === '-h' || cmd === '--help') { console.log(USAGE); process.exit
 // It runs until stdin EOF, then exits from inside startMcpServer.
 if (cmd === 'mcp') {
   const { startMcpServer } = await import('./mcp/server.js');
-  await startMcpServer({ url, connectOpts, debug: has('--debug') }); // --debug surfaces the CDP Debugger tools (hidden by default)
+  await startMcpServer({ url, connectOpts, debug: !has('--no-debug') }); // Debugger tools advertised by default; --no-debug hides them (anti-debug games)
 } else if (cmd === 'scan' || cmd === 'ai') {
   const target = url || connectOpts.match;                  // attach mode can use --match instead of a <url>
-  if (!target) { console.error(`${cmd}: a <url> (or --attach --match <substr>) is required\n\n${USAGE}`); process.exit(1); }
+  if (!target && !connectOpts.attach) { console.error(`${cmd}: a <url> (or --attach [--match <substr>]) is required\n\n${USAGE}`); process.exit(1); } // bare --attach → active tab
   const outDir = flag('-o') || flag('--output');
   let sink = null;
   if (outDir) { mkdirSync(outDir, { recursive: true }); sink = createWriteStream(join(outDir, `${cmd}.log`), { flags: 'a' }); }
@@ -83,7 +86,7 @@ if (cmd === 'mcp') {
   const { connect } = await import('./drivers/puppeteer.js'); // lazy: only load puppeteer-core when actually driving
   out('\n' + '='.repeat(72));
   out(`# copse ${cmd} @ ${new Date().toISOString()}`);
-  out(`# ${connectOpts.attach ? 'attach' : 'url'}: ${target}`);
+  out(`# ${connectOpts.attach ? 'attach' : 'url'}: ${target || '(active tab)'}`);
 
   if (cmd === 'scan') {
     const cp = await connect(target, connectOpts);
@@ -128,13 +131,13 @@ if (cmd === 'mcp') {
   // between `scan` (read-only discovery) and `ai` (the whole LLM loop) — a quick shell-level
   // press/get/call without writing a script or opening MCP. Prints raw JSON (pipe to jq).
   const target = url || connectOpts.match;
-  if (!target) { console.error(`${cmd}: a <url> (or --attach --match <substr>) is required\n\n${USAGE}`); process.exit(1); }
+  if (!target && !connectOpts.attach) { console.error(`${cmd}: a <url> (or --attach [--match <substr>]) is required\n\n${USAGE}`); process.exit(1); } // bare --attach → active tab
   // the selector/ref is the first positional that isn't the <url>; `call` takes trailing args.
   const positionals = rest.filter((a, i) => !/^-/.test(a) && !VAL_FLAGS.has(rest[i - 1]) && a !== url);
   const sel = positionals[0];
   if (!sel) {
     const eg = cmd === 'get' ? 'Canvas/Score:Label.string' : cmd === 'call' ? 'Canvas/Mgr:Ctrl.buy 30' : 'Canvas/ShopBtn';
-    console.error(`${cmd}: a selector/ref is required, e.g. copse ${cmd} ${target} ${eg}\n\n${USAGE}`); process.exit(1);
+    console.error(`${cmd}: a selector/ref is required, e.g. copse ${cmd} ${target || '<url>'} ${eg}\n\n${USAGE}`); process.exit(1);
   }
   const jsonOr = (s) => { try { return JSON.parse(s); } catch { return s; } }; // call args: JSON if it parses, else a string
   const callArgs = positionals.slice(1).map(jsonOr);
@@ -153,19 +156,38 @@ if (cmd === 'mcp') {
   // single-shot with NO selector: connect → __copse.probe() → print the engine-coupling diagnostic.
   // Run it on an unfamiliar build to see whether copse's version-sensitive internals resolve here.
   const target = url || connectOpts.match;
-  if (!target) { console.error(`probe: a <url> (or --attach --match <substr>) is required\n\n${USAGE}`); process.exit(1); }
+  if (!target && !connectOpts.attach) { console.error(`probe: a <url> (or --attach [--match <substr>]) is required\n\n${USAGE}`); process.exit(1); } // bare --attach → active tab
   const { connect } = await import('./drivers/puppeteer.js');
   const cp = await connect(target, connectOpts);
   try { console.log(J(await cp.probe())); } finally { await cp.close(); }
+} else if (cmd === 'run') {
+  // Deterministic replay: connect → runScript(script.json) → result JSON → exit code for CI.
+  // The zero-LLM half of the test loop (docs/SCRIPTS.md) — scripts come from a dumped MCP
+  // session / a frozen `copse ai` run / by hand.
+  const target = url || connectOpts.match;
+  if (!target && !connectOpts.attach) { console.error(`run: a <url> (or --attach [--match <substr>]) is required\n\n${USAGE}`); process.exit(1); } // bare --attach → active tab
+  const positionals = rest.filter((a, i) => !/^-/.test(a) && !VAL_FLAGS.has(rest[i - 1]) && a !== url);
+  const src = positionals[0];
+  if (!src) { console.error(`run: a script JSON (file path or inline) is required, e.g. copse run ${target || '<url>'} tests/shop.json\n\n${USAGE}`); process.exit(1); }
+  let raw = src; try { raw = readFileSync(src, 'utf8'); } catch { /* not a file → treat the arg as inline JSON */ }
+  let script; try { script = JSON.parse(raw); } catch (e) { console.error(`run: couldn't parse the script from "${src}" — need a JSON file path or inline JSON ({name?, steps:[…]}): ${e.message}`); process.exit(1); }
+  const { runScript } = await import('./script.js');
+  const { connect } = await import('./drivers/puppeteer.js');
+  const cp = await connect(target, connectOpts);
+  try {
+    const r = await runScript(cp, script);
+    console.log(J(r));
+    process.exitCode = r.pass ? 0 : 1;
+  } finally { await cp.close(); }
 } else if (cmd === 'coverage') {
   // The combined coir×copse capability at the shell: connect → clickSurface(live) → coverageJoin(coir's
   // static rows) → the coverage buckets as JSON. <rows> is coir's ClickEvent JSON ([{nodePath, method}]) —
   // a file path or inline; get it from coir's CLI/MCP. --no-reachable skips the reachable pass.
   const target = url || connectOpts.match;
-  if (!target) { console.error(`coverage: a <url> (or --attach --match <substr>) is required\n\n${USAGE}`); process.exit(1); }
+  if (!target && !connectOpts.attach) { console.error(`coverage: a <url> (or --attach [--match <substr>]) is required\n\n${USAGE}`); process.exit(1); } // bare --attach → active tab
   const positionals = rest.filter((a, i) => !/^-/.test(a) && !VAL_FLAGS.has(rest[i - 1]) && a !== url);
   const src = positionals[0];
-  if (!src) { console.error(`coverage: a coir static-rows JSON (file path or inline) is required, e.g. copse coverage ${target} coir-rows.json\n\n${USAGE}`); process.exit(1); }
+  if (!src) { console.error(`coverage: a coir static-rows JSON (file path or inline) is required, e.g. copse coverage ${target || '<url>'} coir-rows.json\n\n${USAGE}`); process.exit(1); }
   let raw = src; try { raw = readFileSync(src, 'utf8'); } catch { /* not a file → treat the arg as inline JSON */ }
   let staticRows; try { staticRows = JSON.parse(raw); } catch (e) { console.error(`coverage: couldn't parse static rows from "${src}" — need a JSON file path or inline JSON array ([{nodePath, method}]): ${e.message}`); process.exit(1); }
   if (!Array.isArray(staticRows)) { console.error('coverage: static rows must be a JSON ARRAY of {nodePath, method} (coir\'s ClickEvent edges)'); process.exit(1); }

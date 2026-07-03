@@ -97,10 +97,31 @@ Addressing matches coir: `Parent/Child` node paths, `[i]` for same-name siblings
 `path:Comp.member`. Paths are relative to the scene root; `#N` absolute indices are
 unsupported (no stable index in a live tree).
 
+## Test scripts — freeze a flow, replay in CI
+
+A **script** is a frozen test flow: JSON steps (the same `{op, ref/sel, …}` shape the
+harness plans) plus `expect` subset-match assertions — replayed deterministically, **zero
+LLM**. Explore once (a Claude Code MCP session, or `copse ai`), freeze, replay forever:
+
+```bash
+copse run <url> tests/shop-open-close.json     # exit 0 pass / 1 fail — CI-ready
+# over MCP: run_script({script}); the session auto-records — dump_script() exports
+# every press/get/call made so far as a script skeleton to trim into expects
+```
+
+Steps with no `expect` still fail on facts: `ok:false`, a handler that threw/logged an
+error, a press that actuated nothing. Format, match semantics, and the
+explore→dump→trim→replay workflow: [`docs/SCRIPTS.md`](docs/SCRIPTS.md).
+
 ## AI-driver harness
 
 `runHarness(driver, agent, opts)` is the autonomous loop on top of those
 primitives — `snapshot → plan → press/get/call → judge → maybe iterate → report`.
+With scripts covering known-flow regression and Claude Code over MCP covering
+interactive exploration, the harness's lane is the **headless edge**: unattended CI
+smoke over flows nobody scripted yet (`copse ai --goal …`), fact gates (unreachable /
+errored / undriven hard-fail even a passing LLM verdict) — and a **script factory**:
+its `rounds[].steps` are already script steps, ready to freeze (docs/SCRIPTS.md).
 It's **pure and zero-dep**, decoupled through a `Driver` adapter (copse proxied
 into the page) and an `Agent` adapter whose methods are the points where the AI
 intervenes: `plan` (decide *what to test* + the expected outcome — the oracle),
@@ -142,6 +163,7 @@ npx copse press <url> Canvas/ShopBtn [--force] [--reachable-gate]  # press a but
 npx copse call  <url> Canvas/Mgr:Shop.buy 30           # invoke a method (arg JSON-parsed) → {ok,value,changed?}; missing method → {ok:false,reason:'no-method'}
 npx copse node  <url> Canvas/Panel                     # node intrinsics; copse reachable <url> <ref> for reachability
 npx copse coverage <url> coir-rows.json                # coir×copse join → coverage buckets (coir's static ClickEvent JSON: file or inline)
+npx copse run   <url> tests/shop.json                  # replay a frozen test script → JSON; exit 0/1 (docs/SCRIPTS.md)
 ```
 
 (`copse --version` prints the version; `copse --help` lists everything.)
@@ -170,18 +192,28 @@ tool names match the library 1:1 (including `connect`), so the two surfaces read
 claude mcp add copse -- npx copse mcp        # then: "Use copse: connect <url>, test a panel window"
 ```
 
-The default tool set is the 14 testing primitives. The CDP **debugger** tools are **hidden from the
-tool list by default** (dev-build-only — pausing trips anti-debug); start with `copse mcp --debug` to
-surface them (see [Beyond testing](#beyond-testing--one-cdp-attach-other-lenses)).
+The tool set is the testing primitives **plus the CDP debugger tools** (breakpoints by copse selector,
+call stack, step) — the official chrome-devtools-mcp has no Debugger domain, so that surface is
+copse-unique. Pass `copse mcp --no-debug` to hide the debugger tools against a **protected /
+anti-debug** game (pausing is exactly what those detect) — see
+[Beyond testing](#beyond-testing--one-cdp-attach-other-lenses).
 
 The valuable part of copse is the bridge; the agent loop is replaceable — borrow a good one. (Existing
 browser agents can't help here on their own: a Cocos game is one opaque `<canvas>` to the DOM.) See
 [`docs/MCP.md`](docs/MCP.md).
 
+**Compose with [`chrome-devtools-mcp`](https://github.com/ChromeDevTools/chrome-devtools-mcp)** — copse doesn't
+re-implement generic browser control. Register both servers against the same Chrome
+(`--remote-debugging-port=9222`): chrome-devtools-mcp navigates / screenshots / reads network+perf, copse
+attaches to the same tab — `connect({attach:true, browserURL})` with no `match` picks the **active tab** —
+and drives the Cocos scene inside the canvas, which stays one opaque element to every DOM-level tool.
+Recipe + division of labour: [`docs/MCP.md`](docs/MCP.md).
+
 **Gated sites** (Cloudflare / login / freeze-on-DevTools): a fresh headless launch trips the bot gate.
 Instead, open the game in **your own** Chrome (`--remote-debugging-port=9222`), pass the gate by hand,
 then register a plain `copse mcp` and **attach** without navigating — the agent calls
-`connect({attach:true, browserURL:"http://127.0.0.1:9222", match:"<url-substr>"})` (CLI: `--attach --browser-url --match`). CDP attach opens no
+`connect({attach:true, browserURL:"http://127.0.0.1:9222", match:"<url-substr>"})` (omit `match` → the
+active tab; CLI: `--attach --browser-url [--match]`). CDP attach opens no
 DevTools panel, so **anti-debug / devtools-detection stays dormant** — verified attaching to a
 Cloudflare-gated game opened by hand. (copse still only drives **Cocos** games.)
 
@@ -222,7 +254,7 @@ doesn't need `cc`) — a handy adjacent tool, deliberately kept off the main tes
 
 ### Breakpoints + call stack — CDP **Debugger**
 
-For your **own dev build**, `copse/debug` (and the MCP `--debug` tools) set breakpoints over the CDP
+For your **own dev build**, `copse/debug` (and the MCP debugger tools, on by default) set breakpoints over the CDP
 Debugger domain: `break_in Canvas/Mgr:ShopController.buy` breaks a component method **by copse selector**
 (resolved to the function, so it works minified) — trigger it, then read the call stack + locals
 (`wait_pause`/`eval_frame`/`debug_step`). Pausing trips anti-debug, so this is dev-only, not for

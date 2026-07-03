@@ -14,6 +14,38 @@ Browser agents (browser-use, Stagehand, Claude for Chrome, Computer Use) perceiv
 nothing inside is clickable. copse reaches into the engine and gives the agent a real tree +
 the ability to call the wired handler directly. Over MCP, that capability plugs into any of them.
 
+## Compose with chrome-devtools-mcp — one Chrome, two lenses
+
+copse deliberately does **not** re-implement generic browser control. Register the official
+[`chrome-devtools-mcp`](https://github.com/ChromeDevTools/chrome-devtools-mcp) alongside it and
+point **both at the same Chrome** — this shared-attach setup is the recommended shape:
+
+```bash
+# 1) one Chrome with a debug port (quit Chrome first so the flag takes)
+"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --remote-debugging-port=9222
+
+# 2) the generic browser lens: navigate, screenshot, network, performance, DOM input
+claude mcp add chrome-devtools -- npx chrome-devtools-mcp@latest --browser-url http://127.0.0.1:9222
+
+# 3) the Cocos scene lens (this server): snapshot/press/get/call/reachable/diff/coverage
+claude mcp add copse -- npx copse mcp
+```
+
+The agent navigates / passes gates / screenshots with chrome-devtools-mcp, then drives the game
+with copse: `connect({ attach: true, browserURL: "http://127.0.0.1:9222" })` attaches to the
+**active tab** — the one being viewed / the one chrome-devtools-mcp is on — so no URL guessing
+(add `match: "<url-substr>"` to pin a specific tab instead). Division of labour:
+
+| | chrome-devtools-mcp | copse |
+|---|---|---|
+| sees | DOM / pixels / network — the canvas is one opaque element | the live Cocos node tree **inside** the canvas |
+| acts | real input events, navigation, emulation | the wired handler, any component method |
+| asserts | screenshot, console, network, perf trace | component state, `changed` diff, reachability, coir coverage |
+
+Use both when one action needs rendering evidence (screenshot) **and** logic evidence (state
+delta). copse's own launch mode (`connect(url)` below) still works standalone — it's the
+fallback when you don't want a second server.
+
 ## Prereqs
 
 ```bash
@@ -23,8 +55,9 @@ npm i -D puppeteer-core # the browser edge (peer dep); the server launches syste
 
 ## Tools
 
-The default tool set is the 14 testing primitives below. The tool names match the library 1:1
-(`connect`, `snapshot`, `press`, …) — the MCP edge is the same surface over stdio.
+The tool set is 20 testing primitives (the main ones below) plus the 7 Debugger tools (next
+section). The tool names match the library 1:1 (`connect`, `snapshot`, `press`, …) — the MCP
+edge is the same surface over stdio.
 
 | tool | what it does |
 |---|---|
@@ -39,21 +72,24 @@ The default tool set is the 14 testing primitives below. The tool names match th
 | `listeners(ref)` | user `node.on()` handlers `[{type, fn?, target?}]` (minified builds strip names) |
 | `probe()` | engine-coupling self-diagnostic: `{version, classes, reach, events, touch}` — which version-sensitive internals resolve on this build (drift → visible, not a silent `'unsure'`) |
 | `logs(since?)` | captured `console.*` + uncaught errors (all frames) `[{level, text, t, stack?}]` — check if an action errored with no visible UI change |
+| `run_script({script})` | **replay a frozen test script** deterministically (no LLM): JSON steps + subset-match `expect`s → `{pass, failedAt?, steps}` — the regression half of the loop (see [`SCRIPTS.md`](SCRIPTS.md)) |
+| `dump_script({name?, reset?})` | export this session's recording (every press/get/call/… since `connect`, each with `observed`) as a script skeleton — trim `observed` into minimal `expect`s, save, replay |
 | `close()` | tear down the browser (also detaches the debugger) |
 
 `press`/`call` auto-attach `changed` (what the action did after the tree settles), so opening a
 panel hands the agent its contents with no follow-up snapshot.
 
-### Debugger tools (hidden by default)
+### Debugger tools (on by default)
 
 The CDP **Debugger** edge — `break_at(urlRegex, line)` / `break_in(sel)` / `break_exceptions(state)`
 to set a breakpoint (incl. by `path:Comp.method`, works minified) or pause on throws, then
 `wait_pause(timeoutMs?)` / `eval_frame(frame, expr)` / `debug_step(kind)` / `clear_breakpoints()` to
 read the call stack + locals and step/resume.
 
-These are **hidden from `tools/list` by default** (they're for your OWN dev build — pausing trips
-anti-debug games, and they'd otherwise crowd the menu). Start the server with **`copse mcp --debug`**
-to surface them. Full guide: [`DEBUG.md`](DEBUG.md).
+These are **advertised by default** — chrome-devtools-mcp has no Debugger domain, so breakpoints
+by copse selector are a copse-unique surface. They're for your OWN dev build: pausing is exactly
+what anti-debug games detect, so start the server with **`copse mcp --no-debug`** to hide them
+when driving a protected game. Full guide: [`DEBUG.md`](DEBUG.md).
 
 `connect` is **iframe-aware**: the game's `cc` often lives in a nested (sometimes cross-origin) iframe,
 so the server scans every frame (`page.frames()`) for the engine and drives that frame.
@@ -109,8 +145,9 @@ claude mcp add copse -- npx copse mcp
 
 Then ask the agent to `connect` in **attach** mode — pass `browserURL` + `match` straight to the tool (no
 need for any flag on `copse mcp`): `connect({ attach: true, browserURL: "http://127.0.0.1:9222", match: "your-game" })`.
-`close` then just disconnects — it leaves
-your browser open. (Library: `connect(url, { browserURL, attach: true, match })`.)
+Omit `match` (and `url`) to attach to the **active tab** — the one you're looking at. `close` then just
+disconnects — it leaves your browser open. (Library: `connect(url, { browserURL, attach: true, match })`;
+CLI: bare `--attach --browser-url …` with no `<url>`/`--match` also targets the active tab.)
 
 Caveat: copse only drives **Cocos** games (it needs `cc`). If the attached game isn't Cocos, `connect`
 finds no engine — that's an engine limit, not the gate.

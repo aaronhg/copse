@@ -6,3 +6,4 @@ export { snapshot, clickSurface, resolve, press, get, call, reachable, node, dif
 export { coverageJoin, resolveCoirPath, resolveCopseRef } from './coverage.js';
 export { cocosRuntime, install } from './cocos/runtime.js';
 export { runHarness, localDriver } from './harness.js';
+export { runScript, subsetMatch } from './script.js';

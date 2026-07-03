@@ -7,16 +7,61 @@
 // grammar: Parent/Child:Comp.prop, [i] to disambiguate same-name siblings.
 //
 // Tools tagged `debug: true` (the CDP Debugger surface: break_*/wait_pause/eval_frame/debug_step/
-// clear_breakpoints) are HIDDEN from tools/list by default — they're dev-build-only (pausing trips
-// anti-debug games) and would otherwise crowd the menu. `copse mcp --debug` surfaces them
-// (server.js filters by this tag). They stay callable by name regardless, so tests/power-users
-// aren't blocked.
+// clear_breakpoints) are ADVERTISED by default — the official chrome-devtools-mcp has no Debugger
+// domain, so this surface is copse-unique. `copse mcp --no-debug` hides them from tools/list
+// (server.js filters by this tag) for protected / anti-debug games, where pausing is exactly what
+// gets detected. They stay callable by name regardless, so tests/power-users aren't blocked.
 
 import { resolveCoirPath, coverageJoin } from '../coverage.js';
+import { runScript } from '../script.js';
 
 const needCp = (state) => {
   if (!state.cp) throw new Error('no open game — call the `connect` tool with a url first');
   return state.cp;
+};
+
+// ---- session recording (docs/SCRIPTS.md) ----------------------------------------------
+// Tools tagged `record: true` push a script step + `observed` onto state.history after each
+// successful call (wrapped at the bottom of this file), so `dump_script` can export the whole
+// session as a replayable skeleton. connect/reload/close are transport — never recorded.
+
+// MCP tool args → the harness/script Step shape ({op, ref?/sel?/args?/opts?}).
+const toStep = (name, a = {}) => {
+  switch (name) {
+    case 'press': {
+      const s = { op: 'press', ref: a.ref }; const o = {};
+      if (a.force) o.force = true; if (a.reachableGate) o.reachableGate = true;
+      if (Object.keys(o).length) s.opts = o;
+      return s;
+    }
+    case 'get': return { op: 'get', sel: a.sel };
+    case 'call': return { op: 'call', sel: a.sel, ...(a.args && a.args.length ? { args: a.args } : {}) };
+    case 'node': return { op: 'node', ref: a.ref };
+    case 'reachable': return { op: 'reachable', ref: a.ref };
+    case 'eval': return { op: 'eval', expr: a.expr };
+    case 'snapshot': {
+      const o = {}; for (const k of ['relevant', 'includeInactive', 'components']) if (a[k] !== undefined) o[k] = a[k];
+      return { op: 'snapshot', ...(Object.keys(o).length ? { opts: o } : {}) };
+    }
+    case 'interactive': return { op: 'interactive' };
+    default: return null;
+  }
+};
+
+// Cap `observed` so a whole-scene snapshot doesn't bloat the recording: long arrays keep the
+// first 12 elements (+ a marker), long strings are sliced, depth is bounded. Structure is
+// preserved — the agent trims observed into a minimal `expect` at dump time.
+const truncate = (v, depth = 0) => {
+  if (v === null || typeof v !== 'object') return typeof v === 'string' && v.length > 500 ? v.slice(0, 500) + '…' : v;
+  if (depth >= 6) return '…(deep)';
+  if (Array.isArray(v)) {
+    const head = v.slice(0, 12).map((x) => truncate(x, depth + 1));
+    if (v.length > 12) head.push(`…(+${v.length - 12} more)`);
+    return head;
+  }
+  const o = {};
+  for (const k of Object.keys(v)) o[k] = truncate(v[k], depth + 1);
+  return o;
 };
 
 // Lazily attach the CDP Debugger over the live session (state.dbg). Tests can pre-seed state.dbg.
@@ -29,11 +74,11 @@ const ensureDbg = async (state) => {
   return state.dbg;
 };
 
-/** @type {{name:string,description:string,inputSchema:any,debug?:boolean,run:(state:any,args:any)=>Promise<{data?:any,error?:string}>}[]} */
+/** @type {{name:string,description:string,inputSchema:any,debug?:boolean,record?:boolean,run:(state:any,args:any)=>Promise<{data?:any,error?:string}>}[]} */
 export const TOOLS = [
   {
     name: 'connect',
-    description: 'Launch a browser at <url> (or ATTACH to an already-open tab), load a running Cocos game, inject copse, wait until ready. Call this FIRST (same operation as the library connect()). headed:true shows a window; browserURL points at your own Chrome (started with --remote-debugging-port). attach:true + match drives an ALREADY-OPEN tab without navigating — use this for Cloudflare/login sites you got past by hand. Returns a readiness summary.',
+    description: 'Launch a browser at <url> (or ATTACH to an already-open tab), load a running Cocos game, inject copse, wait until ready. Call this FIRST (same operation as the library connect()). headed:true shows a window; browserURL points at your own Chrome (started with --remote-debugging-port). attach:true + match drives an ALREADY-OPEN tab without navigating — use this for Cloudflare/login sites you got past by hand. attach:true with NO url/match attaches to the ACTIVE tab (the one being viewed / another CDP tool such as chrome-devtools-mcp brought to front) — the natural mode when both servers share one Chrome. Returns a readiness summary.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -42,11 +87,12 @@ export const TOOLS = [
         fps: { type: 'number', description: 'frame-rate cap (default 10; raise to watch smoothly)' },
         browserURL: { type: 'string', description: 'CDP URL of an existing Chrome (e.g. http://127.0.0.1:9222) — required for attach' },
         attach: { type: 'boolean', description: 'drive an already-open tab (no navigation) instead of opening a new one' },
-        match: { type: 'string', description: 'when attach:true, pick the open tab whose URL contains this substring' },
+        match: { type: 'string', description: 'when attach:true, pick the open tab whose URL contains this substring (omit match AND url to attach the ACTIVE tab)' },
       },
     },
     run: async (state, a) => {
       if (state.cp) { try { await state.cp.close(); } catch { /* ignore */ } state.cp = null; }
+      state.history = []; // a new session starts a fresh recording (docs/SCRIPTS.md)
       const { connect } = await import('../drivers/puppeteer.js');
       const opts = { ...state.connectOpts };
       if (a.headed) opts.headless = false;
@@ -58,10 +104,13 @@ export const TOOLS = [
       // attached while the renderer is paused at a breakpoint → copse inject is deferred (it'd hang).
       // Return now: Debugger tools (wait_pause/eval_frame/break_at) work immediately; snapshot/press/
       // break_in auto-run once you resume.
-      if (state.cp.paused) return { data: { ok: true, url: target, attached: true, paused: true, note: 'renderer paused in the debugger — inject deferred. Use wait_pause/eval_frame/break_at now; snapshot/press/break_in run after you resume.' } };
+      // active-tab attach has no target string — report the URL of the tab actually attached
+      // (page.url() is CDP-cached, safe even while paused).
+      const at = () => { try { return target || state.cp.page.url(); } catch { return target; } };
+      if (state.cp.paused) return { data: { ok: true, url: at(), attached: true, paused: true, note: 'renderer paused in the debugger — inject deferred. Use wait_pause/eval_frame/break_at now; snapshot/press/break_in run after you resume.' } };
       const snap = await state.cp.snapshot({ relevant: true });
       const inter = await state.cp.interactive();
-      return { data: { ok: true, url: target, attached: !!opts.attach, relevantNodes: snap.length, buttons: inter.length } };
+      return { data: { ok: true, url: at(), attached: !!opts.attach, relevantNodes: snap.length, buttons: inter.length } };
     },
   },
   {
@@ -72,12 +121,14 @@ export const TOOLS = [
   },
   {
     name: 'snapshot',
+    record: true,
     description: 'Slim live node-tree snapshot: [{ref, button?, interactable?, click?, label?, codeHandlers?}]. Default relevant:true (only nodes with a testable surface — buttons/labels/code-handlers). includeInactive:true also walks hidden subtrees; components:true adds raw component types.',
     inputSchema: { type: 'object', properties: { relevant: { type: 'boolean' }, includeInactive: { type: 'boolean' }, components: { type: 'boolean' } } },
     run: async (state, a) => ({ data: await needCp(state).snapshot({ relevant: a.relevant ?? true, includeInactive: a.includeInactive, components: a.components }) }),
   },
   {
     name: 'interactive',
+    record: true,
     description: 'Buttons only, each annotated with reachable/blockedBy (best-effort geometric reachability).',
     inputSchema: { type: 'object', properties: {} },
     run: async (state) => ({ data: await needCp(state).interactive() }),
@@ -102,30 +153,42 @@ export const TOOLS = [
   },
   {
     name: 'press',
+    record: true,
     description: "Press a button by ref — runs its wired clickEvents + emits CLICK (NOT a coordinate click). Returns {ok, fired, drove, wired?, changed?, errors?}; `drove` = what actuated: ['clickEvent'] (serialized) / ['click'] (a real on('click')) / ['touch'] (a synthetic tap, best-effort) / 'nothing' — so a press that did NOTHING isn't misread as a pass (the harness hard-fails drove:'nothing'); `wired:false` on the ambiguous cases flags a button with no visible handler. `changed` auto-reports what the action did once the tree settles (appeared/disappeared/activated/deactivated/labelChanged as node descriptors, so you can read a panel's contents straight from it). `errors` lists any console-error / uncaught pageerror the handler produced during the press — present even when the engine swallowed the throw and `fired` looks fine, so a crashing handler is NOT a silent pass (the harness hard-fails on it). Honors interactable unless force:true. Set reachableGate:true to ALSO refuse a button a player can't reach (a confident reachable:false → {ok:false, reason:'unreachable', blockedBy}) — the same gate runHarness applies, off by default since press is for driving handler logic regardless of reach.",
     inputSchema: { type: 'object', properties: { ref: { type: 'string', description: 'node ref, e.g. Canvas/Panel/CloseBtn' }, force: { type: 'boolean', description: 'press even if interactable:false' }, reachableGate: { type: 'boolean', description: 'refuse the press if the button is a confident reachable:false (covered/off-screen)' } }, required: ['ref'] },
     run: async (state, a) => { const o = {}; if (a.force) o.force = true; if (a.reachableGate) o.reachableGate = true; return { data: await needCp(state).press(a.ref, o) }; },
   },
   {
     name: 'get',
+    record: true,
     description: 'Read a member for assertions: path:Comp.prop (e.g. Canvas/Score:Label.string), or path:Node.prop for a node intrinsic (e.g. Canvas/Panel:Node.active). Returns {ok, value}.',
     inputSchema: { type: 'object', properties: { sel: { type: 'string', description: 'path:Comp.member selector' } }, required: ['sel'] },
     run: async (state, a) => ({ data: await needCp(state).get(a.sel) }),
   },
   {
     name: 'call',
+    record: true,
     description: 'Invoke any method on any component: path:Comp.method(...args) — drives game logic beyond buttons. Returns {ok, value, changed?, errors?} (`errors` = any console-error / uncaught pageerror the method produced — surfaces a swallowed throw the same way press does).',
     inputSchema: { type: 'object', properties: { sel: { type: 'string', description: 'path:Comp.method selector' }, args: { type: 'array', items: {}, description: 'method arguments' } }, required: ['sel'] },
     run: async (state, a) => ({ data: await needCp(state).call(a.sel, ...(a.args || [])) }),
   },
   {
+    name: 'eval',
+    record: true,
+    description: "Evaluate an arbitrary JS expression in the game frame's MAIN WORLD (global scope), WITHOUT pausing the renderer — unlike eval_frame, which needs a breakpoint and freezes the game (collapsing async timing). `cc`, `window`, `window.__copse`, `cc.find(path)` are all in reach, so you can read engine/proxy state, fire REAL input the press tool can't (e.g. cc.find('…/Btn').emit('touch-end') on raw node.on(TOUCH_*) buttons), or drive game logic and watch its async timing play out live. A returned Promise is awaited (so `await`/thenables work). Returns {ok, value} with value coerced to a JSON-safe form (non-serialisable → String()), or {ok:false, error} on a throw. Big hammer — for your OWN dev build; pass an IIFE for multi-statement logic.",
+    inputSchema: { type: 'object', properties: { expr: { type: 'string', description: 'a JS expression (or IIFE) evaluated in-page at global scope' } }, required: ['expr'] },
+    run: async (state, a) => ({ data: await needCp(state).eval(a.expr) }),
+  },
+  {
     name: 'reachable',
+    record: true,
     description: "Best-effort geometric reachability. Returns {ok, reachable, blockedBy?, occludedBy?, visible}. `reachable` is TRI-STATE: true | false | 'unsure' — 'unsure' (NOT true) when it genuinely can't judge (no UITransform/camera/projection), so uncertainty fails LOUD, not open. `blockedBy` = an input-consumer (overlay / BlockInputEvents) swallowing the touch. `occludedBy` = an opaque sprite drawn OVER the button hiding it VISUALLY while a touch still passes through (reachable:true but a player can't see it). Treat reachable:false / 'unsure' / occludedBy as signals to verify, not gospel — no alpha hit-areas.",
     inputSchema: { type: 'object', properties: { ref: { type: 'string' } }, required: ['ref'] },
     run: async (state, a) => ({ data: await needCp(state).reachable(a.ref) }),
   },
   {
     name: 'node',
+    record: true,
     description: 'Node intrinsics for visibility checks: {active, activeInHierarchy, opacity, scale, worldPos, size}.',
     inputSchema: { type: 'object', properties: { ref: { type: 'string' } }, required: ['ref'] },
     run: async (state, a) => ({ data: await needCp(state).node(a.ref) }),
@@ -204,6 +267,22 @@ export const TOOLS = [
     run: async (state) => ({ data: await (await ensureDbg(state)).clear() }),
   },
   {
+    name: 'run_script',
+    description: 'Replay a FROZEN test script deterministically (no LLM) against the connected game — the regression half of the test loop (docs/SCRIPTS.md). `script` = {name?, continueOnFail?, steps:[…]}; each step is the harness Step shape {op, ref?/sel?/args?/opts?/expr?/note?} plus `expect` (subset match: primitives ===, objects by key, arrays CONTAINS) and `allowErrors`; {op:"sleep", ms} waits. A step with no expect passes on ok!==false; fact gates mirror runHarness: result.errors fails the step (unless allowErrors / an explicit errors expect) and a press with drove:"nothing" fails (unless an explicit drove expect). Default stops at the first failed step (continueOnFail:true runs all). Returns {pass, name?, failedAt?, steps:[{step, ok, ms, mismatch?, result?, gate?}]} — failing steps carry the full result.',
+    inputSchema: { type: 'object', properties: { script: { type: 'object', description: 'the script: {name?, continueOnFail?, steps:[{op, ref?/sel?/args?/opts?, expect?, allowErrors?}, …]}' } }, required: ['script'] },
+    run: async (state, a) => ({ data: await runScript(needCp(state), a.script) }),
+  },
+  {
+    name: 'dump_script',
+    description: "Export this session's recording as a script skeleton: every press/get/call/node/reachable/eval/snapshot/interactive call made since connect, in order, each as a ready script step plus `observed` (its actual result, truncated; connect/reload/close are transport — not recorded). To freeze a flow: drop the exploratory-noise steps, trim each observed into a MINIMAL `expect` (subset match — usually 1-2 keys; do NOT paste observed wholesale, full-result goldens are brittle), remove the observed fields, save as JSON, then replay with run_script / `copse run`. reset:true clears the recording for the next flow (a new connect also clears).",
+    inputSchema: { type: 'object', properties: { name: { type: 'string', description: 'script name to stamp on the export' }, reset: { type: 'boolean', description: 'clear the recording after exporting' } } },
+    run: async (state, a) => {
+      const steps = (state.history || []).slice();
+      if (a.reset) state.history = [];
+      return { data: { name: a.name || 'recorded-session', steps } };
+    },
+  },
+  {
     name: 'close',
     description: 'Close the browser session opened by `connect` (also detaches the debugger).',
     inputSchema: { type: 'object', properties: {} },
@@ -214,5 +293,21 @@ export const TOOLS = [
     },
   },
 ];
+
+// Wrap the record-tagged tools so every successful call lands in state.history as a
+// replayable step + observed — regardless of dispatch path (server or tests). Done here
+// (not in the server dispatcher) so recording is a registry concern, transport-agnostic.
+for (const t of TOOLS) {
+  if (!t.record) continue;
+  const orig = t.run;
+  t.run = async (state, args) => {
+    const res = await orig(state, args);
+    if (res && !res.error) {
+      const step = toStep(t.name, args);
+      if (step) (state.history || (state.history = [])).push({ ...step, observed: truncate(res.data) });
+    }
+    return res;
+  };
+}
 
 export const TOOLS_BY_NAME = new Map(TOOLS.map((t) => [t.name, t]));

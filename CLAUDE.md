@@ -20,6 +20,15 @@ data an AI (or a test) can query, and **both speak the same selector grammar**
 idea is `../aaron/canvas-ai-testing-plan.md` (the "make AI see into the canvas" plan,
 inspired by gstack's `/qa`); copse is the **runtime-pure-logic** route from it.
 
+Positioning vs generic CDP tooling: copse is the **Cocos scene layer over a CDP
+connection**, not a browser-automation harness. Generic browser control (navigate /
+screenshot / network / perf / DOM input) is commodity — the official `chrome-devtools-mcp`
+covers it, and to every such DOM-level tool the game stays one opaque `<canvas>`. The
+recommended shape is **both MCP servers sharing one Chrome** (`--remote-debugging-port=9222`):
+chrome-devtools-mcp navigates / passes gates / screenshots; copse **attaches** to the same
+tab (`connect({attach:true, browserURL})` — no `match` → the ACTIVE tab) and drives the
+scene. copse's own launch mode is the standalone fallback. See `docs/MCP.md`.
+
 ## Status
 
 **Working tool**, verified end-to-end on a **dev/preview build** (the editor-preview rig in
@@ -33,7 +42,7 @@ inspired by gstack's `/qa`); copse is the **runtime-pure-logic** route from it.
 - **MCP** (`copse mcp`): the bridge as MCP tools; verified driving a running game **natively
   from Claude Code** (open → dismiss → press → panel via `changed.appeared` → press
   close → `changed.disappeared`), no browser-use, adaptive (waited for a toggle to enable).
-- **CI**: 90 `node:test` cases green, `npm run typecheck` clean, `npm run build` → three
+- **CI**: 101 `node:test` cases green (+1 engine-gated skip), `npm run typecheck` clean, `npm run build` → three
   self-contained IIFEs (each auto-installs `window.__copse` once `cc` is live): `dist/copse.inject.js`
   (full — the QA/coverage surface), `dist/copse.inject.lite.js` (lite — snapshot/press/get/call/node/diff,
   reachability tree-shaken out; ~half the size, for a `press`-only caller like mast), and
@@ -50,6 +59,7 @@ npm run build      # build:full + build:lite + build:probe → dist/copse.inject
 
 Run it: `copse ai <url> --goal "…"` / `copse scan <url>` / `copse mcp [url]` / single-shot
 `copse get|press|call|node|reachable <url> <sel>` / `copse coverage <url> <coir-rows.json>` (the coir×copse join)
+/ `copse run <url> <script.json>` (deterministic script replay → exit 0/1, `docs/SCRIPTS.md`)
 (the CLI is `src/cli.js`, runs directly; only `dist/copse.inject{,.lite,.probe}.js` are ever built). MCP: `claude mcp add copse -- node <abs>/src/cli.js mcp`
 or a project `.mcp.json` — then any MCP client (Claude Code / browser-use) drives the canvas (see `docs/MCP.md`).
 
@@ -118,9 +128,24 @@ Layout (grouped by concern; `src/index.js` is the public barrel):
   optional). Loop `snapshot → (plan → execute → judge) → maybe iterate → report`, `maxRounds`-
   bounded, policy-free, throwing steps captured not fatal. Prompt-agnostic: `opts.context` is
   passed verbatim to every stage. No engine/LLM dep — those live at the adapter edges below.
+  **Lane (post-scripts):** the headless edge — unattended CI smoke over un-scripted flows
+  (`copse ai --goal`), fact gates over LLM opinion, and a **script factory** (`rounds[].steps`
+  freeze 1:1 into scripts). Interactive exploration belongs to Claude Code over MCP; known-flow
+  regression belongs to `src/script.js`. Don't invest in making the harness's agent smarter.
+- `src/script.js` — **pure deterministic script runner** (`runScript` + `subsetMatch`): replays a
+  FROZEN flow (JSON steps + subset-match `expect`s, `docs/SCRIPTS.md`) over the same `Driver`
+  adapter — the zero-LLM regression half. Step = the harness `Step` shape (+`expr`/`ms`/`since`) +
+  `expect`/`allowErrors`; subset match = primitives `===`, objects by key, arrays CONTAINS. No
+  `expect` → `ok !== false`; fact gates mirror the harness (`errors` fails unless
+  allowErrors/asserted; press `drove:'nothing'` fails unless asserted — an explicit expect
+  overrides its gate). Stops at the first fail (`continueOnFail` runs all); empty steps →
+  `pass:false`; per-step `{step, ok, ms, mismatch?/gate?, result?}`.
 - `src/drivers/puppeteer.js` — **optional** driver (`copse/driver-puppeteer`): `connect(url)`
   launches system Chrome (puppeteer-core peerDep), injects the bundle → a `Driver` for runHarness.
-  `cp.reload()` (factored `bootInPage`) re-navigates the tab + re-injects — picks up the editor's CURRENT
+  Attach mode (`{attach:true, browserURL, match?}`) drives an already-open tab; **no `match`/url →
+  the ACTIVE tab** (visibilityState/hasFocus probes, race-bounded so a paused tab can't hang the
+  scan — a paused game must be attached via `match`). `cp.reload()` (factored `bootInPage`)
+  re-navigates the tab + re-injects — picks up the editor's CURRENT
   scene after `scene_open_scene`, and recovers a wedged/empty preview (attach-found-`getScene()===null`).
   Browser-glue, so deliberately not `@ts-check`ed.
 - `src/agents/claude.js` — **optional** agent (`copse/agent-claude`): `makeClaudeAgent({goal,
@@ -135,14 +160,19 @@ Layout (grouped by concern; `src/index.js` is the public barrel):
   MCP tools so ANY MCP client (Claude Code / browser-use / Stagehand / a plain tool-use loop) drives
   the canvas. `server.js` = hand-rolled JSON-RPC-over-stdio (mirrors coir's `mcp/server.js`: stderr-only
   logging, serialized handler, `createDispatcher(state)` exported for tests; gates debug-tagged tools
-  out of `tools/list` unless `state.debug`); `tools.js` = the tool registry — 17 testing primitives by
-  default (`connect`/`reload`/`snapshot`/`interactive`/`click_surface`/`resolve`/`coverage`/`press`/`get`/`call`/`reachable`/`node`/`diff`/
-  `listeners`/`probe`/`logs`/`close`) + 7 `debug:true`-tagged Debugger tools (`break_*`/`wait_pause`/
-  `eval_frame`/`debug_step`/`clear_breakpoints`) **hidden unless `copse mcp --debug`** — over a live
-  `connect()` session (the MCP tool names match the library 1:1, incl. `connect`). The valuable part of copse is this bridge; the
+  out of `tools/list` when `state.debug` is falsy); `tools.js` = the tool registry — 20 testing primitives
+  (`connect`/`reload`/`snapshot`/`interactive`/`click_surface`/`resolve`/`coverage`/`press`/`get`/`call`/`eval`/`reachable`/`node`/`diff`/
+  `listeners`/`probe`/`logs`/`run_script`/`dump_script`/`close`) + 7 `debug:true`-tagged Debugger tools (`break_*`/`wait_pause`/
+  `eval_frame`/`debug_step`/`clear_breakpoints`), **all advertised by default** (chrome-devtools-mcp has no
+  Debugger domain, so the breakpoint surface is copse-unique; `copse mcp --no-debug` hides the debug 7
+  against protected/anti-debug games) — over a live
+  `connect()` session (the MCP tool names match the library 1:1, incl. `connect`). `record:true`-tagged
+  tools (press/get/call/node/reachable/eval/snapshot/interactive) are wrapped at the bottom of tools.js to
+  push `{…step, observed}` onto `state.history` on success — `dump_script` exports that recording as a
+  script skeleton (`docs/SCRIPTS.md`); `connect` resets it. The valuable part of copse is this bridge; the
   agent loop is replaceable.
 - `src/cli.js` — the **CLI** (registered as `copse`; runs directly, no build): `copse ai <url> --goal …`
-  / `copse scan <url>` / `copse mcp [url] [--debug]` / single-shot `copse get|press|call|node|reachable
+  / `copse scan <url>` / `copse mcp [url] [--no-debug]` / single-shot `copse get|press|call|node|reachable
   <url> <sel>` (connect → one primitive → JSON → close, for shell/jq) / `copse coverage <url> <coir-rows.json>`
   (connect → clickSurface + coverageJoin → buckets — the coir×copse capability at the shell) / `--version`.
   Thin wrapper over `connect` + `makeClaudeAgent` + `runHarness`;
@@ -153,6 +183,8 @@ Layout (grouped by concern; `src/index.js` is the public barrel):
   an interop corpus (coir-emitted paths must resolve in copse). Pins the contract in `docs/SELECTORS.md`.
 - `test/coverage.test.js` — the `coverageJoin` buckets incl. the prefab-internal prefix match + ambiguity.
 - `test/harness.test.js` — the harness loop over a fake driver + deterministic agent.
+- `test/script.test.js` — the script runner over a fake driver: subset/contains + mismatch paths,
+  the default ok/errors/drove judgment, expect-overrides-gate, sleep, stop-on-fail vs continueOnFail.
 - `test/mcp.test.js` — the MCP JSON-RPC dispatcher (`createDispatcher`) over a fake driver.
 - `test/reachable.test.js` — `cocosRuntime(cc).reachable` over a geometric fake `cc` (the only place the engine-coupled reachable runs in CI).
 - `test/runtime-lite.test.js` — the base/lite split contract (lite omits `reachable`; `press` works over lite).
@@ -169,6 +201,9 @@ Layout (grouped by concern; `src/index.js` is the public barrel):
   minified comp names) + its `Node` pseudo-component. Pinned by `test/selectors.test.js`.
 - `docs/MCP.md` — drive copse from any MCP client (Claude Code / browser-use); incl. **attach** mode
   for Cloudflare/login sites (attach to your own browser over CDP, no navigation).
+- `docs/SCRIPTS.md` — test scripts: format + subset-match semantics + the
+  explore→`dump_script`→trim→`run_script`/`copse run` workflow (freeze an explored flow into a
+  deterministic replay; also freezes 1:1 from `runHarness` rounds).
 - `docs/DEBUG.md` — `copse/debug` (CDP Debugger): breakpoints (incl. `break_in path:Comp.method`) +
   call stack / `eval_frame` / step, as MCP tools — for your own dev build.
 - `docs/INJECT.md` — the three ways to inject + the AI test loop.
@@ -273,7 +308,9 @@ mutation (read back off a component); code-registered handlers
 (`codeHandlers`/`listeners`); AI-driver harness (`runHarness` + `copse ai`, report-driven
 verdict, evidence-fed `next`); best-effort reachability (`reachable`/`blockedBy`); slim snapshot +
 settle + descriptor-rich `changed`; **MCP** (`copse mcp`, hand-rolled stdio, verified driving a
-running game natively from Claude Code).
+running game natively from Claude Code); **test scripts** (`runScript` + `run_script`/`dump_script`
+session recording + `copse run` — freeze an explored flow into a deterministic zero-LLM replay,
+`docs/SCRIPTS.md`).
 
 Remaining:
 
@@ -291,7 +328,12 @@ Remaining:
    statically unknowable).
 3. ✅ **Wire `reachable` into the harness** — a press to a covered/unreachable button is now a HARD fail in
    `runHarness` (overrides judge+report; surfaced as `out.unreachable`; `force`/`reachableGate:false` opt out).
-4. **MCP v2** — ✅ `diff`/`listeners`/`probe` tools added; debug tools gated behind `--debug`.
+4. **MCP v2** — ✅ `diff`/`listeners`/`probe` tools added (hijack/captured dropped with the probe refactor);
+   debug tools advertised by default
+   (`--no-debug` hides them — flipped once chrome-devtools-mcp made the Debugger surface the copse-unique part);
+   ✅ active-tab attach (no `match` needed) + the shared-Chrome composition with `chrome-devtools-mcp`
+   documented as the recommended shape (`docs/MCP.md`).
    Remaining: multi-session, a browser-use custom-actions example.
-5. **Adaptive re-planning within a round** — so a step whose target only appears after an earlier
-   step (e.g. a panel's close button) doesn't always need another round.
+5. ~~**Adaptive re-planning within a round**~~ — DEPRIORITIZED: that's "make the harness's agent
+   smarter", and interactive/adaptive exploration is Claude Code over MCP's lane now (the harness's
+   value is the deterministic shell + gates + script factory, not a smarter brain).

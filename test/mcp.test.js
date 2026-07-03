@@ -54,6 +54,7 @@ test('tools registry: each tool has name/description/object inputSchema; core to
   }
   const names = TOOLS.map((t) => t.name);
   for (const n of ['connect', 'reload', 'snapshot', 'interactive', 'click_surface', 'resolve', 'coverage', 'press', 'get', 'call', 'reachable', 'node', 'probe', 'logs', 'close',
+    'run_script', 'dump_script',
     'break_at', 'break_in', 'break_exceptions', 'wait_pause', 'eval_frame', 'debug_step', 'clear_breakpoints']) {
     assert.ok(names.includes(n), `missing tool ${n}`);
   }
@@ -146,11 +147,11 @@ test('inspection tools dispatch to the Driver (diff/listeners/probe)', async () 
   assert.equal(JSON.parse(p.result.content[0].text).version, '3.8.6');
 });
 
-test('tools/list hides debug tools by default; --debug (state.debug) surfaces them; hidden ≠ disabled', async () => {
+test('tools/list gates debug tools on state.debug (CLI defaults to true; --no-debug → false); hidden ≠ disabled', async () => {
   const core = await createDispatcher({ cp: null })({ id: 1, method: 'tools/list' });
   const coreNames = core.result.tools.map((t) => t.name);
   assert.ok(coreNames.includes('press') && coreNames.includes('diff') && coreNames.includes('listeners'), 'core tools advertised');
-  assert.ok(!coreNames.includes('break_in') && !coreNames.includes('wait_pause'), 'debug tools hidden by default');
+  assert.ok(!coreNames.includes('break_in') && !coreNames.includes('wait_pause'), 'debug tools hidden when state.debug is falsy (--no-debug)');
 
   const withDbg = await createDispatcher({ cp: null, debug: true })({ id: 2, method: 'tools/list' });
   const dbgNames = withDbg.result.tools.map((t) => t.name);
@@ -218,4 +219,41 @@ test('close tool tears down the session; notifications get no reply; unknown met
   assert.equal(await handle({ method: 'notifications/initialized' }), null); // no id, no reply
   const unknown = await handle({ id: 11, method: 'frobnicate' });
   assert.equal(unknown.error.code, -32601);
+});
+
+test('recording: record-tagged calls land in state.history as steps+observed; dump_script exports; reset clears', async () => {
+  const state = { cp: fakeCp() };
+  const handle = createDispatcher(state);
+  await handle({ id: 1, method: 'tools/call', params: { name: 'press', arguments: { ref: 'Canvas/Btn', force: true } } });
+  await handle({ id: 2, method: 'tools/call', params: { name: 'get', arguments: { sel: 'Canvas/Score:Label.string' } } });
+  await handle({ id: 3, method: 'tools/call', params: { name: 'listeners', arguments: { ref: 'Canvas/Btn' } } }); // transport-ish read: NOT recorded
+  const r = await handle({ id: 4, method: 'tools/call', params: { name: 'dump_script', arguments: { name: 'flow', reset: true } } });
+  const dump = JSON.parse(r.result.content[0].text);
+  assert.equal(dump.name, 'flow');
+  assert.equal(dump.steps.length, 2);
+  assert.equal(dump.steps[0].op, 'press');
+  assert.equal(dump.steps[0].ref, 'Canvas/Btn');
+  assert.deepEqual(dump.steps[0].opts, { force: true });          // MCP args → Step shape
+  assert.equal(dump.steps[0].observed.ok, true);                  // observed = the actual result
+  assert.equal(dump.steps[1].op, 'get');
+  assert.equal(dump.steps[1].sel, 'Canvas/Score:Label.string');
+  assert.equal(state.history.length, 0);                          // reset:true cleared it
+});
+
+test('run_script replays a frozen script over the live session and returns the runner result', async () => {
+  const handle = createDispatcher({ cp: fakeCp() });
+  const script = { name: 's', steps: [
+    { op: 'press', ref: 'Canvas/Btn', expect: { ok: true, changed: { appeared: [{ ref: 'Canvas/Panel' }] } } },
+    { op: 'get', sel: 'x', expect: { value: '42' } },
+  ] };
+  const green = await handle({ id: 1, method: 'tools/call', params: { name: 'run_script', arguments: { script } } });
+  const out = JSON.parse(green.result.content[0].text);
+  assert.equal(out.pass, true);
+  assert.equal(out.steps.length, 2);
+
+  const red = await handle({ id: 2, method: 'tools/call', params: { name: 'run_script', arguments: { script: { steps: [{ op: 'get', sel: 'x', expect: { value: 'nope' } }] } } } });
+  const bad = JSON.parse(red.result.content[0].text);
+  assert.equal(bad.pass, false);
+  assert.equal(bad.failedAt, 0);
+  assert.equal(bad.steps[0].mismatch.path, 'value');
 });
