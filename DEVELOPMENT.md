@@ -79,7 +79,7 @@ calling `install(cc)` as soon as the engine boots (so it survives `addInitScript
 *before* boot). `npm run build` = esbuild → two IIFEs: `dist/copse.inject.js` (full — the
 QA/coverage surface) and `dist/copse.inject.lite.js` (lite — `snapshot`/`press`/`get`/`call`/
 `node`/`diff`, with reachability tree-shaken out via a separate `reachable.js` module → ~half the
-size + a smaller anti-tamper footprint, for a `press`-only caller). `__copse.press`/`get`/`call`
+size + a smaller injected surface, for a `press`-only caller). `__copse.press`/`get`/`call`
 are byte-identical across the two.
 
 | Decision | Rationale |
@@ -189,7 +189,7 @@ blockedBy:"…/mask"` once a panel opened. The geometry has no real-engine CI, s
 (`test/reachable.test.js`) pins the ladder logic — but the camera-component and tree-shake gotchas above only
 surface on a **live minified build**. Treat `reachable:false`/`'unsure'` as a strong signal, not gospel.
 
-**Later upgraded (a multi-camera real slot forced it):** the draw-order key became `[camera priority,
+**Later upgraded (a multi-camera real game forced it):** the draw-order key became `[camera priority,
 …sibling-index]` — `camOf(node)` picks the node's rendering camera (visibility-mask ∩ `node.layer`, top
 `priority`) and projects with *that* camera, not always `cams[0]`; so it resolves **cross-camera/Layer
 z-order**. A two-agent review then caught a wrong turn: an opacity filter I'd added to skip transparent
@@ -219,7 +219,7 @@ Buttons don't always wire via serialized `clickEvents` — many register in code
   install — was removed: it overlapped `listeners`/`codeHandlers`, and patching the prototype is
   non-native, tripping the anti-tamper `isNative` guards copse otherwise avoids.)
 
-Probe finding (and a corrected assumption): on the slot, the `click:[]` buttons turned out to be
+Probe finding (and a corrected assumption): on the real game, the `click:[]` buttons turned out to be
 **genuinely unwired** (only the Button's own touch listeners), not secretly code-registered.
 `press` covers `on('click')` via the emitted CLICK, and now also **synthesizes a `TOUCH_START`→`END`
 tap** (`rt.emitTouch`, called only when no serialized clickEvent fired) so touch-wired buttons — common
@@ -238,7 +238,7 @@ alone don't cover. Two additions:
   pseudo-component.
 - **`diff(before, after)`** → `{appeared, disappeared, activated, deactivated, labelChanged}`. The
   general way to judge a transition: snapshot, act, snapshot, diff — the panel's subtree shows up in
-  `activated`/`appeared`. Verified on the slot menu: pressing the menu toggle put **21 menu nodes**
+  `activated`/`appeared`. Verified on a real game's menu: pressing the menu toggle put **21 menu nodes**
   in `diff.activated`; `reachable(menu item)` flipped `false → true`.
 
 A usage lesson: `node()` on an always-active *container* shows nothing; `diff()` scans the whole
@@ -248,7 +248,7 @@ tree and **finds the toggled subtree automatically** — so for "did X open", `d
 
 ## 11. Snapshot Slimming (A + B)
 
-Real trees are huge (a slot Q'd **516 nodes**, mostly spine/fbx bones) and the descriptors were
+Real trees are huge (a real game Q'd **516 nodes**, mostly spine/fbx bones) and the descriptors were
 verbose, so a verbose run logged 368KB. Slimmed two ways:
 
 - **A — filter noise**: `snapshot({relevant:true})` keeps only nodes with a testable surface
@@ -330,9 +330,9 @@ plain tool-use loop) the harness — no need to grow copse's own loop.
   `press`/`get`/`call`/`reachable`/`node`/`diff`/`listeners`/`probe`/`logs`/`close`) over a live `connect()` session in `state.cp`
   (`press`/`call` carry the auto-`changed` delta straight through), plus **7 `debug:true`-tagged Debugger
   tools** (`break_*`/`wait_pause`/`eval_frame`/`debug_step`/`clear_breakpoints`, §18) that are **hidden
-  from `tools/list` unless `copse mcp --debug`** (dev-build-only; pausing trips anti-debug). `connect` also
-  takes **`attach`/`match`** to drive an already-open tab (Cloudflare/login sites a human got past) — no
-  navigation, so the gate isn't re-triggered.
+  from `tools/list` unless `copse mcp --debug`** (dev-build-only; pausing the runtime is intrusive). `connect`
+  also takes **`attach`/`match`** to drive an already-open tab (your own game behind a login/staging gate you
+  opened yourself) — no navigation, so it drives the tab exactly as you left it.
 - **Layout aligned to coir at the same time**: no `bin/` dir — the CLI moved to `src/cli.js` (`bin:
   {"copse":"src/cli.js"}`), MCP is the `copse mcp [url]` subcommand (lazy `import('./mcp/server.js')`),
   and the heavy/optional imports (puppeteer driver, claude agent) became **lazy per-command** so
@@ -421,8 +421,8 @@ adjacent jobs that never touch `cc`. copse keeps one such edge:
 - **Debugger** → `src/debug.js`: breakpoints + call stack. `breakIn('path:Comp.method')` resolves the
   method via `window.__copse` (the live component) → breaks on call, so it **works on minified builds**
   (never matches source text). iframe-aware (page + iframe/OOPIF targets). Exposed as MCP tools
-  `break_*`/`wait_pause`/`eval_frame`/`debug_step`, **hidden unless `copse mcp --debug`** (pausing trips
-  anti-debug → dev-build-only).
+  `break_*`/`wait_pause`/`eval_frame`/`debug_step`, **hidden unless `copse mcp --debug`** (pausing the
+  runtime is intrusive → dev-build-only).
 
 A **"how loud is each domain" ordering** holds: a passive **Network** read is quietest (below JS), **DOM**
 middling, **Runtime / Debugger loudest** — they change the page's own JS-runtime behaviour, which a

@@ -1,6 +1,6 @@
 // @ts-check
 // The reachability signal, split out of runtime.js so it can be (a) OMITTED from the LITE inject
-// bundle (mast only needs `press`; this is ~half the engine code + an anti-tamper footprint the
+// bundle (mast only needs `press`; this is ~half the engine code + an injected surface the
 // lite caller doesn't want) and (b) reused as ONE implementation instead of being re-derived
 // elsewhere. `makeReachable(cc)` is SELF-CONTAINED — it re-resolves the cc classes it needs (the
 // same feature-probe/fallback ladder runtime.js uses), so it has no dependency on the base runtime

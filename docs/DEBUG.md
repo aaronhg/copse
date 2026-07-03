@@ -2,7 +2,7 @@
 
 `copse/debug` (MCP tools `break_*` / `wait_pause` / `eval_frame` / `debug_step`) sets breakpoints and
 reads the call stack over the CDP **Debugger** domain, on your live session. **For your OWN dev build** —
-enabling the debugger / pausing is exactly what anti-debug / devtools-detection guards catch.
+pausing the runtime is intrusive, so this only makes sense on a build you own and control.
 
 ## Why, over plain DevTools
 
@@ -110,4 +110,4 @@ await d.resume();
   too (`targetcreated`). `break_at` is set on every session so a script in any frame matches.
 - **Source maps**: v1 reports the loaded (possibly minified) location; mapping back to original `.ts` is a
   later step. A dev build with readable source needs no mapping.
-- For your **own dev build** — pausing trips anti-debug/devtools-detection on hardened games.
+- For your **own dev build** — pausing the runtime is intrusive, so keep this to a build you control.

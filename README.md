@@ -121,9 +121,9 @@ report shape are in [`docs/AI-DRIVER.md`](docs/AI-DRIVER.md);
 
 ## Run it on your game
 
-copse drives a **running** Cocos game (dev/preview, or a release build where `cc` is
-reachable). Four on-ramps below; the debugger edge is separate — see
-[**Beyond testing**](#beyond-testing--one-cdp-attach-another-lens).
+Point copse at **your own** running Cocos game — a dev/preview build (where `cc` is always
+reachable) or a release build of your own where it still is. Four on-ramps below; the debugger
+edge is separate — see [**Beyond testing**](#beyond-testing--one-cdp-attach-another-lens).
 
 ### 1. CLI — quickest
 
@@ -170,20 +170,21 @@ tool names match the library 1:1 (including `connect`), so the two surfaces read
 claude mcp add copse -- npx copse mcp        # then: "Use copse: connect <url>, test a panel window"
 ```
 
-The default tool set is the 14 testing primitives. The CDP **debugger** tools are **hidden from the
-tool list by default** (dev-build-only — pausing trips anti-debug); start with `copse mcp --debug` to
-surface them (see [Beyond testing](#beyond-testing--one-cdp-attach-other-lenses)).
+The default tool set is the 17 testing primitives. The CDP **debugger** tools are **hidden from the
+tool list by default** (a dev-build aid — pausing the runtime only makes sense on a build you own);
+start with `copse mcp --debug` to surface them (see [Beyond testing](#beyond-testing--one-cdp-attach-another-lens)).
 
 The valuable part of copse is the bridge; the agent loop is replaceable — borrow a good one. (Existing
 browser agents can't help here on their own: a Cocos game is one opaque `<canvas>` to the DOM.) See
 [`docs/MCP.md`](docs/MCP.md).
 
-**Gated sites** (Cloudflare / login / freeze-on-DevTools): a fresh headless launch trips the bot gate.
-Instead, open the game in **your own** Chrome (`--remote-debugging-port=9222`), pass the gate by hand,
-then register a plain `copse mcp` and **attach** without navigating — the agent calls
-`connect({attach:true, browserURL:"http://127.0.0.1:9222", match:"<url-substr>"})` (CLI: `--attach --browser-url --match`). CDP attach opens no
-DevTools panel, so **anti-debug / devtools-detection stays dormant** — verified attaching to a
-Cloudflare-gated game opened by hand. (copse still only drives **Cocos** games.)
+**Your game behind a login or staging gate**: when the build you want to test sits behind auth
+(or an environment that a fresh headless launch can't reach), don't have copse launch the browser —
+open the game in **your own** Chrome (`--remote-debugging-port=9222`), sign in / navigate to it
+yourself, then register a plain `copse mcp` and **attach** to that tab without navigating: the agent
+calls `connect({attach:true, browserURL:"http://127.0.0.1:9222", match:"<url-substr>"})` (CLI:
+`--attach --browser-url --match`). copse drives the already-open tab as-is; it never touches how you
+got there. (It still only drives **Cocos** games.)
 
 ### 3. Library — programmatic / CI
 
@@ -210,9 +211,13 @@ Both `cp` and `agent` are just adapters — swap `connect` for a Playwright driv
 
 Paste `dist/copse.inject.js` (after `npm run build`) into the game's DevTools console
 and call `__copse.*` by hand — or inject via Playwright `addInitScript` / a dev-build
-hook. See [`docs/INJECT.md`](docs/INJECT.md). `npm run build` also emits
-`dist/copse.inject.lite.js` — the same `press`/`get`/`call` surface with reachability
-tree-shaken out (~half the size, smaller anti-tamper footprint) for a `press`-only caller.
+hook. See [`docs/INJECT.md`](docs/INJECT.md). `npm run build` also emits two slimmer
+bundles: `dist/copse.inject.lite.js` — the same `press`/`get`/`call` surface with
+reachability tree-shaken out (~half the size, a smaller injected surface) for a
+`press`-only caller — and `dist/copse.inject.probe.js` — a read+drive load-metrics
+surface (`probe`/`firstClickable`/`find`/`interactive`/`reachable`/`press` + `assetsPending`)
+that keeps reachability but drops snapshot-extras/`get`/`call`/`diff`/`logs`, for timing a
+game's load (first-interactive / assets-idle) and driving past the intro.
 
 ## Beyond testing — one CDP attach, another lens
 
@@ -225,15 +230,15 @@ doesn't need `cc`) — a handy adjacent tool, deliberately kept off the main tes
 For your **own dev build**, `copse/debug` (and the MCP `--debug` tools) set breakpoints over the CDP
 Debugger domain: `break_in Canvas/Mgr:ShopController.buy` breaks a component method **by copse selector**
 (resolved to the function, so it works minified) — trigger it, then read the call stack + locals
-(`wait_pause`/`eval_frame`/`debug_step`). Pausing trips anti-debug, so this is dev-only, not for
-driving a protected live game. See [`docs/DEBUG.md`](docs/DEBUG.md).
+(`wait_pause`/`eval_frame`/`debug_step`). It's a **dev-build** aid — pausing the runtime is intrusive
+enough that it only makes sense on a build you own and control. See [`docs/DEBUG.md`](docs/DEBUG.md).
 
 ## Develop
 
 ```bash
 npm test          # node:test over fake trees — no engine, no install (+ an opt-in real-engine L2 test that skips unless reference/cocos/<ver> is cloned)
 npm run typecheck # tsc --noEmit (needs `npm install` for the dev deps)
-npm run build     # → dist/copse.inject.js (full) + dist/copse.inject.lite.js (lite: press-only, no reachability); both self-contained IIFEs
+npm run build     # → dist/copse.inject.js (full) + .lite.js (press-only, no reachability) + .probe.js (load-metrics); all self-contained IIFEs
 ```
 
 How the design got here — decisions, pitfalls, real-game findings — is in

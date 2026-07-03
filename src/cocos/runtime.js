@@ -186,8 +186,8 @@ export function findCC(win = globalThis, depth = 0) {
 /**
  * OPT-IN console capture: patch `console.*` + uncaught errors into a capped ring buffer,
  * readable via `__copse.logs(since?)`. **Not run by default** — patching `console.*` makes it
- * non-native, which trips anti-tamper `isNative` guards (a real slot nuked its globals when it
- * caught our patched console). The puppeteer driver captures console passively over CDP instead;
+ * non-native, which can trip `isNative` guards (some builds wipe their own globals when they
+ * detect a patched `console`). The puppeteer driver captures console passively over CDP instead;
  * only call this for a console-paste where you want `__copse.logs()`. Idempotent.
  * @param {any} [target] @param {number} [max]
  */
@@ -218,9 +218,9 @@ export function startLogCapture(target = globalThis, max = 1000) {
  */
 export function install(cc, target = globalThis) {
   // NOTE: we deliberately do NOT startLogCapture() here — patching the page's `console.*`
-  // makes them non-native, which trips anti-tamper `isNative` guards (a real anti-tamper slot nuked
-  // its globals when it caught our patched console). The puppeteer driver captures console
-  // passively via CDP (`page.on('console')`) instead — undetectable. For console-paste use
+  // makes them non-native, which can trip `isNative` guards (some builds wipe their own globals
+  // when they detect a patched `console`). The puppeteer driver captures console passively via CDP
+  // (`page.on('console')`) instead — no page-visible patching. For console-paste use
   // where you want `__copse.logs()`, opt in explicitly with `copse.startLogCapture()`.
   const rt = cocosRuntime(cc);
   const root = () => cc.director.getScene();
@@ -249,7 +249,7 @@ export function install(cc, target = globalThis) {
  * Install the LITE bridge as `target.__copse`: the minimal surface a `press`-only caller needs
  * (snapshot/press/get/call/node/diff/listeners) over the reachability-free lite runtime. NO
  * reachable/interactive/clickSurface/probe/logs — so a bundle built off this path carries neither
- * the reachability code nor the console-patch surface (smaller anti-tamper footprint). Used by
+ * the reachability code nor the console-patch surface (smaller injected surface). Used by
  * inject-lite.js. `__copse.press`/`get`/`call` are byte-for-byte the same as the full bridge's.
  * @param {any} cc @param {any} [target]
  */

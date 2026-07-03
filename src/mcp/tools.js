@@ -7,8 +7,8 @@
 // grammar: Parent/Child:Comp.prop, [i] to disambiguate same-name siblings.
 //
 // Tools tagged `debug: true` (the CDP Debugger surface: break_*/wait_pause/eval_frame/debug_step/
-// clear_breakpoints) are HIDDEN from tools/list by default — they're dev-build-only (pausing trips
-// anti-debug games) and would otherwise crowd the menu. `copse mcp --debug` surfaces them
+// clear_breakpoints) are HIDDEN from tools/list by default — they're dev-build-only (pausing the
+// runtime is intrusive, only sensible on a build you own) and would otherwise crowd the menu. `copse mcp --debug` surfaces them
 // (server.js filters by this tag). They stay callable by name regardless, so tests/power-users
 // aren't blocked.
 
@@ -33,7 +33,7 @@ const ensureDbg = async (state) => {
 export const TOOLS = [
   {
     name: 'connect',
-    description: 'Launch a browser at <url> (or ATTACH to an already-open tab), load a running Cocos game, inject copse, wait until ready. Call this FIRST (same operation as the library connect()). headed:true shows a window; browserURL points at your own Chrome (started with --remote-debugging-port). attach:true + match drives an ALREADY-OPEN tab without navigating — use this for Cloudflare/login sites you got past by hand. Returns a readiness summary.',
+    description: 'Launch a browser at <url> (or ATTACH to an already-open tab), load a running Cocos game, inject copse, wait until ready. Call this FIRST (same operation as the library connect()). headed:true shows a window; browserURL points at your own Chrome (started with --remote-debugging-port). attach:true + match drives an ALREADY-OPEN tab without navigating — use this for your own game behind a login/staging gate you opened yourself. Returns a readiness summary.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -144,7 +144,7 @@ export const TOOLS = [
   },
   {
     name: 'probe',
-    description: "Engine-coupling self-diagnostic — run it once on an unfamiliar build to see whether copse's version-sensitive internals resolve on THIS Cocos version, instead of finding out via a silent 'unsure'. Read-only (walks + reads, patches nothing → anti-tamper safe). Returns {version, classes:{Node/Button/UITransform/Camera/EventTouch/…present?}, reach:{batcher2D, getFirstRenderCamera, cameraPriority}, events:{eventProcessor, shouldHandleEventTouch, capturingKey, tableKey, infosKey}, touch:{EventTouch, Touch, NodeEventType}}. Anything 'absent'/'unknown'/'error' is a tier that will fall back (or fail loud) here — e.g. getFirstRenderCamera:false → reachable uses the camOf heuristic (via.camera:'heuristic'); events.tableNote:'no-registered-listener-found' just means no node had wired a listener yet (open a scene with buttons and re-probe). The event key names (tableKey:'_callbackTable', infosKey:'callbackInfos' on 3.8.x) are the arms of copse's internal `||` ladders that actually matched — a shift there is exactly the drift this surfaces.",
+    description: "Engine-coupling self-diagnostic — run it once on an unfamiliar build to see whether copse's version-sensitive internals resolve on THIS Cocos version, instead of finding out via a silent 'unsure'. Read-only (walks + reads, patches nothing → non-invasive). Returns {version, classes:{Node/Button/UITransform/Camera/EventTouch/…present?}, reach:{batcher2D, getFirstRenderCamera, cameraPriority}, events:{eventProcessor, shouldHandleEventTouch, capturingKey, tableKey, infosKey}, touch:{EventTouch, Touch, NodeEventType}}. Anything 'absent'/'unknown'/'error' is a tier that will fall back (or fail loud) here — e.g. getFirstRenderCamera:false → reachable uses the camOf heuristic (via.camera:'heuristic'); events.tableNote:'no-registered-listener-found' just means no node had wired a listener yet (open a scene with buttons and re-probe). The event key names (tableKey:'_callbackTable', infosKey:'callbackInfos' on 3.8.x) are the arms of copse's internal `||` ladders that actually matched — a shift there is exactly the drift this surfaces.",
     inputSchema: { type: 'object', properties: {} },
     run: async (state) => ({ data: await needCp(state).probe() }),
   },
@@ -157,7 +157,7 @@ export const TOOLS = [
   {
     name: 'break_at',
     debug: true,
-    description: 'DEBUG (CDP Debugger — for your OWN dev build; pausing trips anti-debug games). Set a breakpoint by script URL + line. urlRegex matches the script URL (e.g. "ShopController" or "game\\\\.js$"); line/col are 0-based. Optional condition (a JS expr). Then trigger it and call wait_pause.',
+    description: 'DEBUG (CDP Debugger — for your OWN dev build; pausing the runtime is intrusive). Set a breakpoint by script URL + line. urlRegex matches the script URL (e.g. "ShopController" or "game\\\\.js$"); line/col are 0-based. Optional condition (a JS expr). Then trigger it and call wait_pause.',
     inputSchema: { type: 'object', properties: { urlRegex: { type: 'string', description: 'regex matched against the script URL' }, line: { type: 'number', description: '0-based line number' }, col: { type: 'number', description: '0-based column (optional)' }, condition: { type: 'string', description: 'pause only if this JS expr is truthy (optional)' } }, required: ['urlRegex', 'line'] },
     run: async (state, a) => ({ data: await (await ensureDbg(state)).breakAt(a.urlRegex, a.line, a.col, a.condition) }),
   },

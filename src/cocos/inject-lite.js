@@ -2,8 +2,8 @@
 // LITE auto-installing inject entry (built to dist/copse.inject.lite.js by `npm run build`).
 // The MINIMAL in-page surface — snapshot / resolve / press / get / call / node / diff — with NO
 // reachability and NO console patching. For callers that only drive handlers + read state (e.g.
-// mast's `press:` action stages): about half the code of the full bundle, a smaller anti-tamper
-// footprint (fewer patched globals, no reachability machinery), and a FROZEN contract that copse's
+// mast's `press:` action stages): about half the code of the full bundle, a smaller injected
+// surface (fewer patched globals, no reachability machinery), and a FROZEN contract that copse's
 // reachability/coverage work can't disturb. The full QA/coverage bundle is inject.js.
 //
 // Same boot model as inject.js: expose `globalThis.copse` immediately, poll ~10s for `cc`, then

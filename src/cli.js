@@ -3,7 +3,7 @@
 // copse CLI — the official entry (registered as `copse`, runs this file directly; no build).
 //   copse ai   <url> --goal "<what to test>" [--stop ..] [--report ..] [--rounds N] [--model ..]
 //   copse scan <url>                          # one-shot: print snapshot/interactive/labels
-//   copse mcp  [url] [--debug]                # JSON-RPC/stdio MCP server (see examples/mcp.md)
+//   copse mcp  [url] [--debug]                # JSON-RPC/stdio MCP server (see docs/MCP.md)
 //   copse get/press/call/node/reachable <url> <sel>   # single-shot primitive → JSON (pipe to jq)
 //
 // Heavy/optional bits (puppeteer-core driver, the claude agent, the MCP server) are
@@ -44,7 +44,7 @@ const USAGE = `copse — drive & assert a running Cocos game
                    [--rounds N] [--model sonnet|opus|...] [--chrome <path>] [--browser-url <url>]
   copse scan <url> [--chrome <path>]
   copse mcp  [url] [--debug]  start a JSON-RPC/stdio MCP server (any MCP client drives the game;
-                    omit url to let the client's 'connect' tool choose — see examples/mcp.md;
+                    omit url to let the client's 'connect' tool choose — see docs/MCP.md;
                     --debug also surfaces the CDP Debugger tools, hidden by default)
 
   one-shot (connect → run one op → print JSON → close; pipe to jq):
@@ -61,7 +61,7 @@ const USAGE = `copse — drive & assert a running Cocos game
            --headed       show a visible browser window (default headless); --fps N raise the fps cap to watch
            --browser-url <url>   attach to your own Chrome (run it with --remote-debugging-port) and drive that
            --attach [--match <substr>]   drive an ALREADY-OPEN tab in that Chrome without navigating
-                         (for Cloudflare/login sites you got past by hand) — needs --browser-url
+                         (for your game behind a login/staging gate you opened yourself) — needs --browser-url
 
 Setup:  npm run build   (produces dist/copse.inject.js)   +   npm i -D puppeteer-core
 The 'ai' command also needs the 'claude' CLI logged in.`;

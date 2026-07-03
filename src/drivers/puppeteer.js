@@ -28,8 +28,9 @@ async function loadPuppeteer() {
  * @param {string} url
  * @param {{bundlePath?:string|URL, executablePath?:string, browserURL?:string, browserWSEndpoint?:string, attach?:boolean, match?:string, attachTries?:number, headless?:any, viewport?:any, fpsCap?:number, timeout?:number, bootTries?:number, readyTries?:number, maxLogs?:number, settle?:boolean|{maxMs?:number,interval?:number}}} [opts]
  *        attach: drive an ALREADY-OPEN tab in `browserURL`'s Chrome (find it by `match` URL
- *        substring; no navigation — for Cloudflare/login sites a human got past, so a fresh
- *        goto won't re-trigger the gate). `close()` then just disconnects, leaving your browser open.
+ *        substring; no navigation — for your own game behind a login/staging gate you opened
+ *        yourself, so a fresh goto won't bounce you back to it). `close()` then just disconnects,
+ *        leaving your browser open.
  *        settle: after a mutating press/call, wait until the tree stabilises (tweens) then
  *        attach a `changed` auto-diff to the result. Default on; `settle:false` to disable.
  */
@@ -50,9 +51,9 @@ export async function connect(url, opts = {}) {
     : await puppeteer.launch({ executablePath: opts.executablePath || DEFAULT_CHROME, headless: opts.headless ?? 'new',
         args: ['--no-sandbox', '--disable-setuid-sandbox', '--use-gl=angle', '--use-angle=swiftshader', '--ignore-gpu-blocklist', '--enable-unsafe-swiftshader', '--mute-audio'] });
 
-  // attach mode: drive an ALREADY-OPEN tab (you passed Cloudflare / login as a human and
-  // launched the game) — find it by URL substring and DON'T navigate (a fresh goto would
-  // re-trigger the bot gate; CDP attach opens no DevTools panel, so anti-devtools stays dormant).
+  // attach mode: drive an ALREADY-OPEN tab (your own game behind a login/staging gate you opened
+  // yourself) — find it by URL substring and DON'T navigate (a fresh goto would bounce you back
+  // out of it; CDP attach opens no DevTools panel either).
   let page;
   if (opts.attach) {
     const needle = opts.match || url || '';

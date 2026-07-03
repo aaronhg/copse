@@ -11,7 +11,7 @@ console). Three ways, lowest-friction first.
 
 > Build once: `npm run build` → `dist/copse.inject.js` (full), `dist/copse.inject.lite.js` (lite —
 > `snapshot`/`press`/`get`/`call`/`node`/`diff`, reachability tree-shaken out: ~half the size + a
-> smaller anti-tamper footprint, for a `press`-only caller; `__copse.press`/`get`/`call` are
+> smaller injected surface (fewer patched globals), for a `press`-only caller; `__copse.press`/`get`/`call` are
 > byte-identical to the full one), **and** `dist/copse.inject.probe.js` (probe — a read+drive metrics
 > surface: `probe`/`find`/`reachable`/`press` + `assetsPending`; keeps reachability, drops
 > snapshot-extras/get/call/diff/logs; built from `installProbe`, used by mast's extension). Each is a

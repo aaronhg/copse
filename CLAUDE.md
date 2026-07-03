@@ -106,7 +106,7 @@ Layout (grouped by concern; `src/index.js` is the public barrel):
     `globalThis.copse` + auto-installs the full `window.__copse` via `install`. esbuild → `dist/copse.inject.js`.
   - `inject-lite.js` — the **lite build entry**: the minimal surface + auto-install via `installLite`.
     Because it never references `makeReachable`/`install`, esbuild drops reachable.js → `dist/copse.inject.lite.js`
-    (~half the size, smaller anti-tamper footprint). `__copse.press`/`get`/`call` are byte-identical to full's.
+    (~half the size, smaller injected surface). `__copse.press`/`get`/`call` are byte-identical to full's.
     Consumed by mast's `press:` stages (`copse/inject-lite` export, full `./inject` as fallback).
   - `inject-probe.js` — the **probe build entry**: `installProbe`'s read+drive metrics surface
     (`probe`/`firstClickable`/`find`/`reachable`/`press` + `assetsPending`). Keeps reachable.js but drops
@@ -130,7 +130,7 @@ Layout (grouped by concern; `src/index.js` is the public barrel):
   across all contexts). `breakAt(urlRegex,line)` + `breakIn('path:Comp.method')`
   (resolves the method via `window.__copse` → break on call; works minified), `breakOnExceptions`,
   `waitPause`→callstack, `evalFrame`, `step`/`resume`. Exposed as MCP tools `break_*`/`wait_pause`/
-  `eval_frame`/`debug_step`. For your OWN dev build (pausing trips anti-debug). Browser-glue, not `@ts-check`ed.
+  `eval_frame`/`debug_step`. For your OWN dev build (pausing the runtime is intrusive). Browser-glue, not `@ts-check`ed.
 - `src/mcp/` — **optional** MCP edge (`copse/mcp`, subcommand `copse mcp`): exposes the bridge as
   MCP tools so ANY MCP client (Claude Code / browser-use / Stagehand / a plain tool-use loop) drives
   the canvas. `server.js` = hand-rolled JSON-RPC-over-stdio (mirrors coir's `mcp/server.js`: stderr-only
@@ -168,7 +168,7 @@ Layout (grouped by concern; `src/index.js` is the public barrel):
   the shared core, copse's divergences (no `#N`/component-`[i]`/array-`[i]`, always index-parses `[i]`,
   minified comp names) + its `Node` pseudo-component. Pinned by `test/selectors.test.js`.
 - `docs/MCP.md` — drive copse from any MCP client (Claude Code / browser-use); incl. **attach** mode
-  for Cloudflare/login sites (attach to your own browser over CDP, no navigation).
+  for your own game behind a login/staging gate (attach to your own browser over CDP, no navigation).
 - `docs/DEBUG.md` — `copse/debug` (CDP Debugger): breakpoints (incl. `break_in path:Comp.method`) +
   call stack / `eval_frame` / step, as MCP tools — for your own dev build.
 - `docs/INJECT.md` — the three ways to inject + the AI test loop.
