@@ -328,11 +328,53 @@ export function installProbe(cc, target = globalThis) {
     }
     return null;
   };
+  // --- `--until` HELD conditions — moved here from mast until.js's pageEvalSource so copse is the SINGLE
+  // cc-eval source: the CLI (forage.js) and the extension (plugin.bg.js) both call __copse.until(specs).
+  // Baselines persist across ticks in this frame's closure (was window.__copseUntil). Reuses find/assets/rt.
+  let _boot = null, _seen = false, _lblBase = null;
+  const meaningful = (s) => s != null && String(s).trim() !== '' && String(s).trim() !== '0';
+  // synthetic touch (opt-in via reachable.dispatch): START → CANCEL at the node's screen centre, no click.
+  const synthTouch = (n) => { try {
+    const ET = cc.EventTouch || (cc.Event && cc.Event.EventTouch) || (cc.internal && cc.internal.EventTouch); if (!ET || !cc.Touch) return false;
+    const TET = (cc.Node && cc.Node.EventType) || {}; const START = TET.TOUCH_START || 'touch-start', CANCEL = TET.TOUCH_CANCEL || 'touch-cancel';
+    let x = 0, y = 0;
+    try { const ut = rt.getComponent(n, 'cc.UITransform'); const cams = []; (function w(z) { const c = z && rt.getComponent(z, 'cc.Camera'); if (c) cams.push(c); (rt.children(z) || []).forEach(w); })(root());
+      if (ut && cams.length) { const bb = ut.getBoundingBoxToWorld(); const o = new cc.Vec3(); cams[cams.length - 1].worldToScreen(new cc.Vec3(bb.x + bb.width / 2, bb.y + bb.height / 2, 0), o); x = o.x; y = o.y; } } catch { /* geometry best-effort */ }
+    const touch = new cc.Touch(x, y, 0);
+    for (let ti = 0; ti < 2; ti++) { const ev = new ET([touch], true, ti === 0 ? START : CANCEL, [touch]); try { ev.touch = touch; } catch { /* */ } try { ev.simulate = true; } catch { /* */ }
+      if (typeof n.dispatchEvent === 'function') n.dispatchEvent(ev); else if (n._eventProcessor && n._eventProcessor.dispatchEvent) n._eventProcessor.dispatchEvent(ev); else return false; }
+    return true; } catch { return false; } };
+  // Evaluate the selected PAGE conditions → { held:[{id,node,detail}], scene, assets } for a --until composer.
+  const until = (specs) => { try {
+    const scene = root(); const sceneName = (scene && (scene.name || scene._name)) || null;
+    const a = assetsPending(cc); const held = [];
+    for (const cs of (specs || [])) {
+      const id = cs.id, mods = cs.mods || [], arg = (cs.arg || '').toLowerCase(), KEY = cs.key || id;
+      if (id === 'scene-switch') {
+        if (_boot == null && sceneName) _boot = sceneName;
+        if (sceneName && _boot && sceneName !== _boot) held.push({ id: KEY, node: null, detail: { from: _boot, to: sceneName } });
+      } else if (id === 'assets-idle') {
+        if (a.known) { if (a.pending > 0) _seen = true; if (_seen && a.pending === 0) held.push({ id: KEY, node: null, detail: { pending: 0 } }); }
+      } else if (id === 'label-filled') {
+        if (!_lblBase) _lblBase = {}; let hit = null;
+        (function w(n) { if (hit || !n) return; const l = rt.getComponent(n, 'cc.Label');
+          if (l && n.uuid) { if (meaningful(l.string)) { if (_lblBase[n.uuid]) hit = { name: n.name || '?', str: ('' + l.string).slice(0, 40) }; } else { _lblBase[n.uuid] = true; } }
+          const ch = rt.children(n) || []; for (let j = 0; j < ch.length; j++) w(ch[j]); })(scene);
+        if (hit) held.push({ id: KEY, node: hit.name, detail: hit });
+      } else if (id === 'reachable') {
+        const en = mods.indexOf('enabled') >= 0, disp = mods.indexOf('dispatch') >= 0;
+        const hit = find(arg, { enabled: en });
+        if (hit) { let ok = true; if (disp) { const nd2 = resolve(root(), rt, hit.ref); ok = nd2 ? synthTouch(nd2) : false; } if (ok) held.push({ id: KEY, node: hit.ref, detail: { ref: hit.ref, enabled: en, dispatched: disp } }); }
+      }
+    }
+    return { held, scene: sceneName, assets: a.known ? { known: true, pending: a.pending } : null };
+  } catch { return null; } };
   const api = {
     probe: () => { const scene = root(); const a = assetsPending(cc);
       return { cc: true, scene: (scene && (scene.name || scene._name)) || null, assetsKnown: a.known, assetsPending: a.pending, firstReachable: firstClickable() }; },
     firstClickable,
     find,
+    until,   // --until HELD conditions (single source for both the CLI and the extension)
     interactive: (opts) => snapshot(root(), rt, { onlyInteractive: true, reachability: true, ...opts }),
     reachable: (sel) => reachable(root(), rt, sel),
     press: (path, opts) => press(root(), rt, path, opts),   // drive a node past intros (a `--until` press: action)
