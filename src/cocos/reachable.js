@@ -2,13 +2,15 @@
 // The reachability signal, split out of runtime.js so it can be (a) OMITTED from the LITE inject
 // bundle (mast only needs `press`; this is ~half the engine code + an injected surface the
 // lite caller doesn't want) and (b) reused as ONE implementation instead of being re-derived
-// elsewhere. `makeReachable(cc)` is SELF-CONTAINED — it re-resolves the cc classes it needs (the
-// same feature-probe/fallback ladder runtime.js uses), so it has no dependency on the base runtime
-// and could later be built into a standalone injectable snippet.
+// elsewhere. `makeReachable(cc)` is SELF-CONTAINED re: cc CLASS resolution — it re-resolves the cc classes
+// it needs (the same feature-probe/fallback ladder runtime.js uses), so it has no dependency on the base
+// runtime. Its ONE import is the shared node→ref path helper (refpath.js), kept in lockstep with visual.js
+// so both emit the same ref grammar (trivially inlinable if this is ever built as a standalone snippet).
 //
 // Best-effort geometric reachability (Rung 2+3): replay the engine's input z-order over the live
 // tree. See the returned method's contract below + CLAUDE.md "Capability boundary" for the honest
 // limits (no alpha hit-areas, no event-penetration, single-frame; answers "would a TOUCH reach it").
+import { refOf } from './refpath.js';
 
 // node → its rendering camera: the active camera whose `visibility` mask includes the node's `layer`,
 // taking the highest `priority`. Falls back to the first camera. (Cross-camera/Layer z-order.)
@@ -43,23 +45,6 @@ const siblingKey = (node, root) => {
 };
 const cmpKey = (a, b) => { const L = Math.max(a.length, b.length); for (let i = 0; i < L; i++) { const x = a[i] ?? -1, y = b[i] ?? -1; if (x !== y) return x - y; } return 0; };
 const isAncestor = (anc, n) => { let p = n.parent; while (p) { if (p === anc) return true; p = p.parent; } return false; };
-
-// node → copse ref (relative to scene root, `[i]` for same-name siblings) — matches core.
-const refOf = (node, root) => {
-  const chain = []; let n = node;
-  while (n && n !== root) { chain.unshift(n); n = n.parent; }
-  if (n !== root) return null;
-  let path = '', parent = root;
-  for (const ch of chain) {
-    const sibs = parent.children || [], name = ch.name;
-    if (sibs.filter((s) => s.name === name).length > 1) {
-      let i = 0; for (const s of sibs) { if (s === ch) break; if (s.name === name) i++; }
-      path = path ? `${path}/${name}[${i}]` : `${name}[${i}]`;
-    } else path = path ? `${path}/${name}` : name;
-    parent = ch;
-  }
-  return path;
-};
 
 /**
  * Build the `reachable(node)` method over a live `cc`. Self-contained — resolves the classes it
@@ -120,7 +105,7 @@ export function makeReachable(cc) {
     const ep = n._eventProcessor;
     // ADDITIVE: shouldHandleEventTouch===true catches a raw touch-listener overlay the class check misses,
     // but a `false` must NOT short-circuit — a cc.Button is a consumer even when the getter momentarily
-    // reads false (returning the raw value here wrongly EXCLUDED the action button on a live build).
+    // reads false (returning the raw value here wrongly EXCLUDED a real Button on a live build).
     if (ep && ep.shouldHandleEventTouch === true) return 'engine';
     if (hasPtrListener(n)) return 'listener';
     if (n.getComponent(BTN) || n.getComponent(BIE)) return 'class';

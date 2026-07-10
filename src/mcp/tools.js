@@ -90,7 +90,7 @@ export const TOOLS = [
   },
   {
     name: 'resolve',
-    description: "Translate a coir STATIC nodePath into the live copse `ref` by matching it against the running tree (symmetric tail match — absorbs coir's scene/prefab-file root prefix and a prefab's instantiation mount, the two reasons a raw coir path won't resolve in press/get). Pass a coir nodePath (e.g. 'home/Canvas/Home/lower/main_btns/layout/btn_shop'); returns {ref, mount, dropped} for a unique hit, {ambiguous:[refs]} for >1, or null. Feed the returned `ref` straight into press/get/reachable.",
+    description: "Translate a coir STATIC nodePath into the live copse `ref` by matching it against the running tree (symmetric tail match — absorbs coir's scene/prefab-file root prefix and a prefab's instantiation mount, the two reasons a raw coir path won't resolve in press/get). Pass a coir nodePath (e.g. 'main/Canvas/Menu/lower/buttons/layout/ShopBtn'); returns {ref, mount, dropped} for a unique hit, {ambiguous:[refs]} for >1, or null. Feed the returned `ref` straight into press/get/reachable.",
     inputSchema: { type: 'object', properties: { path: { type: 'string', description: 'a coir static nodePath' } }, required: ['path'] },
     run: async (state, a) => ({ data: resolveCoirPath(a.path, await needCp(state).snapshot({ includeInactive: true })) }),
   },
@@ -153,6 +153,24 @@ export const TOOLS = [
     description: "Recent console output + uncaught errors captured from the game (all frames): [{level, text, t, stack?}] (level is the console method / 'pageerror'). Use to check whether an action logged/threw an error with no visible UI change. `since` is an index — pass the count you've already seen to get only new lines.",
     inputSchema: { type: 'object', properties: { since: { type: 'number', description: 'return logs from this index onward (default 0 = all)' } } },
     run: async (state, a) => ({ data: await needCp(state).logs(a.since || 0) }),
+  },
+  {
+    name: 'visual_check',
+    description: "Node-anchored VISUAL check — the PIXEL complement to the logic tree (copse otherwise reads the node tree, never pixels). Screenshots JUST this node's screen rect (dynamic children — labels/particles/spine — masked so they don't trip it) and returns a three-state verdict {drawn, matches, clear, score?, visible, via, reason?} in the SAME grammar as reachable (true|false|'unknown' + a `via` provenance tag): drawn = is anything actually rendered at the rect (catches the 'tree says active, screen is blank' case reachable/snapshot can't); with a golden `baseline` signature (from visual_baseline) matches = it looks like the golden and clear = the node's OWN art is what's visible — which is how you close reachable's headline blind spot (a button covered by an opaque sprite with no input-consumer reads reachable:true but clear:false). via becomes 'pixel-confirmed' once a baseline is used; with no baseline matches/clear are 'unknown' (drawn still answers). Needs a screenshot-capable session (connect first).",
+    inputSchema: { type: 'object', properties: { ref: { type: 'string', description: 'node ref' }, baseline: { type: 'array', items: { type: 'number' }, description: "a golden signature for THIS ref (from visual_baseline) to compare against" } }, required: ['ref'] },
+    run: async (state, a) => { const o = {}; if (a.baseline) o.baseline = a.baseline; return { data: await needCp(state).visualCheck(a.ref, o) }; },
+  },
+  {
+    name: 'visual_baseline',
+    description: "Capture a golden per-node visual baseline on the CURRENT (known-good) screen — signs every interactive node (or the passed `refs`) and returns { ref: signature[] }. Feed an entry back as visual_check's `baseline` on a later run/build to detect a node that stopped rendering, got occluded, or changed art. Per-node (NOT a full-frame screenshot) baselines survive animation/RNG because each node's dynamic descendants are masked out. Needs an open session.",
+    inputSchema: { type: 'object', properties: { refs: { type: 'array', items: { type: 'string' }, description: 'refs to baseline (default: every interactive node)' } } },
+    run: async (state, a) => ({ data: await needCp(state).captureBaseline(a.refs ? { refs: a.refs } : {}) }),
+  },
+  {
+    name: 'reachable_visual',
+    description: "The headline COMBINE: touch-reachability (logic z-order) ∧ the pixel pass → \"can a player actually SEE and USE this\". Returns {ref, usable, reachable, visual}; `usable` is three-state — reachable+visible+clear → true, any hard-negative → false, reachable+visible+drawn but no baseline to confirm the art → 'unknown'. This is what turns reachable's opaque-sprite-occlusion caveat (reachable:true but visually covered) into a real answer. Pass a `baseline` (from visual_baseline) to reach a confident true. Needs an open session.",
+    inputSchema: { type: 'object', properties: { ref: { type: 'string' }, baseline: { type: 'array', items: { type: 'number' }, description: "golden signature for this ref (from visual_baseline)" } }, required: ['ref'] },
+    run: async (state, a) => ({ data: await needCp(state).reachableVisual(a.ref, a.baseline ? { baseline: a.baseline } : {}) }),
   },
   {
     name: 'break_at',

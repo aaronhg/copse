@@ -11,6 +11,7 @@
 //     and is imported ONLY by the full runtime, so esbuild tree-shakes it out of the lite bundle.
 import { snapshot, clickSurface, resolve, press, get, call, reachable, node, diff } from '../core/index.js';
 import { makeReachable } from './reachable.js';
+import { makeVisualManifest, frameRectToViewport } from './visual.js';
 import { probe } from './probe.js';
 
 const stripCc = (t) => (typeof t === 'string' && t.startsWith('cc.') ? t.slice(3) : t);
@@ -212,6 +213,36 @@ export function startLogCapture(target = globalThis, max = 1000) {
 }
 
 /**
+ * Build the in-page `visualManifest(sel)` — resolve sel→node, project its screen rect + dynamic mask rects
+ * to VIEWPORT CSS px (via the game-canvas metrics), the geometry a driver needs to sign a node's pixels.
+ * SHARED by install() (the full QA surface) and installProbe() (so mast's `--until drawn:` can read a node's
+ * rect for its gated pixel confirm) — one implementation, not two. `rect:null` (+ reason) when unprojectable.
+ * @param {any} cc @param {any} rt @returns {(sel:string)=>any}
+ */
+function makeVisualManifestFn(cc, rt) {
+  const manifestOf = makeVisualManifest(cc);
+  // Game-canvas metrics for the frame→viewport map (engine/DOM glue — the pure transform is in visual.js).
+  const canvasMetrics = () => {
+    const canvas = (cc.game && cc.game.canvas) || (typeof document !== 'undefined' && document.querySelector && document.querySelector('canvas')) || null;
+    if (!canvas) return null;
+    const bcr = (canvas.getBoundingClientRect && canvas.getBoundingClientRect()) || null;
+    return { fw: canvas.width, fh: canvas.height, left: bcr ? bcr.left : 0, top: bcr ? bcr.top : 0, cssW: bcr ? bcr.width : canvas.width, cssH: bcr ? bcr.height : canvas.height };
+  };
+  return (sel) => {
+    const n = resolve(cc.director.getScene(), rt, sel);
+    if (!n) return null;
+    const m = manifestOf(n);
+    const cm = canvasMetrics();
+    if (!m.rect || !cm) return { ref: m.ref || sel, rect: null, maskRects: [], visible: m.visible, via: m.via, reason: cm ? (m.reason || 'no-rect') : 'no-canvas' };
+    // frameRectToViewport still returns null when the canvas momentarily has 0 width/height (resize / scene
+    // transition) — canvasMetrics is truthy but fw/fh are 0. Don't return rect:null with no reason.
+    const rect = frameRectToViewport(m.rect, cm);
+    if (!rect) return { ref: m.ref, rect: null, maskRects: [], visible: m.visible, via: m.via, reason: 'no-canvas-size' };
+    return { ref: m.ref, visible: m.visible, via: m.via, rect, maskRects: m.maskRects.map((r) => frameRectToViewport(r, cm)).filter(Boolean) };
+  };
+}
+
+/**
  * Install the FULL bridge as `target.__copse` (default `globalThis`/`window`). The
  * driver then calls e.g. `__copse.snapshot()` / `__copse.press('Canvas/ShopBtn')`.
  * @param {any} cc @param {any} [target]
@@ -224,6 +255,7 @@ export function install(cc, target = globalThis) {
   // where you want `__copse.logs()`, opt in explicitly with `copse.startLogCapture()`.
   const rt = cocosRuntime(cc);
   const root = () => cc.director.getScene();
+  const visualManifest = makeVisualManifestFn(cc, rt);
   const api = {
     snapshot: (opts) => snapshot(root(), rt, opts),
     interactive: (opts) => snapshot(root(), rt, { onlyInteractive: true, reachability: true, ...opts }), // pressable list, with reachability
@@ -237,6 +269,9 @@ export function install(cc, target = globalThis) {
     node: (sel) => node(root(), rt, sel),                 // node intrinsics (active/opacity/scale/worldPos/size)
     diff: (before, after) => diff(before, after),         // snapshot diff → appeared/activated/labelChanged/…
     listeners: (sel) => { const n = resolve(root(), rt, sel); return n ? rt.codeHandlers(n) : null; },
+    // Node-anchored VISUAL manifest (screen rect + dynamic mask rects in viewport CSS px) — the companion to
+    // `reachable`; the driver screenshots + downsamples + compares (src/sensors/pixel.js). See makeVisualManifestFn.
+    visualManifest,
     probe: () => probe(cc),                               // engine-coupling self-diagnostic (version + per-capability resolution)
     logs: (since = 0) => (target.__copseLogs || []).filter((l) => l.t > since), // console + uncaught errors
     rt, // exposed for ad-hoc poking from a console
@@ -328,6 +363,7 @@ export function installProbe(cc, target = globalThis) {
     }
     return null;
   };
+  const visualManifest = makeVisualManifestFn(cc, rt); // node → viewport rect, for the `drawn` prearm below
   // --- `--until` HELD conditions — moved here from mast until.js's pageEvalSource so copse is the SINGLE
   // cc-eval source: the CLI (forage.js) and the extension (plugin.bg.js) both call __copse.until(specs).
   // Baselines persist across ticks in this frame's closure (was window.__copseUntil). Reuses find/assets/rt.
@@ -347,7 +383,7 @@ export function installProbe(cc, target = globalThis) {
   // Evaluate the selected PAGE conditions → { held:[{id,node,detail}], scene, assets } for a --until composer.
   const until = (specs) => { try {
     const scene = root(); const sceneName = (scene && (scene.name || scene._name)) || null;
-    const a = assetsPending(cc); const held = [];
+    const a = assetsPending(cc); const held = [], pixelPending = [];
     for (const cs of (specs || [])) {
       const id = cs.id, mods = cs.mods || [], arg = (cs.arg || '').toLowerCase(), KEY = cs.key || id;
       if (id === 'scene-switch') {
@@ -365,16 +401,24 @@ export function installProbe(cc, target = globalThis) {
         const en = mods.indexOf('enabled') >= 0, disp = mods.indexOf('dispatch') >= 0;
         const hit = find(arg, { enabled: en });
         if (hit) { let ok = true; if (disp) { const nd2 = resolve(root(), rt, hit.ref); ok = nd2 ? synthTouch(nd2) : false; } if (ok) held.push({ id: KEY, node: hit.ref, detail: { ref: hit.ref, enabled: en, dispatched: disp } }); }
+      } else if (id === 'drawn') {
+        // PREARM ONLY (cheap, in-page): find the reachable [+enabled] control + project its viewport rect. The
+        // "did it ACTUALLY render on screen" pixel confirm is the DRIVER's job (screenshot that rect) — a WebGL
+        // canvas can't be read in-page. Reported as pixelPending, NOT held; the driver gates the screenshot on this.
+        const den = mods.indexOf('enabled') >= 0;
+        const dhit = find(arg, { enabled: den });
+        if (dhit) { const m = visualManifest(dhit.ref); if (m && m.rect) pixelPending.push({ key: KEY, ref: dhit.ref, rect: m.rect }); }
       }
     }
-    return { held, scene: sceneName, assets: a.known ? { known: true, pending: a.pending } : null };
+    return { held, scene: sceneName, assets: a.known ? { known: true, pending: a.pending } : null, pixelPending };
   } catch { return null; } };
   const api = {
     probe: () => { const scene = root(); const a = assetsPending(cc);
       return { cc: true, scene: (scene && (scene.name || scene._name)) || null, assetsKnown: a.known, assetsPending: a.pending, firstReachable: firstClickable() }; },
     firstClickable,
     find,
-    until,   // --until HELD conditions (single source for both the CLI and the extension)
+    until,   // --until HELD conditions (single source for both the CLI and the extension); returns pixelPending for `drawn`
+    visualManifest, // node → viewport rect + mask rects, for the driver's `drawn` pixel confirm
     interactive: (opts) => snapshot(root(), rt, { onlyInteractive: true, reachability: true, ...opts }),
     reachable: (sel) => reachable(root(), rt, sel),
     press: (path, opts) => press(root(), rt, path, opts),   // drive a node past intros (a `--until` press: action)

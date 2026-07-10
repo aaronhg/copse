@@ -49,7 +49,7 @@ authored **fresh** via the `cocos-creator` MCP and **deleted at the end**
 
 | Fixture | Purpose |
 |---|---|
-| `_copsetest/CopseTest.scene` | the master fixture exercising every lens: READ/GET/DELTA nodes, same-name siblings + `Slot[0]` literal, clickEvent-wired DELTA buttons, code-registered buttons, a panel (active toggle), the reachability roster (covered / occluded / opacity / scale / closed / stacked), and a prefab mount for the cross-tool join |
+| `_copsetest/CopseTest.scene` | the master fixture exercising every lens: READ/GET/DELTA nodes, same-name siblings + `Cell[0]` literal, clickEvent-wired DELTA buttons, code-registered buttons, a panel (active toggle), the reachability roster (covered / occluded / opacity / scale / closed / stacked), and a prefab mount for the cross-tool join |
 | `_copsetest/CopseTestB.scene` | minimal companion (`OtherBtn` / `OtherLabel`) — the reload scene-switch spec: opening it makes the preview serve it, so `reload` must pick up `OtherBtn` and drop `AddBtn` |
 | `_copsetest/CopseCtrl.ts` | the deterministic controller/counter/panel/throw oracle (`add`/`reset`/`open`/`close`/`boom`/`swallow`, Label writes **inside** methods so the editor edit-mode instance replays identically) |
 | `_copsetest/CopseClick.ts` | code-registered `on('click')` oracle (C/D lens) |

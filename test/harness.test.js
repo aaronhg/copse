@@ -213,6 +213,64 @@ test('a synthetic tap into a no-visible-handler button (drove:[touch], wired:fal
   assert.deepEqual(report.uncertain, [{ ref: 'Canvas/MaybeDead', why: 'touch-into-void' }]);
 });
 
+test('visualGate: a subtree the logic diff SHOWED but did not render is SURFACED as out.visual (soft, not a hard fail)', async () => {
+  const { scene } = fixture();
+  const base = localDriver(scene, fakeRuntime());
+  // The press "opens a panel" in the LOGIC diff (changed.activated) — but on SCREEN: Panel is blank
+  // (drawn:false), Title renders fine (drawn:true), Ghost is off-screen. visualCheck is the driver's pixel eye.
+  const driver = {
+    ...base,
+    press: (ref) => ({ ok: true, ref, fired: 1, drove: ['clickEvent'], changed: { appeared: [], activated: [{ ref: 'Canvas/Panel' }, { ref: 'Canvas/Panel/Title' }, { ref: 'Canvas/Ghost' }], deactivated: [], disappeared: [], labelChanged: [] } }),
+    visualCheck: (ref) => ref === 'Canvas/Panel' ? { ref, drawn: false } : ref === 'Canvas/Ghost' ? { ref, drawn: 'unknown', reason: 'offscreen' } : { ref, drawn: true },
+  };
+  const agent = {
+    plan: () => ({ steps: [{ op: 'press', ref: 'Canvas/ShopBtn' }] }),
+    judge: () => ({ pass: true }),                          // the tree says the panel activated → judge is happy
+    report: () => ({ pass: true, summary: 'looks good' }),  // report passes too
+  };
+  const report = await runHarness(driver, agent);
+  assert.equal(report.pass, true, 'visual is a SOFT signal — it does NOT flip the verdict, even over a passing judge+report');
+  assert.deepEqual(report.visual, [
+    { press: 'Canvas/ShopBtn', node: 'Canvas/Panel', reason: 'blank' },
+    { press: 'Canvas/ShopBtn', node: 'Canvas/Ghost', reason: 'offscreen' },
+  ]);
+  assert.deepEqual(report.rounds[0].steps[0].result.blankVisual, [{ ref: 'Canvas/Panel', reason: 'blank' }, { ref: 'Canvas/Ghost', reason: 'offscreen' }]);
+
+  const off = await runHarness(driver, agent, { visualGate: false });
+  assert.equal('visual' in off, false, 'visualGate:false → no visual pass at all');
+});
+
+test('visualGate: a fully-rendered activation surfaces nothing; and no visualCheck capability is a no-op', async () => {
+  const { scene } = fixture();
+  const base = localDriver(scene, fakeRuntime());
+  const changed = { appeared: [{ ref: 'Canvas/Panel' }], activated: [], deactivated: [], disappeared: [], labelChanged: [] };
+
+  // everything drawn → no false positive
+  const good = { ...base, press: (ref) => ({ ok: true, ref, fired: 1, drove: ['clickEvent'], changed }), visualCheck: (ref) => ({ ref, drawn: true }) };
+  const agent = { plan: () => ({ steps: [{ op: 'press', ref: 'Canvas/ShopBtn' }] }), judge: () => ({ pass: true }) };
+  assert.equal('visual' in (await runHarness(good, agent)), false, 'all drawn → nothing surfaced');
+
+  // localDriver has no visualCheck → the gate degrades to today's behavior (absent, not an error)
+  const blind = { ...base, press: (ref) => ({ ok: true, ref, fired: 1, drove: ['clickEvent'], changed }) };
+  assert.equal('visual' in (await runHarness(blind, agent)), false, 'no pixel capability → soft signal simply absent');
+});
+
+test('visualGate: visualMax caps the per-action checks and records the overflow (no silent truncation)', async () => {
+  const { scene } = fixture();
+  const base = localDriver(scene, fakeRuntime());
+  const activated = [{ ref: 'A' }, { ref: 'B' }, { ref: 'C' }];
+  let checked = 0;
+  const driver = {
+    ...base,
+    press: (ref) => ({ ok: true, ref, fired: 1, drove: ['clickEvent'], changed: { appeared: [], activated, deactivated: [], disappeared: [], labelChanged: [] } }),
+    visualCheck: (ref) => { checked++; return { ref, drawn: false }; },
+  };
+  const agent = { plan: () => ({ steps: [{ op: 'press', ref: 'Canvas/ShopBtn' }] }), judge: () => ({ pass: true }) };
+  const report = await runHarness(driver, agent, { visualMax: 2 });
+  assert.equal(checked, 2, 'only visualMax nodes are screenshotted');
+  assert.equal(report.rounds[0].steps[0].result.visualCapped, 1, 'the 1 dropped node is recorded, not silently skipped');
+});
+
 test('agent.next absent ⇒ exactly one round (default policy)', async () => {
   const { scene } = fixture();
   const driver = localDriver(scene, fakeRuntime());

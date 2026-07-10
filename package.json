@@ -5,6 +5,7 @@
   "type": "module",
   "exports": {
     ".": "./src/index.js",
+    "./sensors": "./src/sensors/pixel.js",
     "./driver-puppeteer": "./src/drivers/puppeteer.js",
     "./agent-claude": "./src/agents/claude.js",
     "./debug": "./src/debug.js",

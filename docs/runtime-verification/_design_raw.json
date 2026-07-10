@@ -2010,12 +2010,12 @@
     },
     {
       "id": "SEL-literal-bracket-divergence",
-      "title": "Trailing [i] is ALWAYS an index — copse cannot address a node literally named 'Slot[0]'",
+      "title": "Trailing [i] is ALWAYS an index — copse cannot address a node literally named 'Cell[0]'",
       "kind": "selector",
       "surface": "core resolve via mcp__copse__get",
-      "setup": "A node literally named 'Slot[0]' exists; NO sibling named 'Slot'.",
-      "action": "mcp__copse__get { sel: \"Canvas/Slot[0]:Node.name\" }",
-      "groundTruth": "cocos-creator node_find_node_by_name 'Slot[0]' (and coir find) confirm the node EXISTS — yet copse's resolve parses the trailing [0] as an index, looks for 'Slot'[0] (no 'Slot' sibling), and fails. Documented divergence (docs/SELECTORS.md, selectors.test.js).",
+      "setup": "A node literally named 'Cell[0]' exists; NO sibling named 'Cell'.",
+      "action": "mcp__copse__get { sel: \"Canvas/Cell[0]:Node.name\" }",
+      "groundTruth": "cocos-creator node_find_node_by_name 'Cell[0]' (and coir find) confirm the node EXISTS — yet copse's resolve parses the trailing [0] as an index, looks for 'Cell'[0] (no 'Cell' sibling), and fails. Documented divergence (docs/SELECTORS.md, selectors.test.js).",
       "verifyLevel": "cross-tool",
       "expect": "{ ok:false, reason:'not-found' } despite the node existing — pins the no-literal-bracket divergence (coir would match it via full-path-first).",
       "lens": "SEL"
@@ -5138,7 +5138,7 @@
     },
     {
       "ref": "assets/_copsetest/SelScene.scene",
-      "purpose": "One de-identified scene authored fresh via cocos-creator MCP that exercises every selector/member branch. Authored top-level under the scene root so copse paths are scene-root-relative (Canvas/...). Author nodes: Canvas (cc.Canvas+Camera) with children: ScoreLabel (cc.Label string='hi'); Panel (node.active=false) > PanelInner (cc.Label string='inner'); Mgr (CopseCounter script, count=0); three same-name siblings each named 'Item' carrying cc.Label string='item0'/'item1'/'item2' (in child order); a node named literally 'Slot[0]' (cc.Label string='literal') with NO sibling named 'Slot'. Author via node_create_node + node_set_node_property(name/active) + component_add_component(cc.Label) + component_set_component_property(Label.string). Each copse ref is scene-root-relative: Canvas/ScoreLabel, Canvas/Panel, Canvas/Panel/PanelInner, Canvas/Mgr, Canvas/Item[0..2], Canvas/Slot[0]. After authoring: scene_save_scene, open it in the editor, start the preview server (:7456), then copse connect to the preview URL + reload so __copse drives the live SelScene tree.",
+      "purpose": "One de-identified scene authored fresh via cocos-creator MCP that exercises every selector/member branch. Authored top-level under the scene root so copse paths are scene-root-relative (Canvas/...). Author nodes: Canvas (cc.Canvas+Camera) with children: ScoreLabel (cc.Label string='hi'); Panel (node.active=false) > PanelInner (cc.Label string='inner'); Mgr (CopseCounter script, count=0); three same-name siblings each named 'Item' carrying cc.Label string='item0'/'item1'/'item2' (in child order); a node named literally 'Cell[0]' (cc.Label string='literal') with NO sibling named 'Cell'. Author via node_create_node + node_set_node_property(name/active) + component_add_component(cc.Label) + component_set_component_property(Label.string). Each copse ref is scene-root-relative: Canvas/ScoreLabel, Canvas/Panel, Canvas/Panel/PanelInner, Canvas/Mgr, Canvas/Item[0..2], Canvas/Cell[0]. After authoring: scene_save_scene, open it in the editor, start the preview server (:7456), then copse connect to the preview URL + reload so __copse drives the live SelScene tree.",
       "components": [
         "cc.Canvas",
         "cc.Camera",

@@ -22,6 +22,9 @@ function fakeCp() {
     diff(a, b) { this.calls.push(['diff', a, b]); return { appeared: [{ ref: 'Canvas/Panel' }], disappeared: [], activated: [], deactivated: [], labelChanged: [] }; },
     listeners(ref) { this.calls.push(['listeners', ref]); return [{ type: 'click', fn: 'onBuy' }]; },
     probe() { this.calls.push(['probe']); return { version: '3.8.6', ok: true }; },
+    visualCheck(ref, o) { this.calls.push(['visualCheck', ref, o]); const based = !!(o && o.baseline); return { ref, drawn: true, matches: based ? true : 'unknown', clear: based ? true : 'unknown', via: based ? 'pixel-confirmed' : 'geometric', visible: true }; },
+    captureBaseline(o) { this.calls.push(['captureBaseline', o]); return { 'Canvas/Btn': [0, 0, 0] }; },
+    reachableVisual(ref, o) { this.calls.push(['reachableVisual', ref, o]); return { ref, usable: true, reachable: { reachable: true }, visual: { drawn: true } }; },
     logs(since = 0) { this.calls.push(['logs', since]); return [{ level: 'error', text: 'boom' }, { level: 'log', text: 'ok' }].slice(since); },
     close() { this.closed = true; },
   };
@@ -54,6 +57,7 @@ test('tools registry: each tool has name/description/object inputSchema; core to
   }
   const names = TOOLS.map((t) => t.name);
   for (const n of ['connect', 'reload', 'snapshot', 'interactive', 'click_surface', 'resolve', 'coverage', 'press', 'get', 'call', 'reachable', 'node', 'probe', 'logs', 'close',
+    'visual_check', 'visual_baseline', 'reachable_visual',
     'break_at', 'break_in', 'break_exceptions', 'wait_pause', 'eval_frame', 'debug_step', 'clear_breakpoints']) {
     assert.ok(names.includes(n), `missing tool ${n}`);
   }
@@ -144,6 +148,36 @@ test('inspection tools dispatch to the Driver (diff/listeners/probe)', async () 
   const p = await handle({ id: 3, method: 'tools/call', params: { name: 'probe', arguments: {} } });
   assert.deepEqual(cp.calls.at(-1), ['probe']);
   assert.equal(JSON.parse(p.result.content[0].text).version, '3.8.6');
+});
+
+test('visual tools dispatch to the Driver (visual_check/visual_baseline/reachable_visual)', async () => {
+  const cp = fakeCp();
+  const handle = createDispatcher({ cp });
+
+  // visual_check: no baseline → via geometric, matches unknown
+  const vc = await handle({ id: 1, method: 'tools/call', params: { name: 'visual_check', arguments: { ref: 'Canvas/Btn' } } });
+  assert.deepEqual(cp.calls.at(-1), ['visualCheck', 'Canvas/Btn', {}]);
+  const v = JSON.parse(vc.result.content[0].text);
+  assert.equal(v.drawn, true);
+  assert.equal(v.matches, 'unknown');
+  assert.equal(v.via, 'geometric');
+
+  // baseline passes through → via pixel-confirmed, matches true
+  const vc2 = await handle({ id: 2, method: 'tools/call', params: { name: 'visual_check', arguments: { ref: 'Canvas/Btn', baseline: [0, 0, 0] } } });
+  assert.deepEqual(cp.calls.at(-1), ['visualCheck', 'Canvas/Btn', { baseline: [0, 0, 0] }]);
+  assert.equal(JSON.parse(vc2.result.content[0].text).via, 'pixel-confirmed');
+
+  // visual_baseline: default (no refs) → {}; refs pass through
+  const vb = await handle({ id: 3, method: 'tools/call', params: { name: 'visual_baseline', arguments: {} } });
+  assert.deepEqual(cp.calls.at(-1), ['captureBaseline', {}]);
+  assert.ok(JSON.parse(vb.result.content[0].text)['Canvas/Btn'], 'returns a per-ref signature map');
+  await handle({ id: 4, method: 'tools/call', params: { name: 'visual_baseline', arguments: { refs: ['A'] } } });
+  assert.deepEqual(cp.calls.at(-1), ['captureBaseline', { refs: ['A'] }]);
+
+  // reachable_visual: the combine → usable
+  const rv = await handle({ id: 5, method: 'tools/call', params: { name: 'reachable_visual', arguments: { ref: 'Canvas/Btn' } } });
+  assert.deepEqual(cp.calls.at(-1), ['reachableVisual', 'Canvas/Btn', {}]);
+  assert.equal(JSON.parse(rv.result.content[0].text).usable, true);
 });
 
 test('tools/list hides debug tools by default; --debug (state.debug) surfaces them; hidden ≠ disabled', async () => {

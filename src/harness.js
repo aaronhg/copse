@@ -25,7 +25,11 @@ import { snapshot as snap, press, get, call, reachable as coreReachable } from '
 // The AI's verdict is scoped to LOGIC/FLOW only — it is fed the node tree, not
 // pixels, so it must not claim rendering/reachability correctness (a covered or
 // off-screen button passes here but fails for a real player). Surface that in
-// the judge's `scope` field.
+// the judge's `scope` field. Those two dimensions the agent MUST NOT claim are
+// instead supplied as HARNESS-level facts by optional Driver capabilities:
+// `reachable` → the reachability hard-fail gate, and `visualCheck` → a "did the
+// subtree this action SHOWED actually render on screen" SOFT signal (surfaced as
+// out.visual, never a hard fail — see the visualGate below).
 
 /**
  * One copse command the plan wants to run.
@@ -49,6 +53,7 @@ import { snapshot as snap, press, get, call, reachable as coreReachable } from '
  * @property {(sel:string)=>any} get
  * @property {(sel:string,...args:any[])=>any} call
  * @property {(sel:string)=>any} [reachable]   OPTIONAL: drives the harness's reachability hard-fail gate
+ * @property {(ref:string)=>any} [visualCheck] OPTIONAL: drives the harness's visual "did it actually render" soft signal
  */
 
 /**
@@ -79,8 +84,34 @@ import { snapshot as snap, press, get, call, reachable as coreReachable } from '
  *           (overall pass stays the per-round AND). Optional; absent ⇒ no `summary`.
  */
 
+/**
+ * Pixel SOFT-signal: after an action whose logic-`diff` (`result.changed`) says a subtree appeared/activated,
+ * confirm those nodes actually RENDERED — catches "the tree says the panel opened but the screen is blank"
+ * (half-load / missing material / clipped), which the node tree alone can't see. Attaches `result.blankVisual`
+ * = the shown-but-not-drawn nodes (soft — never a hard fail; without a baseline only `drawn:false`/`offscreen`
+ * is trusted, and even that can misread a solid-colour node — see docs/VISUAL.md). Capability-gated on
+ * `driver.visualCheck`, capped at `gates.visualMax` (records the overflow in `result.visualCapped`, no silent
+ * truncation). Runs only when the driver exposes pixels — degrades to today's behavior otherwise.
+ */
+async function visualConfirm(driver, r, gates) {
+  if (!(gates.visualGate && typeof driver.visualCheck === 'function' && r && typeof r === 'object' && r.changed)) return;
+  const shown = [...(r.changed.appeared || []), ...(r.changed.activated || [])].map((d) => d && d.ref).filter(Boolean);
+  const uniq = [...new Set(shown)];
+  const n = Math.min(uniq.length, gates.visualMax);
+  const blank = [];
+  for (let i = 0; i < n; i++) {
+    let v; try { v = await driver.visualCheck(uniq[i]); } catch { continue; }
+    // reason is DERIVED from state, not v.reason: visualConfirm always calls visualCheck WITHOUT a baseline,
+    // so v.reason is 'no-baseline' even for a genuinely blank node — that config-sounding label is exactly
+    // the wrong signal here. drawn:false → 'blank'; otherwise the include was for an offscreen node.
+    if (v && (v.drawn === false || v.reason === 'offscreen')) blank.push({ ref: uniq[i], reason: v.drawn === false ? 'blank' : 'offscreen' });
+  }
+  if (blank.length) r.blankVisual = blank;
+  if (uniq.length > n) r.visualCapped = uniq.length - n;
+}
+
 /** Run one planned step against the driver, capturing throws (doesn't-crash is a signal we WANT). */
-async function execStep(driver, step, reachableGate) {
+async function execStep(driver, step, gates) {
   try {
     switch (step.op) {
       case 'press': {
@@ -88,7 +119,7 @@ async function execStep(driver, step, reachableGate) {
         // overlay / off-screen) is a REAL fail, not a pass. Check before pressing; honor `force` (explicit
         // override) and skip silently when the driver has no reachability (degrades to today's behavior).
         let unreachable = null, uncertain = null;
-        if (reachableGate && !(step.opts && step.opts.force) && typeof driver.reachable === 'function') {
+        if (gates.reachableGate && !(step.opts && step.opts.force) && typeof driver.reachable === 'function') {
           try {
             const rr = await driver.reachable(step.ref);
             if (rr && rr.reachable === false) unreachable = rr.blockedBy || true;
@@ -100,10 +131,11 @@ async function execStep(driver, step, reachableGate) {
         // a synthetic tap into a button with no VISIBLE handler — verify, don't hard-fail (copse's codeHandlers can miss a real one)
         if (!uncertain && r && Array.isArray(r.drove) && r.drove.length === 1 && r.drove[0] === 'touch' && r.wired === false) uncertain = 'touch-into-void';
         if (uncertain && r && typeof r === 'object') r.uncertain = uncertain; // surfaced as out.uncertain (verify), NOT hard-failed
+        await visualConfirm(driver, r, gates); // pixel soft-signal: did the subtree this press SHOWED actually render?
         return r;
       }
       case 'get':         return await driver.get(step.sel);
-      case 'call':        return await driver.call(step.sel, ...(step.args || []));
+      case 'call':        { const r = await driver.call(step.sel, ...(step.args || [])); await visualConfirm(driver, r, gates); return r; }
       case 'snapshot':    return await driver.snapshot(step.opts);
       case 'interactive': return await driver.interactive();
       default:            return { ok: false, reason: 'unknown-op', op: step.op };
@@ -126,10 +158,15 @@ async function execStep(driver, step, reachableGate) {
  * @param {boolean} [opts.reachableGate]  hard-fail a press to a covered/unreachable button (default true)
  * @param {boolean} [opts.errorGate]  hard-fail a step whose handler threw / logged an error (default true)
  * @param {boolean} [opts.driveGate]  hard-fail a press that drove NOTHING (drove:'nothing') (default true)
- * @returns {Promise<{pass:boolean, rounds:Array<{round:number, rationale?:string, steps:Array<{step:Step, result:any}>, verdict:Verdict}>, snapshot:any, summary?:any, unreachable?:Array<{ref:string, blockedBy:any}>, errored?:Array<{ref:string, error:string}>, undriven?:Array<{ref:string}>, uncertain?:Array<{ref:string, why:string}>}>}
+ * @param {boolean} [opts.visualGate]  SOFT-surface (out.visual) a subtree an action showed in the logic diff
+ *        but that didn't render on screen — needs a driver with `visualCheck` (default true; no-op without it)
+ * @param {number} [opts.visualMax]  max nodes to visual-check per action (default 4; each is a screenshot, so
+ *        this bounds the added latency — overflow is recorded in result.visualCapped, never silently dropped)
+ * @returns {Promise<{pass:boolean, rounds:Array<{round:number, rationale?:string, steps:Array<{step:Step, result:any}>, verdict:Verdict}>, snapshot:any, summary?:any, unreachable?:Array<{ref:string, blockedBy:any}>, errored?:Array<{ref:string, error:string}>, undriven?:Array<{ref:string}>, uncertain?:Array<{ref:string, why:string}>, visual?:Array<{press:string, node:string, reason:string}>}>}
  */
 export async function runHarness(driver, agent, opts = {}) {
-  const { context = null, maxRounds = 1, reachableGate = true, errorGate = true, driveGate = true } = opts;
+  const { context = null, maxRounds = 1, reachableGate = true, errorGate = true, driveGate = true, visualGate = true, visualMax = 4 } = opts;
+  const gates = { reachableGate, visualGate, visualMax };
   const rounds = [];
   let snapshot = await driver.snapshot();
 
@@ -137,7 +174,7 @@ export async function runHarness(driver, agent, opts = {}) {
     const plan = (await agent.plan({ context, snapshot, rounds, round })) || { steps: [] };
 
     const steps = [];
-    for (const step of plan.steps || []) steps.push({ step, result: await execStep(driver, step, reachableGate) });
+    for (const step of plan.steps || []) steps.push({ step, result: await execStep(driver, step, gates) });
 
     const verdict = await agent.judge({ context, snapshot, plan, steps, rounds, round });
     rounds.push({ round, rationale: plan.rationale, steps, verdict });
@@ -170,11 +207,16 @@ export async function runHarness(driver, agent, opts = {}) {
   // SURFACED but NOT hard-failed: a press copse couldn't confirm a player reaches/sees (reachable:'unsure' / occludedBy)
   // or a synthetic tap into a no-visible-handler button. Fail-loud uncertainty reaches the report instead of a silent pass.
   const uncertainSteps = rounds.flatMap((r) => (r.steps || []).filter((s) => s.result && s.result.uncertain).map((s) => ({ ref: s.step.ref, why: s.result.uncertain })));
+  // SOFT (surfaced, never a hard fail — like uncertain): a node the action's logic diff showed (appeared/
+  // activated) that did NOT render on screen (drawn:false / offscreen). "Tree says the panel opened, screen is
+  // blank." Left for the judge/report to weigh — no baseline here, so we don't auto-fail (see visualConfirm).
+  const blankVisuals = rounds.flatMap((r) => (r.steps || []).filter((s) => s.result && s.result.blankVisual).flatMap((s) => s.result.blankVisual.map((b) => ({ press: s.step.ref || s.step.sel || s.step.op, node: b.ref, reason: b.reason }))));
   const out = { pass: pass && unreachablePresses.length === 0 && (!errorGate || erroredSteps.length === 0) && (!driveGate || undrivenPresses.length === 0), rounds, snapshot };
   if (unreachablePresses.length) out.unreachable = unreachablePresses;
   if (erroredSteps.length) out.errored = erroredSteps;
   if (undrivenPresses.length) out.undriven = undrivenPresses;
   if (uncertainSteps.length) out.uncertain = uncertainSteps;
+  if (blankVisuals.length) out.visual = blankVisuals;
   // AI ④ (optional). Returning `{ pass, summary }` sets the OVERALL verdict + summary
   // (overrides the per-round AND); any other return value is treated as the summary.
   if (agent.report) {

@@ -170,7 +170,7 @@ Mechanism (engine-coupled, `runtime.js`), now **Rung 2+3** — replay the engine
 - **Consumer set** (`consumerTier`): the engine's `NodeEventProcessor.shouldHandleEventTouch` (the exact
   pointer-dispatch-list membership — catches a raw `node.on(TOUCH_*)` overlay a class check misses) → a user
   click/touch listener → `Button`/`BlockInputEvents`. **ADDITIVE**: a `false` from the engine getter must NOT
-  exclude a `cc.Button` (returning the raw getter value once wrongly dropped a live action button).
+  exclude a `cc.Button` (returning the raw getter value once wrongly dropped a live Button).
 - **Order** = `[render-camera priority, …sibling-index]` (resolves cross-camera/Layer). The render camera is
   `batcher2D.getFirstRenderCamera(node)` — ⚠ that returns the low-level render-pipeline camera whose
   `worldToScreen` yields **(0,0)**; map it back to its `cc.Camera` **component** (whose `worldToScreen` is

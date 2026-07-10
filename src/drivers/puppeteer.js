@@ -7,6 +7,7 @@
 // peer dep `puppeteer-core` and a built `dist/copse.inject.js`.
 import { readFileSync } from 'node:fs';
 import { diff as coreDiff } from '../core/index.js';
+import { signature, visualVerdict } from '../sensors/pixel.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const DEFAULT_CHROME = process.platform === 'darwin'
@@ -183,6 +184,66 @@ export async function connect(url, opts = {}) {
     return r;
   }
 
+  // ---- node-anchored visual layer (P1b) --------------------------------------------------------------
+  // Reduce a node's on-screen pixels to a signature: read the in-page manifest (rect + dynamic mask rects,
+  // viewport CSS px) → CDP-screenshot JUST that rect → downsample to grid×grid IN-PAGE (a 2D canvas decodes
+  // the opaque screenshot for free; the game's own WebGL canvas can't be read from JS) → signature() the
+  // tiny RGBA in Node. Masks are painted before downscaling so animation/particle/text jitter never signs.
+  const VGRID = 16;
+  // The cc frame may be a nested/OOPIF iframe offset from the top page. page.screenshot clips in TOP-page
+  // coords while the manifest rect is IFRAME-local, so resolve the cc frame's offset in the top page (0,0
+  // for the main frame). Returns null when it can't be determined (an OOPIF with no reachable frameElement)
+  // → visualSig then degrades LOUD instead of screenshotting the wrong region.
+  async function ccFrameOffset() {
+    if (frame === page.mainFrame()) return { x: 0, y: 0 };
+    let el; try { el = await frame.frameElement(); } catch { el = null; }
+    if (!el) return null;
+    let box; try { box = await el.boundingBox(); } catch { box = null; } finally { try { await el.dispose(); } catch { /* */ } }
+    return box ? { x: box.x, y: box.y } : null;
+  }
+  async function visualSig(ref, o = {}) {
+    const grid = o.grid || VGRID;
+    const manifest = await ev((r) => window.__copse.visualManifest(r), ref);
+    if (!manifest || !manifest.rect) return { manifest, sig: null, reason: (manifest && manifest.reason) || 'no-manifest' };
+    const vp = await ev(() => ({ w: window.innerWidth, h: window.innerHeight })).catch(() => null);
+    const r = manifest.rect;
+    const x = Math.max(0, r.x), y = Math.max(0, r.y);
+    let w = r.w - (x - r.x), h = r.h - (y - r.y);              // trim the part clamped off the top/left
+    if (vp) { w = Math.min(w, vp.w - x); h = Math.min(h, vp.h - y); } // and off the right/bottom
+    if (!(w >= 1 && h >= 1)) {
+      // fully outside the viewport (negative/over-far coords) reads as a real "not on screen" answer, not
+      // a sampling failure — distinguish so a caller sees `offscreen` vs a genuinely degenerate rect.
+      const off = r.x + r.w <= 0 || r.y + r.h <= 0 || (vp && (r.x >= vp.w || r.y >= vp.h));
+      return { manifest, sig: null, reason: off ? 'offscreen' : 'degenerate-rect' };
+    }
+    // rect/masks are iframe-LOCAL; the CDP screenshot clips in TOP-page coords → add the cc frame's offset.
+    const foff = await ccFrameOffset();
+    if (!foff) return { manifest, sig: null, reason: 'iframe-offset-unknown' }; // OOPIF we can't place → degrade loud
+    const local = { x, y, width: w, height: h };                        // iframe-local region (mask math)
+    const clip = { x: x + foff.x, y: y + foff.y, width: w, height: h };  // top-page region (the screenshot)
+    // version-safe: recent puppeteer returns a Uint8Array (the `encoding:'base64'` option is gone) → base64 in Node.
+    const shot = await page.screenshot({ clip, type: 'png' }).catch(() => null);
+    if (!shot) return { manifest, sig: null, reason: 'screenshot-failed' };
+    const png = Buffer.from(shot).toString('base64');
+    // Decode+downsample in-page. Guard it like its siblings above: a CSP that blocks data: imgs (or any
+    // decode failure) must degrade LOUD, not throw out of visualSig and reject the whole visualCheck.
+    const rgba = await page.evaluate(async ({ b64, grid, masks, clip }) => {
+      const img = new Image();
+      await new Promise((res, rej) => { img.onload = res; img.onerror = () => rej(new Error('decode')); img.src = 'data:image/png;base64,' + b64; });
+      const fw = img.width || 1, fh = img.height || 1;
+      const scratch = document.createElement('canvas'); scratch.width = fw; scratch.height = fh;
+      const ctx = scratch.getContext('2d'); ctx.drawImage(img, 0, 0);
+      const sx = fw / clip.width, sy = fh / clip.height;       // screenshot px per CSS px (≈ devicePixelRatio)
+      ctx.fillStyle = '#000';
+      for (const m of masks || []) ctx.fillRect((m.x - clip.x) * sx, (m.y - clip.y) * sy, m.w * sx, m.h * sy);
+      const small = document.createElement('canvas'); small.width = grid; small.height = grid;
+      const s2 = small.getContext('2d'); s2.drawImage(scratch, 0, 0, grid, grid);
+      return Array.from(s2.getImageData(0, 0, grid, grid).data);
+    }, { b64: png, grid, masks: manifest.maskRects, clip: local }).catch(() => null); // masks are iframe-local → pass the local region
+    if (!rgba) return { manifest, sig: null, reason: 'decode-failed' };
+    return { manifest, sig: signature(rgba, grid, grid, { grid }), grid };
+  }
+
   /** @type {any} */
   const cp = {
     // CDP reload: reload the attached tab (re-fetches the preview → picks up the editor's CURRENT
@@ -208,6 +269,41 @@ export async function connect(url, opts = {}) {
     diff: (a, b) => ev(([a, b]) => window.__copse.diff(a, b), [a, b]),
     listeners: (sel) => ev((s) => window.__copse.listeners(s), sel),   // user node.on() handlers (best-effort)
     probe: () => ev(() => window.__copse.probe()),                     // engine-coupling self-diagnostic (version + per-capability resolution)
+    // Node-anchored VISUAL check — the pixel complement to the logic tree. `drawn` catches "tree says
+    // active, screen is empty"; with a golden `baseline` signature (from captureBaseline), `matches`/`clear`
+    // confirm the node's OWN art is what's visible (closing reachable's opaque-sprite occlusion blind spot).
+    // Three-state {drawn,matches,clear,score?,visible,via,reason?}, same grammar as reachable.
+    visualCheck: async (ref, o = {}) => {
+      const { manifest, sig, reason } = await visualSig(ref, o);
+      const v = visualVerdict({ ref: (manifest && manifest.ref) || ref, sig, baseline: o.baseline, rect: manifest && manifest.rect, masked: (manifest && manifest.maskRects) || [], via: manifest && manifest.via, matchThreshold: o.matchThreshold, detailThreshold: o.detailThreshold });
+      if (manifest) v.visible = manifest.visible;
+      if (reason) v.reason = reason; // the driver's reason (offscreen/degenerate-rect/screenshot-failed) is more specific than verdict's generic 'no-signature'
+      return v;
+    },
+    // Golden per-node baseline on the CURRENT (known-good) screen → { ref: signature[] }. Feed an entry back
+    // as visualCheck({baseline}) later to detect a node that stopped rendering / got occluded / changed.
+    // Per-node (not full-frame), so it survives animation/RNG — dynamic descendants are masked out.
+    captureBaseline: async (o = {}) => {
+      const refs = o.refs || (await ev(() => window.__copse.interactive().map((d) => d.ref)));
+      const out = {};
+      for (const ref of refs) { const { sig } = await visualSig(ref, o); if (sig) out[ref] = Array.from(sig); }
+      return out;
+    },
+    // reachable (touch z-order) ∧ the pixel pass → "can a player actually SEE and USE it". usable is
+    // three-state: reachable+visible+clear → true; any hard-negative → false; reachable+visible+drawn but no
+    // baseline to confirm the art → 'unknown'. The headline combine — closes reachable's occlusion caveat.
+    reachableVisual: async (ref, o = {}) => {
+      const r = await ev((s) => window.__copse.reachable(s), ref);
+      const v = await cp.visualCheck(ref, o);
+      const usable = r.reachable === false ? false          // a confident block → not usable
+        : r.reachable !== true ? 'unknown'                  // 'unsure' → copse couldn't tell; never fold into a hard false
+          : v.visible === false ? false
+            : v.clear === true ? true
+              : v.clear === false ? false
+                : v.drawn === false ? false
+                  : 'unknown';                              // reachable+visible but no baseline to confirm the art
+      return { ref, usable, reachable: r, visual: v };
+    },
     logs: (since = 0) => logs.slice(since),               // console + page errors (all frames); since = index already seen
     // attach mode drives the user's own browser → disconnect, don't close it.
     page, get frame() { return frame; }, browser, ready, paused, // `paused`: attached while halted in the debugger → inject deferred

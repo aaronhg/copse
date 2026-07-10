@@ -27,7 +27,7 @@ tools — they're the interoperable contract (guarded by the interop corpus in t
 | `#N` absolute array index (`#14`, `#4._string`) | ✅ | ❌ | No stable index at runtime (the live tree isn't the serialized `__id__` array). |
 | `[i]` on **components** (`Fx:cc.Sprite[1]`) | ✅ | ❌ | copse addresses one component by class name; same-type disambiguation isn't exposed. |
 | `[i]` / `.i` on **array elements** (`Btn:cc.Button.clickEvents[0].handler`) | ✅ | ❌ | copse reads a whole member; drill into the returned value yourself. |
-| Literal-first node match (a node actually named `Slot[0]`) | ✅ (full-path-first) | ❌ | copse's parser **always** treats a trailing `[i]` as an index, so it can't address a node whose name literally ends in `[0]`. |
+| Literal-first node match (a node actually named `Cell[0]`) | ✅ (full-path-first) | ❌ | copse's parser **always** treats a trailing `[i]` as an index, so it can't address a node whose name literally ends in `[0]`. |
 | Real component class names (`cc.Label`, `ShopController`) | ✅ (from source/`.meta`) | ⚠️ minified | Release builds mangle `constructor.name` to `t`/`e`/`n`. coir keeps the real name; `getComponent('Label')` and serialized ClickEvent handler names still resolve at runtime. |
 
 **Behavioral divergence — ambiguity:** a bare same-name path (`Canvas/Item` when there are several
