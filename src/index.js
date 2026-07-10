@@ -7,3 +7,4 @@ export { coverageJoin, resolveCoirPath, resolveCopseRef } from './coverage.js';
 export { cocosRuntime, install } from './cocos/runtime.js';
 export { runHarness, localDriver } from './harness.js';
 export { runScript, subsetMatch } from './script.js';
+export { signature, compareSignatures, detail, visualVerdict } from './sensors/pixel.js';

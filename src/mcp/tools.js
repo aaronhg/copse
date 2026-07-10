@@ -7,10 +7,10 @@
 // grammar: Parent/Child:Comp.prop, [i] to disambiguate same-name siblings.
 //
 // Tools tagged `debug: true` (the CDP Debugger surface: break_*/wait_pause/eval_frame/debug_step/
-// clear_breakpoints) are ADVERTISED by default — the official chrome-devtools-mcp has no Debugger
-// domain, so this surface is copse-unique. `copse mcp --no-debug` hides them from tools/list
-// (server.js filters by this tag) for protected / anti-debug games, where pausing is exactly what
-// gets detected. They stay callable by name regardless, so tests/power-users aren't blocked.
+// clear_breakpoints) are HIDDEN from tools/list by default — they're dev-build-only (pausing the
+// runtime is intrusive, only sensible on a build you own) and would otherwise crowd the menu. `copse mcp --debug` surfaces them
+// (server.js filters by this tag). They stay callable by name regardless, so tests/power-users
+// aren't blocked.
 
 import { resolveCoirPath, coverageJoin } from '../coverage.js';
 import { runScript } from '../script.js';
@@ -78,7 +78,7 @@ const ensureDbg = async (state) => {
 export const TOOLS = [
   {
     name: 'connect',
-    description: 'Launch a browser at <url> (or ATTACH to an already-open tab), load a running Cocos game, inject copse, wait until ready. Call this FIRST (same operation as the library connect()). headed:true shows a window; browserURL points at your own Chrome (started with --remote-debugging-port). attach:true + match drives an ALREADY-OPEN tab without navigating — use this for Cloudflare/login sites you got past by hand. attach:true with NO url/match attaches to the ACTIVE tab (the one being viewed / another CDP tool such as chrome-devtools-mcp brought to front) — the natural mode when both servers share one Chrome. Returns a readiness summary.',
+    description: 'Launch a browser at <url> (or ATTACH to an already-open tab), load a running Cocos game, inject copse, wait until ready. Call this FIRST (same operation as the library connect()). headed:true shows a window; browserURL points at your own Chrome (started with --remote-debugging-port). attach:true + match drives an ALREADY-OPEN tab without navigating — use this for your own game behind a login/staging gate you opened yourself; omit match AND url to attach the ACTIVE tab (e.g. one chrome-devtools-mcp brought to front). Returns a readiness summary.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -145,7 +145,7 @@ export const TOOLS = [
   },
   {
     name: 'resolve',
-    description: "Translate a coir STATIC nodePath into the live copse `ref` by matching it against the running tree (symmetric tail match — absorbs coir's scene/prefab-file root prefix and a prefab's instantiation mount, the two reasons a raw coir path won't resolve in press/get). Pass a coir nodePath (e.g. 'home/Canvas/Home/lower/main_btns/layout/btn_shop'); returns {ref, mount, dropped} for a unique hit, {ambiguous:[refs]} for >1, or null. Feed the returned `ref` straight into press/get/reachable.",
+    description: "Translate a coir STATIC nodePath into the live copse `ref` by matching it against the running tree (symmetric tail match — absorbs coir's scene/prefab-file root prefix and a prefab's instantiation mount, the two reasons a raw coir path won't resolve in press/get). Pass a coir nodePath (e.g. 'main/Canvas/Menu/lower/buttons/layout/ShopBtn'); returns {ref, mount, dropped} for a unique hit, {ambiguous:[refs]} for >1, or null. Feed the returned `ref` straight into press/get/reachable.",
     inputSchema: { type: 'object', properties: { path: { type: 'string', description: 'a coir static nodePath' } }, required: ['path'] },
     run: async (state, a) => ({ data: resolveCoirPath(a.path, await needCp(state).snapshot({ includeInactive: true })) }),
   },
@@ -211,7 +211,7 @@ export const TOOLS = [
   },
   {
     name: 'probe',
-    description: "Engine-coupling self-diagnostic — run it once on an unfamiliar build to see whether copse's version-sensitive internals resolve on THIS Cocos version, instead of finding out via a silent 'unsure'. Read-only (walks + reads, patches nothing → anti-tamper safe). Returns {version, classes:{Node/Button/UITransform/Camera/EventTouch/…present?}, reach:{batcher2D, getFirstRenderCamera, cameraPriority}, events:{eventProcessor, shouldHandleEventTouch, capturingKey, tableKey, infosKey}, touch:{EventTouch, Touch, NodeEventType}}. Anything 'absent'/'unknown'/'error' is a tier that will fall back (or fail loud) here — e.g. getFirstRenderCamera:false → reachable uses the camOf heuristic (via.camera:'heuristic'); events.tableNote:'no-registered-listener-found' just means no node had wired a listener yet (open a scene with buttons and re-probe). The event key names (tableKey:'_callbackTable', infosKey:'callbackInfos' on 3.8.x) are the arms of copse's internal `||` ladders that actually matched — a shift there is exactly the drift this surfaces.",
+    description: "Engine-coupling self-diagnostic — run it once on an unfamiliar build to see whether copse's version-sensitive internals resolve on THIS Cocos version, instead of finding out via a silent 'unsure'. Read-only (walks + reads, patches nothing → non-invasive). Returns {version, classes:{Node/Button/UITransform/Camera/EventTouch/…present?}, reach:{batcher2D, getFirstRenderCamera, cameraPriority}, events:{eventProcessor, shouldHandleEventTouch, capturingKey, tableKey, infosKey}, touch:{EventTouch, Touch, NodeEventType}}. Anything 'absent'/'unknown'/'error' is a tier that will fall back (or fail loud) here — e.g. getFirstRenderCamera:false → reachable uses the camOf heuristic (via.camera:'heuristic'); events.tableNote:'no-registered-listener-found' just means no node had wired a listener yet (open a scene with buttons and re-probe). The event key names (tableKey:'_callbackTable', infosKey:'callbackInfos' on 3.8.x) are the arms of copse's internal `||` ladders that actually matched — a shift there is exactly the drift this surfaces.",
     inputSchema: { type: 'object', properties: {} },
     run: async (state) => ({ data: await needCp(state).probe() }),
   },
@@ -276,9 +276,27 @@ export const TOOLS = [
     run: async (state, a) => { const r = await needCp(state).screenshot(a); return r && r.base64 ? { image: { data: r.base64, mimeType: r.mimeType } } : { data: r }; },
   },
   {
+    name: 'visual_check',
+    description: "Node-anchored VISUAL check — the PIXEL complement to the logic tree (copse otherwise reads the node tree, never pixels). Screenshots JUST this node's screen rect (dynamic children — labels/particles/spine — masked so they don't trip it) and returns a three-state verdict {drawn, matches, clear, score?, visible, via, reason?} in the SAME grammar as reachable (true|false|'unknown' + a `via` provenance tag): drawn = is anything actually rendered at the rect (catches the 'tree says active, screen is blank' case reachable/snapshot can't); with a golden `baseline` signature (from visual_baseline) matches = it looks like the golden and clear = the node's OWN art is what's visible — which is how you close reachable's headline blind spot (a button covered by an opaque sprite with no input-consumer reads reachable:true but clear:false). via becomes 'pixel-confirmed' once a baseline is used; with no baseline matches/clear are 'unknown' (drawn still answers). Needs a screenshot-capable session (connect first).",
+    inputSchema: { type: 'object', properties: { ref: { type: 'string', description: 'node ref' }, baseline: { type: 'array', items: { type: 'number' }, description: "a golden signature for THIS ref (from visual_baseline) to compare against" } }, required: ['ref'] },
+    run: async (state, a) => { const o = {}; if (a.baseline) o.baseline = a.baseline; return { data: await needCp(state).visualCheck(a.ref, o) }; },
+  },
+  {
+    name: 'visual_baseline',
+    description: "Capture a golden per-node visual baseline on the CURRENT (known-good) screen — signs every interactive node (or the passed `refs`) and returns { ref: signature[] }. Feed an entry back as visual_check's `baseline` on a later run/build to detect a node that stopped rendering, got occluded, or changed art. Per-node (NOT a full-frame screenshot) baselines survive animation/RNG because each node's dynamic descendants are masked out. Needs an open session.",
+    inputSchema: { type: 'object', properties: { refs: { type: 'array', items: { type: 'string' }, description: 'refs to baseline (default: every interactive node)' } } },
+    run: async (state, a) => ({ data: await needCp(state).captureBaseline(a.refs ? { refs: a.refs } : {}) }),
+  },
+  {
+    name: 'reachable_visual',
+    description: "The headline COMBINE: touch-reachability (logic z-order) ∧ the pixel pass → \"can a player actually SEE and USE this\". Returns {ref, usable, reachable, visual}; `usable` is three-state — reachable+visible+clear → true, any hard-negative → false, reachable+visible+drawn but no baseline to confirm the art → 'unknown'. This is what turns reachable's opaque-sprite-occlusion caveat (reachable:true but visually covered) into a real answer. Pass a `baseline` (from visual_baseline) to reach a confident true. Needs an open session.",
+    inputSchema: { type: 'object', properties: { ref: { type: 'string' }, baseline: { type: 'array', items: { type: 'number' }, description: "golden signature for this ref (from visual_baseline)" } }, required: ['ref'] },
+    run: async (state, a) => ({ data: await needCp(state).reachableVisual(a.ref, a.baseline ? { baseline: a.baseline } : {}) }),
+  },
+  {
     name: 'break_at',
     debug: true,
-    description: 'DEBUG (CDP Debugger — for your OWN dev build; pausing trips anti-debug games). Set a breakpoint by script URL + line. urlRegex matches the script URL (e.g. "ShopController" or "game\\\\.js$"); line/col are 0-based. Optional condition (a JS expr). Then trigger it and call wait_pause.',
+    description: 'DEBUG (CDP Debugger — for your OWN dev build; pausing the runtime is intrusive). Set a breakpoint by script URL + line. urlRegex matches the script URL (e.g. "ShopController" or "game\\\\.js$"); line/col are 0-based. Optional condition (a JS expr). Then trigger it and call wait_pause.',
     inputSchema: { type: 'object', properties: { urlRegex: { type: 'string', description: 'regex matched against the script URL' }, line: { type: 'number', description: '0-based line number' }, col: { type: 'number', description: '0-based column (optional)' }, condition: { type: 'string', description: 'pause only if this JS expr is truthy (optional)' } }, required: ['urlRegex', 'line'] },
     run: async (state, a) => ({ data: await (await ensureDbg(state)).breakAt(a.urlRegex, a.line, a.col, a.condition) }),
   },

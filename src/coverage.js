@@ -133,7 +133,7 @@ export function coverageJoin(staticRows, runtimeRows) {
  * (`dropped`) and a prefab's instantiation `mount` — i.e. a raw coir path that wouldn't resolve
  * in `press`/`get` becomes the exact runtime `ref` that does. Path-only (ignores method), so it
  * works for any node, not just buttons.
- * @param {string} coirPath a coir nodePath, e.g. `home/Canvas/Home/.../btn_shop`
+ * @param {string} coirPath a coir nodePath, e.g. `main/Canvas/Menu/.../ShopBtn`
  * @param {Array<{ref:string,[k:string]:any}>} runtimeRows clickSurface()/snapshot() rows
  * @returns {{ref:string, mount:string, dropped:string} | {ambiguous:string[]} | null}
  */

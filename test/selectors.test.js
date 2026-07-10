@@ -20,7 +20,7 @@ function tree() {
   const panel = node('Panel', [], []); panel.active = false;
   const mgr = node('Mgr', [], [{ type: 'ShopController', gold: 100, buy(n) { this.gold -= n; return this.gold; } }]);
   const items = [node('Item'), node('Item'), node('Item')];
-  const literal = node('Slot[0]'); // a node whose NAME literally contains [0]
+  const literal = node('Cell[0]'); // a node whose NAME literally contains [0]
   const canvas = node('Canvas', [score, panel, mgr, ...items, literal]);
   return node('Scene', [canvas]);
 }
@@ -43,11 +43,11 @@ test('grammar: bare name = first same-name sibling; [i] is 0-based among same-na
   assert.equal(resolve(s, rt, 'Canvas/Item[3]'), null);
 });
 
-test('grammar DIVERGENCE: a trailing [i] is ALWAYS an index — copse cannot address a node literally named "Slot[0]"', () => {
+test('grammar DIVERGENCE: a trailing [i] is ALWAYS an index — copse cannot address a node literally named "Cell[0]"', () => {
   const s = tree();
-  // coir tries a literal full-path match first (so it CAN select a node named "Slot[0]");
-  // copse's resolve always parses the trailing [i] as an index → looks for "Slot"[0] → null.
-  assert.equal(resolve(s, rt, 'Canvas/Slot[0]'), null);
+  // coir tries a literal full-path match first (so it CAN select a node named "Cell[0]");
+  // copse's resolve always parses the trailing [i] as an index → looks for "Cell"[0] → null.
+  assert.equal(resolve(s, rt, 'Canvas/Cell[0]'), null);
 });
 
 test('grammar DIVERGENCE: #N absolute array index is unsupported (no stable runtime index)', () => {

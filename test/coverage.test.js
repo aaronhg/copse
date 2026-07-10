@@ -38,15 +38,15 @@ test('coverageJoin: prefab-internal button joins by prefix (runtime longer), car
 });
 
 test('coverageJoin: scene-root prefix — coir path LONGER (includes the scene file) still joins (the live-game case)', () => {
-  // Real Cocos: coir reports `home/Canvas/Home/btn` (scene root included); copse's runtime ref
-  // is `Canvas/Home/btn` (scene root excluded). The shorter is a tail of the longer → covered.
-  const stat = [{ nodePath: 'home/Canvas/Home/lower/btn_shop', method: 'gotoShop', handlerClass: 'HomeUI' }];
-  const run = [{ ref: 'Canvas/Home/lower/btn_shop', method: 'gotoShop', component: 'e', interactable: true, reachable: true }];
+  // Real Cocos: coir reports `main/Canvas/Menu/btn` (scene root included); copse's runtime ref
+  // is `Canvas/Menu/btn` (scene root excluded). The shorter is a tail of the longer → covered.
+  const stat = [{ nodePath: 'main/Canvas/Menu/lower/ShopBtn', method: 'gotoShop', handlerClass: 'MenuUI' }];
+  const run = [{ ref: 'Canvas/Menu/lower/ShopBtn', method: 'gotoShop', component: 'e', interactable: true, reachable: true }];
   const { covered } = coverageJoin(stat, run);
   assert.equal(covered.length, 1);
   assert.equal(covered[0].via, 'prefix');
   assert.equal(covered[0].mount, '');                // runtime adds no prefix…
-  assert.equal(covered[0].dropped, 'home');          // …coir's path had the scene-root segment copse omits
+  assert.equal(covered[0].dropped, 'main');          // …coir's path had the scene-root segment copse omits
 });
 
 test('coverageJoin: live-but-unreachable → blocked, not covered', () => {
@@ -168,9 +168,9 @@ test('coverageJoin: an EXACT 1-segment match still joins (min-overlap only block
 
 // ---- selector resolvers (coir path ↔ copse ref) ----------------------------------------
 test('resolveCoirPath: coir path → live ref, dropping the scene-root prefix (the live-game case)', () => {
-  const rows = [{ ref: 'Canvas/Home/lower/main_btns/layout/btn_shop' }, { ref: 'Canvas/Home/upper/btn_message' }];
-  assert.deepEqual(resolveCoirPath('home/Canvas/Home/lower/main_btns/layout/btn_shop', rows),
-    { ref: 'Canvas/Home/lower/main_btns/layout/btn_shop', mount: '', dropped: 'home' });
+  const rows = [{ ref: 'Canvas/Menu/lower/buttons/layout/ShopBtn' }, { ref: 'Canvas/Menu/upper/MsgBtn' }];
+  assert.deepEqual(resolveCoirPath('main/Canvas/Menu/lower/buttons/layout/ShopBtn', rows),
+    { ref: 'Canvas/Menu/lower/buttons/layout/ShopBtn', mount: '', dropped: 'main' });
 });
 
 test('resolveCoirPath: prefab-internal coir path → live ref with the inferred mount', () => {
@@ -191,7 +191,7 @@ test('resolveCoirPath: min-overlap — a 1-segment leaf does NOT resolve to a de
 });
 
 test('resolveCopseRef: reverse — live ref → coir nodePath (real handler class lives on that row)', () => {
-  const staticRows = [{ nodePath: 'home/Canvas/Home/lower/main_btns/layout/btn_shop', handlerClass: 'HomeUI' }];
-  assert.deepEqual(resolveCopseRef('Canvas/Home/lower/main_btns/layout/btn_shop', staticRows),
-    { nodePath: 'home/Canvas/Home/lower/main_btns/layout/btn_shop', mount: '', dropped: 'home' });
+  const staticRows = [{ nodePath: 'main/Canvas/Menu/lower/buttons/layout/ShopBtn', handlerClass: 'MenuUI' }];
+  assert.deepEqual(resolveCopseRef('Canvas/Menu/lower/buttons/layout/ShopBtn', staticRows),
+    { nodePath: 'main/Canvas/Menu/lower/buttons/layout/ShopBtn', mount: '', dropped: 'main' });
 });

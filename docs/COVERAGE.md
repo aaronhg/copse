@@ -110,8 +110,8 @@ and prints the buckets — the same logic the `coverage` tool/CLI run against a 
 ## Caveats (be honest)
 
 - **Different rootings (scene-root prefix & prefab mount).** coir includes the scene/prefab-file root
-  in its path (e.g. `home/Canvas/Home/btn_shop`); copse roots at the scene-root's *children*
-  (`Canvas/Home/btn_shop`). And a prefab instantiated into the scene gains a `mount` prefix coir can't
+  in its path (e.g. `main/Canvas/Menu/ShopBtn`); copse roots at the scene-root's *children*
+  (`Canvas/Menu/ShopBtn`). And a prefab instantiated into the scene gains a `mount` prefix coir can't
   know. `coverageJoin`'s symmetric tail match absorbs both: after an exact miss it matches when the
   shorter path is a clean segment-suffix of the longer, reporting `dropped` (coir's extra head, e.g.
   `home`) and/or `mount` (the runtime's extra head). It infers these from the live tree, so if the same

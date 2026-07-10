@@ -3,7 +3,7 @@
 // copse CLI — the official entry (registered as `copse`, runs this file directly; no build).
 //   copse ai   <url> --goal "<what to test>" [--stop ..] [--report ..] [--rounds N] [--model ..]
 //   copse scan <url>                          # one-shot: print snapshot/interactive/labels
-//   copse mcp  [url] [--no-debug]             # JSON-RPC/stdio MCP server (see examples/mcp.md)
+//   copse mcp  [url] [--debug]                # JSON-RPC/stdio MCP server (see docs/MCP.md)
 //   copse get/press/call/node/reachable <url> <sel>   # single-shot primitive → JSON (pipe to jq)
 //
 // Heavy/optional bits (puppeteer-core driver, the claude agent, the MCP server) are
@@ -44,10 +44,9 @@ const USAGE = `copse — drive & assert a running Cocos game
   copse ai   <url> --goal "<what to test>" [--stop "<when to stop>"] [--report "<format>"]
                    [--rounds N] [--model sonnet|opus|...] [--chrome <path>] [--browser-url <url>]
   copse scan <url> [--chrome <path>]
-  copse mcp  [url] [--no-debug]  start a JSON-RPC/stdio MCP server (any MCP client drives the game;
-                    omit url to let the client's 'connect' tool choose — see examples/mcp.md;
-                    the CDP Debugger tools are included by default — --no-debug hides them,
-                    e.g. against a protected / anti-debug game)
+  copse mcp  [url] [--debug]  start a JSON-RPC/stdio MCP server (any MCP client drives the game;
+                    omit url to let the client's 'connect' tool choose — see docs/MCP.md;
+                    --debug also surfaces the CDP Debugger tools, hidden by default)
 
   one-shot (connect → run one op → print JSON → close; pipe to jq):
   copse get   <url> <path:Comp.member>      read a member, e.g. Canvas/Score:Label.string
@@ -64,7 +63,7 @@ const USAGE = `copse — drive & assert a running Cocos game
            --headed       show a visible browser window (default headless); --fps N raise the fps cap to watch
            --browser-url <url>   attach to your own Chrome (run it with --remote-debugging-port) and drive that
            --attach [--match <substr>]   drive an ALREADY-OPEN tab in that Chrome without navigating
-                         (for Cloudflare/login sites you got past by hand) — needs --browser-url;
+                         (for your game behind a login/staging gate you opened yourself) — needs --browser-url;
                          omit --match (and <url>) to drive the ACTIVE tab (the one you're looking at)
            --framework <file>[,<file>]   extra framework adapter file(s) (config/code) on top of the
                          auto-loaded copse.frameworks.mjs — enables framework/pm_state/pm_call
@@ -78,7 +77,7 @@ if (!cmd || cmd === '-h' || cmd === '--help') { console.log(USAGE); process.exit
 // It runs until stdin EOF, then exits from inside startMcpServer.
 if (cmd === 'mcp') {
   const { startMcpServer } = await import('./mcp/server.js');
-  await startMcpServer({ url, connectOpts, debug: !has('--no-debug') }); // Debugger tools advertised by default; --no-debug hides them (anti-debug games)
+  await startMcpServer({ url, connectOpts, debug: has('--debug') }); // Debugger tools hidden by default; --debug surfaces them
 } else if (cmd === 'scan' || cmd === 'ai') {
   const target = url || connectOpts.match;                  // attach mode can use --match instead of a <url>
   if (!target && !connectOpts.attach) { console.error(`${cmd}: a <url> (or --attach [--match <substr>]) is required\n\n${USAGE}`); process.exit(1); } // bare --attach → active tab

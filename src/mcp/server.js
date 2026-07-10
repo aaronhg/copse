@@ -33,9 +33,9 @@ export function createDispatcher(state) {
       case 'ping':
         return { result: {} };
       case 'tools/list': {
-        // Debug-tagged tools (the CDP Debugger surface) are advertised by default (the CLI passes
-        // debug:true unless `copse mcp --no-debug` — hide them against protected/anti-debug games).
-        // They stay dispatchable by name in tools/call below regardless.
+        // Hide debug-tagged tools (the CDP Debugger surface) unless this session opted in with
+        // `copse mcp --debug` (state.debug). They stay dispatchable by name in tools/call below —
+        // hiding them just keeps the default menu focused on the testing primitives.
         const advertised = state.debug ? TOOLS : TOOLS.filter((t) => !t.debug);
         return { result: { tools: advertised.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })) } };
       }
@@ -61,7 +61,7 @@ export function createDispatcher(state) {
 /**
  * Run the MCP server on stdio. Optionally pre-opens a game if `url` is given
  * (else the client's `connect` tool chooses). Resolves only on stdin EOF (then exits).
- * `debug:false` hides the CDP Debugger tools from tools/list (the CLI defaults to true; `--no-debug` flips it).
+ * `debug:true` surfaces the CDP Debugger tools in tools/list (hidden by default).
  * @param {{url?:string, connectOpts?:any, debug?:boolean}} [opts]
  */
 export async function startMcpServer({ url, connectOpts, debug } = {}) {
@@ -93,7 +93,7 @@ export async function startMcpServer({ url, connectOpts, debug } = {}) {
     });
   });
   const shown = state.debug ? TOOLS.length : TOOLS.filter((t) => !t.debug).length;
-  log(`ready — ${shown} tools${state.debug ? '' : ` (+${TOOLS.length - shown} debug, hidden by --no-debug)`}${url ? `, pre-opening ${url}` : ', waiting for connect(url)'}`);
+  log(`ready — ${shown} tools${state.debug ? '' : ` (+${TOOLS.length - shown} debug, hidden; --debug to show)`}${url ? `, pre-opening ${url}` : ', waiting for connect(url)'}`);
 
   // `copse mcp <url>` convenience: pre-open in the BACKGROUND. Never block here — the
   // `initialize` handshake must respond immediately (launching/attaching a browser can take

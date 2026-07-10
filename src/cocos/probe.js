@@ -3,8 +3,8 @@
 // version-sensitive INTERNAL `cc.*` path copse reads, report WHETHER it resolved and via WHICH
 // key/tier, plus the engine version. Turns silent cross-version drift into a visible report —
 // run it once on an unfamiliar build and it names exactly which internal shape moved, instead of
-// copse quietly degrading to 'unsure'. Patches NOTHING (walks + reads only), so it's safe against
-// anti-tamper. This is the runtime companion to reachable.js's fail-loud floor: the floor stops a
+// copse quietly degrading to 'unsure'. Patches NOTHING (walks + reads only), so it's fully
+// non-invasive. This is the runtime companion to reachable.js's fail-loud floor: the floor stops a
 // stale read from being trusted; probe tells you WHICH read went stale on this version.
 //
 // Every path below is one copse actually depends on (grep the cocos/ layer): the NodeEventProcessor

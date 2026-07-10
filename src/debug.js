@@ -12,7 +12,7 @@
 //                                       `window.__copse` to the actual function, then break when it's
 //                                       CALLED (Debugger.setBreakpointOnFunctionCall). Works on minified
 //                                       builds. Breaks the METHOD (every instance) — narrow with a condition.
-// NB: enabling the Debugger / pausing is exactly what anti-debug games detect — use on your OWN dev build.
+// NB: pausing the runtime is intrusive — use on your OWN dev build, a build you own and control.
 
 /** @param {any} page a puppeteer Page (connect()'s `cp.page`). @returns a debug controller. */
 export async function attachDebugger(page) {

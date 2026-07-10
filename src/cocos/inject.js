@@ -21,8 +21,8 @@ const g = /** @type {any} */ (globalThis);
 g.copse = copse;
 
 // NOTE: we do NOT auto-capture console here. Patching `console.*` makes it non-native and
-// trips anti-tamper `isNative` guards (a hardened game self-destructed when it caught our patched
-// console). The puppeteer driver captures console passively over CDP instead. If you're doing
+// can trip `isNative` guards (some builds treat a patched `console` as tampering and wipe their
+// own globals in response). The puppeteer driver captures console passively over CDP instead. If you're doing
 // a console-paste and want `__copse.logs()`, opt in explicitly: `copse.startLogCapture()`.
 
 /**

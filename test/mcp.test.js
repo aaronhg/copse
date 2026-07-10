@@ -40,6 +40,9 @@ function fakeCp() {
     pmState(sel, hasValue, value) { this.calls.push(['pmState', sel, hasValue, value]); return hasValue ? { ok: true, ref: sel, wrote: value } : { ok: true, ref: sel, value: true }; },
     pmCall(sel, ...args) { this.calls.push(['pmCall', sel, args]); return { ok: true, ref: sel, value: 'switched' }; },
     screenshot(o = {}) { this.calls.push(['screenshot', o]); return o.path ? { ok: true, path: o.path, clipped: false } : { base64: 'AAAA', mimeType: 'image/png', clipped: !!o.selector }; },
+    visualCheck(ref, o) { this.calls.push(['visualCheck', ref, o]); const based = !!(o && o.baseline); return { ref, drawn: true, matches: based ? true : 'unknown', clear: based ? true : 'unknown', via: based ? 'pixel-confirmed' : 'geometric', visible: true }; },
+    captureBaseline(o) { this.calls.push(['captureBaseline', o]); return { 'Canvas/Btn': [0, 0, 0] }; },
+    reachableVisual(ref, o) { this.calls.push(['reachableVisual', ref, o]); return { ref, usable: true, reachable: { reachable: true }, visual: { drawn: true } }; },
     close() { this.closed = true; },
   };
 }
@@ -73,6 +76,7 @@ test('tools registry: each tool has name/description/object inputSchema; core to
   for (const n of ['connect', 'reload', 'snapshot', 'interactive', 'click_surface', 'resolve', 'coverage', 'press', 'get', 'call', 'reachable', 'node', 'probe', 'logs', 'close',
     'run_script', 'dump_script',
     'watch', 'patch', 'patch_clear', 'framework', 'register_framework', 'pm_state', 'pm_call', 'network', 'screenshot',
+    'visual_check', 'visual_baseline', 'reachable_visual',
     'break_at', 'break_in', 'break_exceptions', 'wait_pause', 'eval_frame', 'debug_step', 'clear_breakpoints']) {
     assert.ok(names.includes(n), `missing tool ${n}`);
   }
@@ -219,7 +223,37 @@ test('inspection tools dispatch to the Driver (diff/listeners/probe)', async () 
   assert.equal(JSON.parse(p.result.content[0].text).version, '3.8.6');
 });
 
-test('tools/list gates debug tools on state.debug (CLI defaults to true; --no-debug → false); hidden ≠ disabled', async () => {
+test('visual tools dispatch to the Driver (visual_check/visual_baseline/reachable_visual)', async () => {
+  const cp = fakeCp();
+  const handle = createDispatcher({ cp });
+
+  // visual_check: no baseline → via geometric, matches unknown
+  const vc = await handle({ id: 1, method: 'tools/call', params: { name: 'visual_check', arguments: { ref: 'Canvas/Btn' } } });
+  assert.deepEqual(cp.calls.at(-1), ['visualCheck', 'Canvas/Btn', {}]);
+  const v = JSON.parse(vc.result.content[0].text);
+  assert.equal(v.drawn, true);
+  assert.equal(v.matches, 'unknown');
+  assert.equal(v.via, 'geometric');
+
+  // baseline passes through → via pixel-confirmed, matches true
+  const vc2 = await handle({ id: 2, method: 'tools/call', params: { name: 'visual_check', arguments: { ref: 'Canvas/Btn', baseline: [0, 0, 0] } } });
+  assert.deepEqual(cp.calls.at(-1), ['visualCheck', 'Canvas/Btn', { baseline: [0, 0, 0] }]);
+  assert.equal(JSON.parse(vc2.result.content[0].text).via, 'pixel-confirmed');
+
+  // visual_baseline: default (no refs) → {}; refs pass through
+  const vb = await handle({ id: 3, method: 'tools/call', params: { name: 'visual_baseline', arguments: {} } });
+  assert.deepEqual(cp.calls.at(-1), ['captureBaseline', {}]);
+  assert.ok(JSON.parse(vb.result.content[0].text)['Canvas/Btn'], 'returns a per-ref signature map');
+  await handle({ id: 4, method: 'tools/call', params: { name: 'visual_baseline', arguments: { refs: ['A'] } } });
+  assert.deepEqual(cp.calls.at(-1), ['captureBaseline', { refs: ['A'] }]);
+
+  // reachable_visual: the combine → usable
+  const rv = await handle({ id: 5, method: 'tools/call', params: { name: 'reachable_visual', arguments: { ref: 'Canvas/Btn' } } });
+  assert.deepEqual(cp.calls.at(-1), ['reachableVisual', 'Canvas/Btn', {}]);
+  assert.equal(JSON.parse(rv.result.content[0].text).usable, true);
+});
+
+test('tools/list hides debug tools by default; --debug (state.debug) surfaces them; hidden ≠ disabled', async () => {
   const core = await createDispatcher({ cp: null })({ id: 1, method: 'tools/list' });
   const coreNames = core.result.tools.map((t) => t.name);
   assert.ok(coreNames.includes('press') && coreNames.includes('diff') && coreNames.includes('listeners'), 'core tools advertised');

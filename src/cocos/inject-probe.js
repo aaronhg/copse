@@ -6,7 +6,7 @@
 //
 // This is the READ-ONLY load-metrics surface (probe/firstClickable/interactive/reachable) for a driver that
 // only MEASURES — no press/get/call/diff. esbuild tree-shakes those out (this entry never imports them),
-// leaving reachability (the reused core) as the only heavy piece. Smaller anti-tamper footprint than the
+// leaving reachability (the reused core) as the only heavy piece. Smaller injected surface than the
 // full bundle; unlike inject-lite it KEEPS reachability (which lite drops).
 import { installProbe, findCC } from './runtime.js';
 
