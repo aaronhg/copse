@@ -9,9 +9,10 @@
 //   • cocosRuntimeLite(cc) — base only, NO reachable (the minimal driver a `press`-only caller
 //     needs; inject-lite.js). The reachability code (~half the engine layer) lives in reachable.js
 //     and is imported ONLY by the full runtime, so esbuild tree-shakes it out of the lite bundle.
-import { snapshot, clickSurface, resolve, press, get, call, reachable, node, diff } from '../core/index.js';
+import { snapshot, clickSurface, resolve, press, get, call, reachable, node, diff, splitMember } from '../core/index.js';
 import { makeReachable } from './reachable.js';
 import { probe } from './probe.js';
+import { registerInto, describe, stateWith, callWith } from './framework.js';
 
 const stripCc = (t) => (typeof t === 'string' && t.startsWith('cc.') ? t.slice(3) : t);
 
@@ -224,6 +225,112 @@ export function install(cc, target = globalThis) {
   // where you want `__copse.logs()`, opt in explicitly with `copse.startLogCapture()`.
   const rt = cocosRuntime(cc);
   const root = () => cc.director.getScene();
+
+  const jsonSafe = (v) => { try { JSON.stringify(v); return v; } catch { try { return String(v); } catch { return '[unserializable]'; } } };
+  const dur = (v, d) => { if (v == null) return d; if (typeof v === 'number') return v; const m = /^\s*(\d+(?:\.\d+)?)\s*(ms|s)?\s*$/.exec(String(v)); return m ? Number(m[1]) * (m[2] === 's' ? 1000 : 1) : d; };
+  const nap = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  // ---- watch: a diff-only TIMELINE of exprs/selectors over time (state-machine observation) ----
+  // The whole poll loop runs IN-PAGE in one call, so a caller (the puppeteer driver / MCP) makes a
+  // single request instead of N per-tick round-trips. Records ONLY changed keys, with relative
+  // timestamps {t, dt} — replaces the hand-written `setInterval + diff` loops testers kept re-inventing.
+  /** @param {{exprs?:string[], selectors?:string[], interval?:string|number, until?:string, timeout?:string|number, settle?:string|number}} [o] */
+  async function watchImpl(o = {}) {
+    const { exprs = [], selectors = [], interval, until, timeout, settle } = o;
+    const iv = Math.max(50, dur(interval, 1000)), to = dur(timeout, 40000), st = dur(settle, 0);
+    const evalOne = (e) => { try { return jsonSafe((0, eval)(e)); } catch (err) { return '⚠ ' + ((err && err.message) || err); } };
+    const sample = () => {
+      const s = {};
+      for (const e of exprs) s['{' + e + '}'] = evalOne(e);
+      for (const sel of selectors) { try { const r = get(root(), rt, sel); s[sel] = r && r.ok ? jsonSafe(r.value) : ('⚠ ' + ((r && r.reason) || 'err')); } catch (err) { s[sel] = '⚠ ' + ((err && err.message) || err); } }
+      return s;
+    };
+    const hit = () => { if (!until) return false; try { return !!(0, eval)(until); } catch { return false; } };
+    const t0 = Date.now(); const timeline = []; let last = {}, lastT = t0;
+    const rec = () => {
+      const cur = sample(); const ch = {};
+      for (const k of Object.keys(cur)) if (JSON.stringify(cur[k]) !== JSON.stringify(last[k])) ch[k] = cur[k];
+      if (Object.keys(ch).length) { const now = Date.now(); timeline.push({ t: now - t0, dt: now - lastT, changes: ch }); lastT = now; }
+      last = cur;
+    };
+    rec();                                            // t=0 baseline (everything reads as "changed" from nothing)
+    let stoppedBy = 'timeout';
+    while (true) {
+      if (hit()) { stoppedBy = 'until'; break; }
+      if (Date.now() - t0 >= to) { stoppedBy = 'timeout'; break; }
+      await nap(iv); rec();
+    }
+    if (stoppedBy === 'until' && st > 0) { const end = Date.now() + st; while (Date.now() < end) { await nap(iv); rec(); } }
+    return { timeline, stoppedBy, elapsed: Date.now() - t0, samples: timeline.length };
+  }
+
+  // ---- patch: wrap a live component method to verify a fix WITHOUT rebuilding ----
+  // Wraps the method on the INSTANCE (scoped, restorable), binds `this` correctly, and runs the
+  // before/after hooks under try/catch so a buggy hook can't break the original call — the three
+  // things testers kept getting wrong hand-writing monkey-patches on the running game.
+  const PATCHES = target.__copsePatches || (target.__copsePatches = new Map());
+  const compileHook = (src) => { if (!src) return null; if (typeof src === 'function') return src; return (0, eval)('(' + src + ')'); };
+
+  // ---- framework adapters (SUGGESTIONS #4): the per-session registry (core ships none) ----
+  // Populated by registerFramework — the driver auto-injects adapters from copse.frameworks.mjs; probe
+  // reads the same store off globalThis. describe/stateWith/callWith are the generic (framework.js) engine.
+  const FW = target.__copseFrameworks || (target.__copseFrameworks = []);
+  const restore = (sel) => { const p = PATCHES.get(sel); if (!p) return false; try { if (p.hadOwn) p.comp[p.member] = p.orig; else delete p.comp[p.member]; } catch { /* */ } PATCHES.delete(sel); return true; };
+  function patchImpl(sel, hooks = {}) {
+    let comp, member;
+    try { const p = splitMember(sel); const n = resolve(root(), rt, p.path); if (!n) return { ok: false, reason: 'not-found', ref: sel }; comp = rt.getComponent(n, p.comp); member = p.member; }
+    catch (e) { return { ok: false, reason: 'bad-selector', error: (e && e.message) || String(e) }; }
+    if (!comp) return { ok: false, reason: 'no-component', ref: sel };
+    if (typeof comp[member] !== 'function') return { ok: false, reason: 'not-a-method', ref: sel };
+    let before, after, replace;
+    try { before = compileHook(hooks.before); after = compileHook(hooks.after); replace = compileHook(hooks.replace); }
+    catch (e) { return { ok: false, reason: 'bad-hook', error: (e && e.message) || String(e) }; }
+    if (PATCHES.has(sel)) restore(sel);              // re-patching the same selector replaces
+    const hadOwn = Object.prototype.hasOwnProperty.call(comp, member);
+    const orig = comp[member];
+    const errors = [];
+    const wrapper = function (...args) {
+      let a = args;
+      if (before) { try { const r = before(a, this); if (Array.isArray(r)) a = r; } catch (e) { errors.push('before: ' + ((e && e.message) || e)); } }
+      const ret = replace ? replace(a, this) : orig.apply(this, a);   // orig/replace throw propagates (that's the signal)
+      if (after) { try { const r = after(a, ret, this); if (r !== undefined) return r; } catch (e) { errors.push('after: ' + ((e && e.message) || e)); } }
+      return ret;
+    };
+    try { comp[member] = wrapper; } catch (e) { return { ok: false, reason: 'unwritable', error: (e && e.message) || String(e) }; }
+    PATCHES.set(sel, { comp, member, hadOwn, orig, errors });
+    return { ok: true, ref: sel, method: member, hooks: ['before', 'after', 'replace'].filter((k) => hooks[k]) };
+  }
+  function patchClearImpl(sel) {
+    const errsOf = (k) => { const p = PATCHES.get(k); return p && p.errors.length ? p.errors.slice() : null; };
+    if (sel) { const he = errsOf(sel); const ok = restore(sel); return { ok: true, cleared: ok ? [sel] : [], ...(he ? { hookErrors: { [sel]: he } } : {}) }; }
+    const all = [...PATCHES.keys()]; const hookErrors = {};
+    for (const k of all) { const he = errsOf(k); if (he) hookErrors[k] = he; }
+    for (const k of all) restore(k);
+    return { ok: true, cleared: all, ...(Object.keys(hookErrors).length ? { hookErrors } : {}) };
+  }
+
+  // ---- screenRect: best-effort screen-space rect of a node (for screenshot clipping) ----
+  // Projects the node's world bbox through a camera to CSS pixels (Cocos screen origin is
+  // bottom-left, DOM top-left; de-scale by devicePixelRatio). Returns null on any doubt so the
+  // driver falls back to a full-frame capture rather than clipping to garbage.
+  const screenRect = (sel) => {
+    try {
+      const n = resolve(root(), rt, sel); if (!n) return null;
+      const ui = n.getComponent(cc.UITransform || 'cc.UITransform'); if (!ui || !cc.Vec3 || !cc.Camera) return null;
+      let cam = null; (function walk(z) { if (cam || !z) return; const c = z.getComponent && z.getComponent(cc.Camera); if (c && typeof c.worldToScreen === 'function') { cam = c; return; } (z.children || []).forEach(walk); })(root());
+      if (!cam) return null;
+      const box = ui.getBoundingBoxToWorld();
+      const pts = [[box.x, box.y], [box.x + box.width, box.y + box.height]].map(([x, y]) => { const o = new cc.Vec3(); cam.worldToScreen(new cc.Vec3(x, y, 0), o); return o; });
+      const dpr = target.devicePixelRatio || 1;
+      const H = (cc.view && cc.view.getFrameSize && cc.view.getFrameSize().height) || ((target.innerHeight || 0) * dpr) || (Math.max(pts[0].y, pts[1].y));
+      const xs = pts.map((p) => p.x), ys = pts.map((p) => p.y);
+      const left = Math.min(...xs) / dpr, right = Math.max(...xs) / dpr;
+      const top = (H - Math.max(...ys)) / dpr, bottom = (H - Math.min(...ys)) / dpr;
+      const rect = { x: Math.max(0, left), y: Math.max(0, top), width: right - left, height: bottom - top };
+      return (rect.width > 0 && rect.height > 0 && isFinite(rect.x) && isFinite(rect.y)) ? rect : null;
+    } catch { return null; }
+  };
+
   const api = {
     snapshot: (opts) => snapshot(root(), rt, opts),
     interactive: (opts) => snapshot(root(), rt, { onlyInteractive: true, reachability: true, ...opts }), // pressable list, with reachability
@@ -239,6 +346,14 @@ export function install(cc, target = globalThis) {
     listeners: (sel) => { const n = resolve(root(), rt, sel); return n ? rt.codeHandlers(n) : null; },
     probe: () => probe(cc),                               // engine-coupling self-diagnostic (version + per-capability resolution)
     logs: (since = 0) => (target.__copseLogs || []).filter((l) => l.t > since), // console + uncaught errors
+    watch: (opts) => watchImpl(opts),                     // diff-only timeline of exprs/selectors over time
+    patch: (sel, hooks) => patchImpl(sel, hooks),         // wrap a live method to verify a fix pre-rebuild
+    patch_clear: (sel) => patchClearImpl(sel),            // restore patched method(s)
+    registerFramework: (a) => registerInto(FW, a),        // install an adapter for this session (auto-loaded from copse.frameworks.mjs, or ad-hoc)
+    framework: () => ({ ...describe(target, FW), registered: FW.length }), // detect via registered adapters + enumerate proxies/mediators
+    pmState: (sel, hasValue, value) => stateWith(target, FW, sel, hasValue, value), // read/write proxy/mediator state (outside the cc tree)
+    pmCall: (sel, args) => callWith(target, FW, sel, args), // call a proxy/mediator method
+    screenRect,                                           // best-effort node screen rect (screenshot clip) — null if unprojectable
     rt, // exposed for ad-hoc poking from a console
   };
   target.__copse = api;

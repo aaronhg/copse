@@ -160,9 +160,10 @@ Layout (grouped by concern; `src/index.js` is the public barrel):
   MCP tools so ANY MCP client (Claude Code / browser-use / Stagehand / a plain tool-use loop) drives
   the canvas. `server.js` = hand-rolled JSON-RPC-over-stdio (mirrors coir's `mcp/server.js`: stderr-only
   logging, serialized handler, `createDispatcher(state)` exported for tests; gates debug-tagged tools
-  out of `tools/list` when `state.debug` is falsy); `tools.js` = the tool registry — 20 testing primitives
+  out of `tools/list` when `state.debug` is falsy); `tools.js` = the tool registry — 29 testing primitives
   (`connect`/`reload`/`snapshot`/`interactive`/`click_surface`/`resolve`/`coverage`/`press`/`get`/`call`/`eval`/`reachable`/`node`/`diff`/
-  `listeners`/`probe`/`logs`/`run_script`/`dump_script`/`close`) + 7 `debug:true`-tagged Debugger tools (`break_*`/`wait_pause`/
+  `listeners`/`probe`/`logs`/`watch`/`patch`/`patch_clear`/`framework`/`register_framework`/`pm_state`/`pm_call`/`network`/`screenshot`/`run_script`/`dump_script`/`close`)
+  + 7 `debug:true`-tagged Debugger tools (`break_*`/`wait_pause`/
   `eval_frame`/`debug_step`/`clear_breakpoints`), **all advertised by default** (chrome-devtools-mcp has no
   Debugger domain, so the breakpoint surface is copse-unique; `copse mcp --no-debug` hides the debug 7
   against protected/anti-debug games) — over a live
@@ -230,10 +231,33 @@ __copse.node('Canvas/Panel')                      // node intrinsics → { activ
 __copse.get('Canvas/Panel:Node.active')           // read a single node intrinsic via the `Node` pseudo-component
 __copse.diff(before, after)                       // → { appeared, disappeared, activated, deactivated (node descriptors w/ label/click), labelChanged }
 __copse.listeners('Canvas/ShopBtn')               // user node.on() handlers (engine-internal + Button's own filtered out)
-__copse.probe()                                   // engine-coupling self-diagnostic → { version, classes, reach, events, touch } — which version-sensitive internals resolve on THIS build (drift → visible, not a silent 'unsure')
+__copse.probe()                                   // engine-coupling self-diagnostic → { version, classes, reach, events, touch, framework } — which version-sensitive internals resolve on THIS build (drift → visible, not a silent 'unsure')
 
 __copse.logs(sinceTs?)                            // captured console.* + uncaught errors → [{level,text,t,stack?}] (started on inject load)
+__copse.watch({exprs?,selectors?,interval?,until?,timeout?,settle?})  // diff-only state TIMELINE over time → { timeline:[{t,dt,changes}], stoppedBy } (one in-page loop; replaces hand-written polling)
+__copse.patch('Canvas/Mgr:Ctrl.setBet', {before?,after?,replace?})   // wrap a live method (JS fn-expr src) to verify a fix pre-rebuild → { ok, method, hooks }; __copse.patch_clear(sel?) restores
+__copse.registerFramework(adapterOrSrc)           // install a framework adapter for this session → { ok, kind, registered }  (core ships NONE)
+__copse.framework()                               // detect via REGISTERED adapters + enumerate → { kind, proxies, mediators, commands, registered }  (logic state OUTSIDE the cc tree)
+__copse.pmState('GameDataProxy.active' [,true,value])  // read/write a proxy/mediator prop (get/call can't reach these) → { ok, value|wrote }
+__copse.pmCall('PanelMediator.toggle', args)  // call a proxy/mediator method → { ok, value }
 ```
+**Framework-aware access is a PLUGIN, not core knowledge** (`src/cocos/framework.js` is a generic adapter
+engine — no PureMVC baked in; not every game has a framework and those that do wire it differently). The
+driver auto-loads adapters from `copse.frameworks.mjs` (this machine's, next to the package, **git-ignored**;
+then a per-project one in cwd) + `connect({frameworks})` / `--framework <file>` / the `register_framework`
+tool, and injects them so `framework`/`pm_state`/`pm_call` light up. An adapter is a CONFIG object
+(`{kind, facade:[…locations], proxy:{via?,map?}, mediator, command}` — field-name candidates absorb per-game
+differences) or a code-adapter source string. `probe.framework.registered` says how many are loaded. See
+`copse.frameworks.example.mjs`.
+
+(The driver adds two Node-side surfaces that don't need `cc`: `cp.network({grep,status,type,tail,since})`
+— CDP-captured requests for "client action → server error code" bugs, also attachable via `press({captureNetwork:true})`;
+and `cp.screenshot({selector?,path?})` — a PNG so the model can pair a logic state with the actual screen.
+`cp.logs`/`cp.network` filter server-side (grep/level/tail) so a chatty game never blows the token budget;
+`cp.eval` auto-wraps top-level `await`; and `cp.*` calls transparently re-inject after a page navigation.
+Attach reports `paused` (renderer HALTED in the debugger → inject deferred) and `stalled`/`injecting`
+(init not settled — usually a loading/intro screen with no buttons yet; `__copse` is typically already up)
+as **separate** states, so a still-loading game is no longer mislabelled "paused in the debugger".)
 Panel open/close ("press a panel button → its block opens") = snapshot `{includeInactive:true}`
 → act → snapshot → `diff`: the panel's subtree shows up in `activated`/`appeared`. Verified
 on a dev/preview build: pressing a menu toggle put its menu subtree (21 nodes) in `diff.activated`,

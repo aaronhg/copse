@@ -74,7 +74,7 @@ const ensureDbg = async (state) => {
   return state.dbg;
 };
 
-/** @type {{name:string,description:string,inputSchema:any,debug?:boolean,record?:boolean,run:(state:any,args:any)=>Promise<{data?:any,error?:string}>}[]} */
+/** @type {{name:string,description:string,inputSchema:any,debug?:boolean,record?:boolean,run:(state:any,args:any)=>Promise<{data?:any,error?:string,image?:any}>}[]} */
 export const TOOLS = [
   {
     name: 'connect',
@@ -88,6 +88,7 @@ export const TOOLS = [
         browserURL: { type: 'string', description: 'CDP URL of an existing Chrome (e.g. http://127.0.0.1:9222) — required for attach' },
         attach: { type: 'boolean', description: 'drive an already-open tab (no navigation) instead of opening a new one' },
         match: { type: 'string', description: 'when attach:true, pick the open tab whose URL contains this substring (omit match AND url to attach the ACTIVE tab)' },
+        frameworks: { type: 'array', items: {}, description: 'extra framework adapters (config objects / code-adapter source strings / file paths) on top of the auto-loaded copse.frameworks.mjs — enables framework/pm_state/pm_call' },
       },
     },
     run: async (state, a) => {
@@ -99,15 +100,18 @@ export const TOOLS = [
       if (typeof a.fps === 'number') opts.fpsCap = a.fps;
       if (a.browserURL) opts.browserURL = a.browserURL;
       if (a.attach) { opts.attach = true; opts.match = a.match || a.url; }
+      if (a.frameworks) opts.frameworks = a.frameworks;
       const target = a.url || opts.match || '';
       state.cp = await connect(target, opts);
-      // attached while the renderer is paused at a breakpoint → copse inject is deferred (it'd hang).
-      // Return now: Debugger tools (wait_pause/eval_frame/break_at) work immediately; snapshot/press/
-      // break_in auto-run once you resume.
-      // active-tab attach has no target string — report the URL of the tab actually attached
-      // (page.url() is CDP-cached, safe even while paused).
-      const at = () => { try { return target || state.cp.page.url(); } catch { return target; } };
-      if (state.cp.paused) return { data: { ok: true, url: at(), attached: true, paused: true, note: 'renderer paused in the debugger — inject deferred. Use wait_pause/eval_frame/break_at now; snapshot/press/break_in run after you resume.' } };
+      // Report the URL of the tab actually attached (page.url() is CDP-cached, safe even while paused);
+      // fall back to the target/match string only if that read fails (it was reporting the match substring).
+      const at = () => { try { return state.cp.page.url() || target; } catch { return target; } };
+      // paused = the renderer is HALTED in the debugger → copse inject is deferred (it'd hang). Debugger
+      // tools work immediately; snapshot/press/break_in auto-run once you resume.
+      if (state.cp.paused) return { data: { ok: true, url: at(), attached: true, paused: true, note: 'renderer HALTED (debugger) — inject deferred. Use wait_pause/eval_frame/break_at now; snapshot/press/break_in run after you resume.' } };
+      // stalled = init didn't settle in time — almost always the game is on a loading/intro screen (no
+      // interactive buttons yet), NOT a debugger pause. __copse is usually already installed, so a read works.
+      if (state.cp.stalled) return { data: { ok: true, url: at(), attached: true, injecting: true, note: 'inject still settling — the game looks like it is on a loading/intro screen (no interactive buttons yet). __copse is likely already installed: call snapshot/interactive again in a moment, or reload.' } };
       const snap = await state.cp.snapshot({ relevant: true });
       const inter = await state.cp.interactive();
       return { data: { ok: true, url: at(), attached: !!opts.attach, relevantNodes: snap.length, buttons: inter.length } };
@@ -155,8 +159,8 @@ export const TOOLS = [
     name: 'press',
     record: true,
     description: "Press a button by ref — runs its wired clickEvents + emits CLICK (NOT a coordinate click). Returns {ok, fired, drove, wired?, changed?, errors?}; `drove` = what actuated: ['clickEvent'] (serialized) / ['click'] (a real on('click')) / ['touch'] (a synthetic tap, best-effort) / 'nothing' — so a press that did NOTHING isn't misread as a pass (the harness hard-fails drove:'nothing'); `wired:false` on the ambiguous cases flags a button with no visible handler. `changed` auto-reports what the action did once the tree settles (appeared/disappeared/activated/deactivated/labelChanged as node descriptors, so you can read a panel's contents straight from it). `errors` lists any console-error / uncaught pageerror the handler produced during the press — present even when the engine swallowed the throw and `fired` looks fine, so a crashing handler is NOT a silent pass (the harness hard-fails on it). Honors interactable unless force:true. Set reachableGate:true to ALSO refuse a button a player can't reach (a confident reachable:false → {ok:false, reason:'unreachable', blockedBy}) — the same gate runHarness applies, off by default since press is for driving handler logic regardless of reach.",
-    inputSchema: { type: 'object', properties: { ref: { type: 'string', description: 'node ref, e.g. Canvas/Panel/CloseBtn' }, force: { type: 'boolean', description: 'press even if interactable:false' }, reachableGate: { type: 'boolean', description: 'refuse the press if the button is a confident reachable:false (covered/off-screen)' } }, required: ['ref'] },
-    run: async (state, a) => { const o = {}; if (a.force) o.force = true; if (a.reachableGate) o.reachableGate = true; return { data: await needCp(state).press(a.ref, o) }; },
+    inputSchema: { type: 'object', properties: { ref: { type: 'string', description: 'node ref, e.g. Canvas/Panel/CloseBtn' }, force: { type: 'boolean', description: 'press even if interactable:false' }, reachableGate: { type: 'boolean', description: 'refuse the press if the button is a confident reachable:false (covered/off-screen)' }, captureNetwork: { type: 'boolean', description: 'attach the network requests this press triggered (url/status/payload) — for client-action→server-error bugs' } }, required: ['ref'] },
+    run: async (state, a) => { const o = {}; if (a.force) o.force = true; if (a.reachableGate) o.reachableGate = true; if (a.captureNetwork) o.captureNetwork = true; return { data: await needCp(state).press(a.ref, o) }; },
   },
   {
     name: 'get',
@@ -213,9 +217,63 @@ export const TOOLS = [
   },
   {
     name: 'logs',
-    description: "Recent console output + uncaught errors captured from the game (all frames): [{level, text, t, stack?}] (level is the console method / 'pageerror'). Use to check whether an action logged/threw an error with no visible UI change. `since` is an index — pass the count you've already seen to get only new lines.",
-    inputSchema: { type: 'object', properties: { since: { type: 'number', description: 'return logs from this index onward (default 0 = all)' } } },
-    run: async (state, a) => ({ data: await needCp(state).logs(a.since || 0) }),
+    description: "Recent console output + uncaught errors captured from the game (all frames): [{level, text, t, stack?}] (level is the console method / 'pageerror'). SERVER-SIDE filtered so a chatty game's output never blows the token budget: `grep` (case-insensitive regex over the text, e.g. '\\\\[StartCommand\\\\]|500'), `level` ('error'|'warn'|'log'|…), `tail` (keep only the last N), `since` (an index — pass the count you've already seen). Combine them (since → level → grep → tail).",
+    inputSchema: { type: 'object', properties: { grep: { type: 'string', description: 'case-insensitive regex over the log text' }, level: { type: 'string', description: "keep only this console level ('error'|'warn'|'log'|'info'|'debug'|'pageerror')" }, tail: { type: 'number', description: 'keep only the last N matching lines' }, since: { type: 'number', description: 'return logs from this index onward (default 0 = all)' } } },
+    run: async (state, a) => ({ data: await needCp(state).logs(a || {}) }),
+  },
+  {
+    name: 'watch',
+    description: "Record a diff-only TIMELINE of game state over time — the state-machine observation primitive (replaces hand-written polling loops). Samples `exprs` (in-page JS expressions read in the game frame, e.g. 'gdp.active') and/or `selectors` (path:Comp.prop, read via get) every `interval` (default '1s'), recording ONLY changed keys with relative timestamps {t, dt} (so you can answer 'hit → bigwin, how many seconds?'). Stops when `until` (an in-page boolean expr, e.g. 'gdp.active===false') is true or `timeout` (default '40s') elapses; after `until` it keeps recording for `settle` (e.g. '2s') to catch the tail. Returns {timeline:[{t, dt, changes}], stoppedBy:'until'|'timeout', elapsed, samples}. Durations accept '1s'/'500ms'/a number(ms). The whole poll loop runs in ONE in-page call.",
+    inputSchema: { type: 'object', properties: { exprs: { type: 'array', items: { type: 'string' }, description: 'in-page JS expressions to sample' }, selectors: { type: 'array', items: { type: 'string' }, description: 'path:Comp.prop selectors to sample via get' }, interval: { type: 'string', description: "sample interval (default '1s')" }, until: { type: 'string', description: 'stop when this in-page boolean expression is true' }, timeout: { type: 'string', description: "hard stop (default '40s')" }, settle: { type: 'string', description: "after `until`, keep recording this long to catch the tail" } } },
+    run: async (state, a) => ({ data: await needCp(state).watch(a) }),
+  },
+  {
+    name: 'patch',
+    description: "Wrap a live component method to verify a fix WITHOUT rebuilding — the 'try the fix on the running game first' primitive. sel = path:Comp.method (e.g. Canvas/Mgr:PanelCtrl.setRoundInfo). `before`/`after`/`replace` are JS FUNCTION-EXPRESSION source strings; copse compiles them, finds the real method, binds `this`, and wraps the hooks in try/catch (a throwing hook can't break the original call), restorably. `before(args, self)` runs first — return an ARRAY to replace the args; `replace(args, self)` runs INSTEAD of the original (its return becomes the result); `after(args, ret, self)` runs last — return non-undefined to replace the result. Example fix-probe: before=\"(a,self)=>{ self.mode = self.off; }\". Returns {ok, method, hooks}. Undo with patch_clear.",
+    inputSchema: { type: 'object', properties: { sel: { type: 'string', description: 'path:Comp.method selector' }, before: { type: 'string', description: 'JS fn-expr (args, self) => …  (return an array to replace args)' }, after: { type: 'string', description: 'JS fn-expr (args, ret, self) => …  (return non-undefined to replace the result)' }, replace: { type: 'string', description: 'JS fn-expr (args, self) => …  runs INSTEAD of the original' } }, required: ['sel'] },
+    run: async (state, a) => ({ data: await needCp(state).patch(a.sel, { before: a.before, after: a.after, replace: a.replace }) }),
+  },
+  {
+    name: 'patch_clear',
+    description: 'Undo `patch`: restore the original method (all patches if no sel). Returns {ok, cleared:[sels], hookErrors?} — hookErrors surfaces any exception your before/after hooks threw while the patch was active (so a silently-swallowed hook bug is still visible).',
+    inputSchema: { type: 'object', properties: { sel: { type: 'string', description: 'the same path:Comp.method you patched (omit to clear all)' } } },
+    run: async (state, a) => ({ data: await needCp(state).patchClear(a.sel) }),
+  },
+  {
+    name: 'framework',
+    description: "Detect the game's app framework and enumerate its state registry: {kind, proxies:[names], mediators:[names], commands:[names], registered}. copse core ships NO framework knowledge — this reports whatever ADAPTER is registered this session (auto-loaded from copse.frameworks.mjs, or added via register_framework / connect({frameworks})). kind:'none' + registered:0 = no adapter installed; kind:'none' + registered>0 = an adapter is loaded but didn't match this build (widen its facade candidates). PureMVC etc. keep LOGIC state OUTSIDE the cc node tree, which get/call can't reach — use pm_state/pm_call for those.",
+    inputSchema: { type: 'object', properties: {} },
+    run: async (state) => ({ data: await needCp(state).framework() }),
+  },
+  {
+    name: 'register_framework',
+    description: "Install a framework adapter for THIS session so framework/pm_state/pm_call can reach app-layer state (core ships none). `adapter` is a CONFIG object {kind, facade:[…locations], proxy:{via?,map?}, mediator:{via?,map?}, command:{map?}} — `facade` lists candidate window paths ('puremvc.Facade.instance', or 'a.b.*' to expand a map), `via` a retrieve method name, `map` registry-map path candidates — OR a code-adapter SOURCE string \"({detect,proxies,mediators,commands,retrieve})\" for a framework the config can't express. De-duped by `kind`. Persist it in copse.frameworks.mjs (auto-loaded on connect); use this to add/adjust one on the fly. Returns {ok, kind, registered}.",
+    inputSchema: { type: 'object', properties: { adapter: { description: 'a config object, or a code-adapter source string' } }, required: ['adapter'] },
+    run: async (state, a) => ({ data: await needCp(state).registerFramework(a.adapter) }),
+  },
+  {
+    name: 'pm_state',
+    description: "Read (or write) a PureMVC proxy/mediator's state — the logic state OUTSIDE the cc node tree that get/call can't reach. sel = 'Name.prop.subprop' (e.g. 'GameDataProxy.active' or 'GameDataProxy.sessionData.remaining'); Name is resolved via retrieveProxy then retrieveMediator. Pass `value` to WRITE the leaf (e.g. set 'GameDataProxy.mode'); omit it to READ. Returns {ok, value} or {ok, wrote}. Run `framework` first to see the names.",
+    inputSchema: { type: 'object', properties: { sel: { type: 'string', description: "'ProxyOrMediatorName.prop.subprop'" }, value: { description: 'when present, WRITE this value to the leaf (any JSON value)' } }, required: ['sel'] },
+    run: async (state, a) => ({ data: await needCp(state).pmState(a.sel, Object.prototype.hasOwnProperty.call(a, 'value'), a.value) }),
+  },
+  {
+    name: 'pm_call',
+    description: "Call a method on a PureMVC proxy/mediator: sel = 'Name.method' (e.g. 'PanelMediator.toggle'), args = the arguments. Drives app-layer logic that isn't a cc component method. Returns {ok, value}.",
+    inputSchema: { type: 'object', properties: { sel: { type: 'string', description: "'ProxyOrMediatorName.method'" }, args: { type: 'array', items: {}, description: 'method arguments' } }, required: ['sel'] },
+    run: async (state, a) => ({ data: await needCp(state).pmCall(a.sel, ...(a.args || [])) }),
+  },
+  {
+    name: 'network',
+    description: "Recent network requests captured from the game (all frames), SERVER-SIDE filtered: [{t, method, url, status, type, payload?}]. Purpose-built for 'client action → server error code' bugs (e.g. a action request that came back 500): press with captureNetwork:true, or call this after an action. Filters: `grep` (regex over url), `status` (e.g. 200 or 'failed'), `type` ('xhr'|'fetch'|…), `tail` (last N), `since` (index). xhr/fetch rows include a truncated request `payload`.",
+    inputSchema: { type: 'object', properties: { grep: { type: 'string', description: 'case-insensitive regex over the request url' }, status: { description: "keep only this HTTP status (a number, or 'failed')" }, type: { type: 'string', description: "keep only this resourceType ('xhr'|'fetch'|'document'|…)" }, tail: { type: 'number', description: 'keep only the last N matching requests' }, since: { type: 'number', description: 'return requests from this index onward' } } },
+    run: async (state, a) => ({ data: await needCp(state).network(a || {}) }),
+  },
+  {
+    name: 'screenshot',
+    description: "Capture the game canvas as a PNG — logic tools are pixel-blind, so this pairs a logic state with what's ACTUALLY on screen (e.g. a button that's 30px off, which no state read can catch). `selector` best-effort clips to a node's screen rect (falls back to the full frame if it can't project). `path` writes the PNG to disk and returns {ok, path}; omit `path` to return the image INLINE (the model sees it). Works in attach mode (your real browser) and the headless GPU launch.",
+    inputSchema: { type: 'object', properties: { selector: { type: 'string', description: 'node ref to clip to (best-effort)' }, path: { type: 'string', description: 'write the PNG here instead of returning it inline' } } },
+    run: async (state, a) => { const r = await needCp(state).screenshot(a); return r && r.base64 ? { image: { data: r.base64, mimeType: r.mimeType } } : { data: r }; },
   },
   {
     name: 'break_at',

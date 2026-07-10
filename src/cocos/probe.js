@@ -14,6 +14,8 @@
 // (reference/cocos/3.8.6): NodeEventProcessor.{capturingTarget,bubblingTarget,shouldHandleEventTouch},
 // CallbacksInvoker._callbackTable → CallbackList.callbackInfos — the primaries in copse's `||` ladders.
 
+import { describe } from './framework.js';
+
 const present = (v) => v !== undefined && v !== null;
 
 // Walk the live scene depth-first, calling fn(node) until it returns true (or the tree is exhausted).
@@ -30,10 +32,18 @@ const walkUntil = (root, fn) => {
 
 /**
  * @param {any} cc
- * @returns {{version:string, classes:Record<string,boolean>, reach:object, events:object, touch:object, ok:boolean}}
+ * @returns {{version:string, classes:Record<string,boolean>, reach:object, events:object, touch:object, framework:object, ok:boolean}}
  */
 export function probe(cc) {
   const version = (cc && cc.ENGINE_VERSION) || '?';
+
+  // (0) app framework — is the game's logic state reachable OUTSIDE the cc tree (PureMVC etc.)?
+  // Uses the adapters registered for THIS session (auto-loaded from copse.frameworks.mjs, or via
+  // registerFramework) — core ships none, so `registered:0` / kind:'none' until one is installed.
+  const framework = (() => {
+    try { const g = (typeof globalThis !== 'undefined') ? globalThis : {}; const store = g.__copseFrameworks || []; return { ...describe(g, store), registered: store.length }; }
+    catch { return { kind: 'unknown' }; }
+  })();
 
   // (1) class globals — a tree-shaken release build drops some `cc.*` globals (`cc.UITransform` was
   // UNDEFINED on a real 3.8.6 preview). getComponent falls back to the registered class-NAME string,
@@ -107,5 +117,5 @@ export function probe(cc) {
     NodeEventType: !!(cc.Node && cc.Node.EventType), // TOUCH_START/END constants emitTouch reads
   };
 
-  return { version, classes, reach, events, touch, ok: true };
+  return { version, classes, reach, events, touch, framework, ok: true };
 }

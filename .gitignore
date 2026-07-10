@@ -9,3 +9,7 @@ harvest*/
 # validate copse's internal-field assumptions + build real-engine test fixtures. Third-party,
 # hundreds of MB each — a local reference, never vendored into copse.
 reference/
+# this machine's framework adapters (PureMVC etc.) — auto-loaded by the driver, injected into the
+# game. Game-/vendor-specific + not every game uses a framework, so it stays LOCAL: core is
+# framework-agnostic. The git-tracked copse.frameworks.example.mjs documents the format.
+copse.frameworks.mjs

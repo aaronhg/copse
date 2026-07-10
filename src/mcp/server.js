@@ -47,6 +47,9 @@ export function createDispatcher(state) {
         try { res = await tool.run(state, args); }
         catch (e) { res = { error: e instanceof Error ? e.message : String(e) }; }
         if (res && res.error) return toolResult(`✗ ${`${res.error}`.replace(/^\s*✗\s*/, '')}`, true);
+        // A tool returning `{ image }` (screenshot) emits an MCP image content block so the model
+        // actually SEES the pixels — the whole point of pairing a logic state with the screen.
+        if (res && res.image) return { result: { content: [{ type: 'image', data: res.image.data, mimeType: res.image.mimeType || 'image/png' }] } };
         return toolResult(JSON.stringify(res.data));
       }
       default:

@@ -246,8 +246,9 @@ export function reachable(root, rt, path) {
   };
 }
 
-// "Canvas/Score:Label.string" → { path, comp, member }
-function splitMember(sel) {
+// "Canvas/Score:Label.string" → { path, comp, member }. Exported so the cocos layer
+// (patch) can address a component method with the same grammar get/call use.
+export function splitMember(sel) {
   const c = String(sel).indexOf(':');
   if (c < 0) throw new Error(`selector needs ":Comp.member" — got "${sel}"`);
   const path = sel.slice(0, c);

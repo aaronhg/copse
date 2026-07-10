@@ -24,7 +24,7 @@ if (cmd === '--version' || cmd === '-V' || rest.includes('--version')) {
 }
 // value-taking flags — so the positional <url> finder below never grabs a flag's value
 // (e.g. `--browser-url http://…` must NOT be read as the game url, or `copse mcp` pre-opens it).
-const VAL_FLAGS = new Set(['--goal', '--stop', '--report', '--rounds', '--model', '--chrome', '--browser-url', '--fps', '--match', '-o', '--output']);
+const VAL_FLAGS = new Set(['--goal', '--stop', '--report', '--rounds', '--model', '--chrome', '--browser-url', '--fps', '--match', '--framework', '-o', '--output']);
 const url = rest.find((a, i) => /^https?:\/\//.test(a) && !VAL_FLAGS.has(rest[i - 1])); // declared AFTER VAL_FLAGS (no TDZ)
 const verbose = has('--verbose', '-v');
 const J = (x) => JSON.stringify(x, null, 2);
@@ -36,6 +36,7 @@ const connectOpts = {
   fpsCap: flag('--fps') ? Number(flag('--fps')) : undefined, // raise from the default 10 to watch smoothly
   attach: has('--attach') || undefined,                     // drive an already-open tab (no navigation)
   match: flag('--match'),                                   // pick that tab by URL substring
+  frameworks: flag('--framework') ? flag('--framework').split(',') : undefined, // extra adapter file(s) on top of copse.frameworks.mjs
 };
 
 const USAGE = `copse — drive & assert a running Cocos game
@@ -65,6 +66,8 @@ const USAGE = `copse — drive & assert a running Cocos game
            --attach [--match <substr>]   drive an ALREADY-OPEN tab in that Chrome without navigating
                          (for Cloudflare/login sites you got past by hand) — needs --browser-url;
                          omit --match (and <url>) to drive the ACTIVE tab (the one you're looking at)
+           --framework <file>[,<file>]   extra framework adapter file(s) (config/code) on top of the
+                         auto-loaded copse.frameworks.mjs — enables framework/pm_state/pm_call
 
 Setup:  npm run build   (produces dist/copse.inject.js)   +   npm i -D puppeteer-core
 The 'ai' command also needs the 'claude' CLI logged in.`;

@@ -21,8 +21,25 @@ function fakeCp() {
     node(ref) { this.calls.push(['node', ref]); return { ok: true, active: true }; },
     diff(a, b) { this.calls.push(['diff', a, b]); return { appeared: [{ ref: 'Canvas/Panel' }], disappeared: [], activated: [], deactivated: [], labelChanged: [] }; },
     listeners(ref) { this.calls.push(['listeners', ref]); return [{ type: 'click', fn: 'onBuy' }]; },
-    probe() { this.calls.push(['probe']); return { version: '3.8.6', ok: true }; },
-    logs(since = 0) { this.calls.push(['logs', since]); return [{ level: 'error', text: 'boom' }, { level: 'log', text: 'ok' }].slice(since); },
+    probe() { this.calls.push(['probe']); return { version: '3.8.6', framework: { kind: 'puremvc' }, ok: true }; },
+    logs(arg = 0) {
+      this.calls.push(['logs', arg]);
+      const o = typeof arg === 'number' ? { since: arg } : (arg || {});
+      let out = [{ level: 'error', text: 'boom 500' }, { level: 'log', text: 'ok' }].slice(o.since || 0);
+      if (o.level) out = out.filter((l) => l.level === o.level);
+      if (o.grep) out = out.filter((l) => new RegExp(o.grep, 'i').test(l.text));
+      if (o.tail) out = out.slice(-o.tail);
+      return out;
+    },
+    network(arg = {}) { this.calls.push(['network', arg]); return [{ t: 1, method: 'POST', url: '/action', status: 200, type: 'xhr' }]; },
+    watch(o) { this.calls.push(['watch', o]); return { timeline: [{ t: 0, dt: 0, changes: { '{gdp.active}': true } }], stoppedBy: 'until', elapsed: 1000, samples: 1 }; },
+    patch(sel, hooks) { this.calls.push(['patch', sel, hooks]); return { ok: true, ref: sel, method: 'setBet', hooks: ['before'] }; },
+    patchClear(sel) { this.calls.push(['patchClear', sel]); return { ok: true, cleared: sel ? [sel] : [] }; },
+    framework() { this.calls.push(['framework']); return { kind: 'puremvc', proxies: ['GameDataProxy'], mediators: ['PanelMediator'], commands: [], registered: 1 }; },
+    registerFramework(a) { this.calls.push(['registerFramework', a]); return { ok: true, kind: a && a.kind || 'framework', registered: 1 }; },
+    pmState(sel, hasValue, value) { this.calls.push(['pmState', sel, hasValue, value]); return hasValue ? { ok: true, ref: sel, wrote: value } : { ok: true, ref: sel, value: true }; },
+    pmCall(sel, ...args) { this.calls.push(['pmCall', sel, args]); return { ok: true, ref: sel, value: 'switched' }; },
+    screenshot(o = {}) { this.calls.push(['screenshot', o]); return o.path ? { ok: true, path: o.path, clipped: false } : { base64: 'AAAA', mimeType: 'image/png', clipped: !!o.selector }; },
     close() { this.closed = true; },
   };
 }
@@ -55,6 +72,7 @@ test('tools registry: each tool has name/description/object inputSchema; core to
   const names = TOOLS.map((t) => t.name);
   for (const n of ['connect', 'reload', 'snapshot', 'interactive', 'click_surface', 'resolve', 'coverage', 'press', 'get', 'call', 'reachable', 'node', 'probe', 'logs', 'close',
     'run_script', 'dump_script',
+    'watch', 'patch', 'patch_clear', 'framework', 'register_framework', 'pm_state', 'pm_call', 'network', 'screenshot',
     'break_at', 'break_in', 'break_exceptions', 'wait_pause', 'eval_frame', 'debug_step', 'clear_breakpoints']) {
     assert.ok(names.includes(n), `missing tool ${n}`);
   }
@@ -126,10 +144,64 @@ test('tools/call dispatches to the Driver and wraps the result as MCP text conte
   assert.deepEqual(cp.calls.at(-1), ['snapshot', { includeInactive: true }]);
   assert.deepEqual(JSON.parse(rv.result.content[0].text), { ref: 'Canvas/Btn', mount: '', dropped: 'home' });
 
-  // logs: since index passes through; result is the captured console/errors (field is `level`)
+  // logs: the whole args object passes through (server-side filter); since slices, field is `level`
   const lg = await handle({ id: 8, method: 'tools/call', params: { name: 'logs', arguments: { since: 1 } } });
-  assert.deepEqual(cp.calls.at(-1), ['logs', 1]);
+  assert.deepEqual(cp.calls.at(-1), ['logs', { since: 1 }]);
   assert.deepEqual(JSON.parse(lg.result.content[0].text), [{ level: 'log', text: 'ok' }]);
+  // logs grep/level filter server-side → only the matching line comes back (never the 65KB)
+  const lgf = await handle({ id: 8.5, method: 'tools/call', params: { name: 'logs', arguments: { grep: '500', level: 'error' } } });
+  assert.deepEqual(JSON.parse(lgf.result.content[0].text), [{ level: 'error', text: 'boom 500' }]);
+});
+
+test('new tools dispatch to the Driver (watch/patch/patch_clear/framework/pm_state/pm_call/network)', async () => {
+  const cp = fakeCp();
+  const handle = createDispatcher({ cp });
+
+  // watch: args pass through; returns a diff-only timeline
+  const w = await handle({ id: 1, method: 'tools/call', params: { name: 'watch', arguments: { exprs: ['gdp.active'], until: 'gdp.active===false', interval: '1s' } } });
+  assert.deepEqual(cp.calls.at(-1), ['watch', { exprs: ['gdp.active'], until: 'gdp.active===false', interval: '1s' }]);
+  assert.equal(JSON.parse(w.result.content[0].text).stoppedBy, 'until');
+
+  // patch: hooks assembled from before/after/replace; patch_clear passes the sel
+  await handle({ id: 2, method: 'tools/call', params: { name: 'patch', arguments: { sel: 'Canvas/Mgr:Ctrl.setBet', before: '(a,self)=>{}' } } });
+  assert.deepEqual(cp.calls.at(-1), ['patch', 'Canvas/Mgr:Ctrl.setBet', { before: '(a,self)=>{}', after: undefined, replace: undefined }]);
+  await handle({ id: 3, method: 'tools/call', params: { name: 'patch_clear', arguments: { sel: 'Canvas/Mgr:Ctrl.setBet' } } });
+  assert.deepEqual(cp.calls.at(-1), ['patchClear', 'Canvas/Mgr:Ctrl.setBet']);
+
+  // framework detection (no args) + register_framework + pm_state read/write + pm_call
+  const fw = await handle({ id: 4, method: 'tools/call', params: { name: 'framework', arguments: {} } });
+  assert.deepEqual(cp.calls.at(-1), ['framework']);
+  assert.equal(JSON.parse(fw.result.content[0].text).kind, 'puremvc');
+  const reg = await handle({ id: 4.5, method: 'tools/call', params: { name: 'register_framework', arguments: { adapter: { kind: 'puremvc', facade: ['x'] } } } });
+  assert.deepEqual(cp.calls.at(-1), ['registerFramework', { kind: 'puremvc', facade: ['x'] }]);
+  assert.equal(JSON.parse(reg.result.content[0].text).ok, true);
+  await handle({ id: 5, method: 'tools/call', params: { name: 'pm_state', arguments: { sel: 'GameDataProxy.active' } } });
+  assert.deepEqual(cp.calls.at(-1), ['pmState', 'GameDataProxy.active', false, undefined]); // no value key → read
+  await handle({ id: 6, method: 'tools/call', params: { name: 'pm_state', arguments: { sel: 'GameDataProxy.mode', value: 'off' } } });
+  assert.deepEqual(cp.calls.at(-1), ['pmState', 'GameDataProxy.mode', true, 'off']); // value key present → write
+  await handle({ id: 7, method: 'tools/call', params: { name: 'pm_call', arguments: { sel: 'PanelMediator.toggle', args: [1] } } });
+  assert.deepEqual(cp.calls.at(-1), ['pmCall', 'PanelMediator.toggle', [1]]);
+
+  // network: filter args pass through
+  const nw = await handle({ id: 8, method: 'tools/call', params: { name: 'network', arguments: { grep: 'action', status: 200 } } });
+  assert.deepEqual(cp.calls.at(-1), ['network', { grep: 'action', status: 200 }]);
+  assert.equal(JSON.parse(nw.result.content[0].text)[0].url, '/action');
+});
+
+test('screenshot returns an MCP image block inline, or a path when written to disk', async () => {
+  const cp = fakeCp();
+  const handle = createDispatcher({ cp });
+
+  // no path → inline image content block (the model sees the pixels)
+  const img = await handle({ id: 1, method: 'tools/call', params: { name: 'screenshot', arguments: {} } });
+  assert.equal(img.result.content[0].type, 'image');
+  assert.equal(img.result.content[0].data, 'AAAA');
+  assert.equal(img.result.content[0].mimeType, 'image/png');
+
+  // path → the tool returns text (the file path), not an image block
+  const toDisk = await handle({ id: 2, method: 'tools/call', params: { name: 'screenshot', arguments: { path: '/tmp/shot.png' } } });
+  assert.equal(toDisk.result.content[0].type, 'text');
+  assert.equal(JSON.parse(toDisk.result.content[0].text).path, '/tmp/shot.png');
 });
 
 test('inspection tools dispatch to the Driver (diff/listeners/probe)', async () => {
