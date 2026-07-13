@@ -63,6 +63,18 @@ tool calls, which use the same named fields.
   the test) or `drove` (asserting a dead button) wins; `"allowErrors": true` also opts
   out of the error gate. Reachability gating stays on the driver's own
   `opts.reachableGate`. An empty `steps` array proves nothing → `pass:false`.
+- **Errors gate — narrowing it without going all-or-nothing.** `allowErrors` is the blunt
+  opt-out; two finer levers (on a step, or on the whole script — a step's own wins) keep a real
+  crash failing while a chatty game's background noise doesn't:
+  - **`ignoreErrors`** — a regex string or array (OR-joined). Errors whose `text` matches are
+    dropped from the *gate* (still kept in `result.errors` for visibility). The exact fix for a
+    flow whose LAST step gets red-flagged by an unrelated `EventSource … MIME type ("text/plain") …
+    Aborting` while its core assertions passed: `"ignoreErrors": ["EventSource", "MIME type"]`.
+  - **`errorGate`** — the source floor. `"all"` (default: any console-error or uncaught throw),
+    `"uncaught"` (only a real throw — a driver `pageerror` — fails; a `console.error` is tolerated),
+    `"off"` (= `allowErrors`). Because the driver already tags each error's `level`
+    (`error` = console.error, `pageerror` = uncaught), `"uncaught"` is a reliable "only a genuine
+    crash fails" mode.
 
 ## Match semantics — subset match, one rule, no DSL
 
@@ -95,6 +107,23 @@ runScript(driver, script) → {
 // per-step `{step, result}` mirrors runHarness's rounds[].steps — same reading habits.
 // a gate failure carries `gate: 'errors' | 'drove'` instead of `mismatch`.
 ```
+
+## Peeking at values on a green run — `capture`
+
+A failing step always carries its full `result` (for debugging). A **passing** step's result is
+governed by `capture`:
+
+- **Read ops auto-capture.** `get` / `pmGet` / `node` / `reachable` / `framework` / `probe` /
+  `orient` / `listeners` / `patchCalls` / `diff` ride their (truncated) value along even on green —
+  the value *is* the point of a read, so a green `pmGet` no longer forces a redundant single-shot
+  `pm_get`/`eval` just to see "active is… what?". Suppress a noisy one with `"capture": false`.
+- **Actuations and big list ops stay silent** (`press` / `call` / `pmCall` / `snapshot` /
+  `interactive` / `watch` / `network` / `logs` / …) — their result is large and usually asserted via
+  `expect`, not eyeballed. Opt a specific one in with `"capture": true` on the step, or set
+  `"capture": true` on the whole script to capture *every* passing step.
+
+Captured results use the SAME truncation as `dump_script`'s `observed` (long arrays → first 12,
+long strings sliced, depth-bounded), so a live-run value and a dumped step read identically.
 
 ## Recording — the MCP session becomes the script
 

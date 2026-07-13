@@ -476,3 +476,82 @@ end. (The Network edge — a passive asset/RPC tap — was split out into the se
 
 (Done since the initial plan: synthetic `TOUCH_*` tap (§9); the CDP Debugger edge (§18); the
 reachability hard-fail gate in the harness. The Network/asset-foraging edge was split into **mast**.)
+
+## 25. Field report — a real-game feature migration (what it drove)
+
+A retrospective, **not** a TODO. copse was used on two production Cocos Creator 3.5.2 games
+(PureMVC-based, driven through a web-mobile mock) to migrate and regression-test a multi-step gameplay
+feature. Recorded here: what was smooth, the pain points real use surfaced, how each was closed, and the
+honest boundaries that remain. Domain/project specifics are kept out — this is about the tool.
+
+**Smooth:** `pm_get/pm_set/pm_call/pm_notify` drive proxy/mediator directly — semantic tests with almost
+no eval; `run_script` (chain + `expect` subset + `changed` appeared/deactivated/labelChanged) reads UI
+side-effects intuitively; `pm_set` with the type-fix + read-back writes booleans/objects directly. Pain
+clustered on **"when you need eval"** and **"session/frame stability."** Each item below: original pain →
+what was closed.
+
+### A — high-leverage (all done)
+
+- **A1 — run_script step value.** READ steps (`get`/`pmGet`/`node`/`reachable`/`framework`/`probe`/
+  `orient`/`listeners`/`patchCalls`/`diff`) now auto-capture their (truncated) value on a green step so
+  you can peek without a re-fetch; actuations/large list ops stay silent unless `capture:true` (per-step
+  or per-script); `capture:false` suppresses. (Before: a green step returned only `{ok,ms}`.)
+- **A2 — errors-gate filtering.** `ignoreErrors` (regex|regex[], OR-joined) drops known background noise
+  (SSE/MIME/aborted) from the pass gate while keeping it in `result.errors`; `errorGate:'uncaught'` fails
+  only on a real throw (a `pageerror`, tolerating `console.error`), `'off'` = allowErrors. Per-step and
+  per-script. (The concrete trigger: a background `EventSource … MIME type … Aborting` on a flow's LAST
+  step flipped an otherwise-green run to `pass:false`; `allowErrors` was too all-or-nothing.)
+- **A3 — frame-detach auto-recovery.** `isDetached()` recognises detached/context-destroyed/target-closed;
+  `reboot()` re-finds the cc frame and re-injects (deduped, re-registering framework adapters); every
+  in-page call auto-reboots + retries once. No manual reconnect after a navigation/reload/long poll.
+
+### B — smoothing "when you need eval"
+
+- **B1 — stable eval `pm.*` helper.** In-page `__copse.pm = {get,set,call,notify,patch}` (aliases of the
+  camelCase members, one implementation) + `pm.proxy(name)`/`pm.mediator(name)` return the RAW live object
+  to poke. NOTE the snake_case *tool* names (`pm_get`) don't exist in-page — eval uses `pm.get`. (Before:
+  `__copse.pm_get(...)` threw in eval, forcing a hand-dug `puremvc.Facade.instance.retrieveProxy(...)`.)
+- **B2 — walk-based node find (PARTIAL).** copse's own `snapshot`/selectors already WALK the live tree
+  (`Parent/Child` relative to the scene root), so copse code never calls the flaky `cc.find(...)` — which
+  covers most of the pain. Still open: a dedicated fuzzy `__copse.find(name)` on the MAIN eval surface —
+  only the `probe` bundle carries a `find(name,{enabled})` today (for the `--until` driver).
+- **B3 — minified-name countermeasure.** Release builds minify class names (a mediator class name → `t`),
+  so `constructor.name` is useless. `framework()` enumerates proxies/mediators/commands by their REGISTRY
+  name (the mediatorMap key is NOT minified) and `pm.mediator(name)`/`pm.proxy(name)` fetch by that name —
+  so address by registry key, never `constructor.name`.
+- **B4 — attach tab selection.** `list_tabs` (pre-attach, no navigation → `[{index,url,title,active}]`);
+  `match` takes a substring, a LIST (ALL ANDed), or `{url,title}` (title matchable) so two builds sharing a
+  url fragment are told apart; >1 match errors with the candidate list (or `pick:<index>`); the `connect`
+  summary echoes `attachedTab`. (Before: several mock tabs shared a url fragment → silent wrong-tab attach,
+  discovered late.)
+
+### C1 — hold / pause a flow
+
+`hold`/`release`/`hold_status`. `hold(sel,{at,pm,holdMs})` arms a ONE-SHOT freeze of the engine loop at a
+trigger (a component method, or a framework command/method with `pm:true`) — `cc.game.pause`→`director.pause`,
+version-adaptive, fail-loud `no-freeze-api`. The last frame stays on the canvas (`screenshot` captures it),
+`get`/`pm_get`/`snapshot` still read while frozen, `release` resumes, `holdMs` auto-releases. Composes in
+`run_script` (`hold`→`screenshot`→`release`). (The need: a self-running ~3s flow blows past a ~1s
+intermediate state too fast to screenshot.) Boundary: freezes everything on the engine loop
+(scheduler/tween/animation/engine callbacks); a bare `setTimeout`-driven state won't freeze, and a frozen
+game can't be driven further until `release`.
+
+### D — a cross-tool caveat (native-verify false positives)
+
+Not copse — **coir**'s `native-verify`. Editor-extension components (e.g. a custom editor-tool extension,
+a localized-text component) aren't loaded by native-verify's instantiate runtime, so they read
+`comp-missing`/`node-missing` even on an untouched shipped prefab; and an all-nested-instance container
+prefab reports ALL its children as node-missing. Easy to misread as "my copied asset is broken." Verify
+with offline `coir verify` (structure) + a build + copse live instead. **Resolved in coir:** native-verify
+now demotes nested-instance / unresolved-(compressed)-component mismatches to WARN (not a `valid` failure)
+with a clear reason, so they no longer read as defects.
+
+### E — not copse's job (recorded so it isn't misattributed)
+
+- A standard mock not embedded in the real container has no `postMessage` source (`window.parent`), so a
+  server-authoritative action never triggers the feature's callback — that end-to-end path can't run in a
+  bare mock, only `pm_call` simulation. → environment/container.
+- A self-driving mode issues a server request the backend rejects → deadlock. Use a self-contained path
+  instead. → backend behavior.
+- The `cc.find` / minified-name root cause is the Cocos engine/build; copse works around it via
+  snapshot/selectors (B2) + registry-name access (B3).

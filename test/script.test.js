@@ -48,7 +48,7 @@ test('subsetMatch: type mismatches fail with a path', () => {
 
 // ---------- runScript ----------
 
-test('a green flow: expects hold, per-step {step, ok, ms}, passing steps omit result', async () => {
+test('a green flow: expects hold, per-step {step, ok, ms}; read ops capture their value, actuations omit it', async () => {
   const d = fakeDriver();
   const r = await runScript(d, {
     name: 'shop-open',
@@ -62,8 +62,31 @@ test('a green flow: expects hold, per-step {step, ok, ms}, passing steps omit re
   assert.equal(r.name, 'shop-open');
   assert.equal(r.failedAt, undefined);
   assert.equal(r.steps.length, 3);
-  for (const s of r.steps) { assert.equal(s.ok, true); assert.equal(typeof s.ms, 'number'); assert.equal(s.result, undefined); }
+  for (const s of r.steps) { assert.equal(s.ok, true); assert.equal(typeof s.ms, 'number'); }
+  const [pr, g, cl] = r.steps;
+  assert.equal(pr.result, undefined);                       // press: actuation → omitted
+  assert.deepEqual(g.result, { ok: true, value: '100' });   // get: read → auto-captured (the whole point of a read)
+  assert.equal(cl.result, undefined);                       // call: actuation → omitted
   assert.deepEqual(d.calls[2], ['call', 'Canvas/Mgr:Shop.buy', [30]]);
+});
+
+test('capture: read ops auto-capture on green; capture:false opts out; an actuation captures only with capture:true', async () => {
+  const d = fakeDriver();
+  const r = await runScript(d, {
+    steps: [
+      { op: 'get', sel: 'x' },                           // read → auto-capture (truncated)
+      { op: 'node', ref: 'Canvas/Panel' },               // read → auto-capture
+      { op: 'get', sel: 'y', capture: false },           // read but opted OUT → omitted
+      { op: 'press', ref: 'Canvas/ShopBtn' },            // actuation → omitted by default
+      { op: 'press', ref: 'Canvas/ShopBtn', capture: true }, // actuation forced → captured
+    ],
+  });
+  assert.equal(r.pass, true);
+  assert.deepEqual(r.steps[0].result, { ok: true, value: '100' });
+  assert.deepEqual(r.steps[1].result, { ok: true, active: true, opacity: 255 });
+  assert.equal(r.steps[2].result, undefined);
+  assert.equal(r.steps[3].result, undefined);
+  assert.equal(r.steps[4].result.ok, true);              // forced capture on a passing actuation
 });
 
 test('a mismatch fails the step with a path, carries the full result, and stops the run', async () => {
@@ -123,6 +146,30 @@ test('errors gate: result.errors fails even a matching expect; allowErrors or an
   assert.equal(allowed.pass, true);
   const asserted = await runScript(d, { steps: [{ op: 'press', ref: 'X', expect: { errors: [{ text: 'TypeError: boom' }] } }] });
   assert.equal(asserted.pass, true);                     // explicitly asserting the error IS the test
+});
+
+test('errors gate: ignoreErrors drops matching background noise (step or script level); a non-matching error still fails', async () => {
+  const sse = { level: 'error', text: 'EventSource\'s response has a MIME type ("text/plain")… Aborting the connection.' };
+  const d = fakeDriver({ press: (ref) => ({ ok: true, ref, fired: 1, drove: ['clickEvent'], errors: [sse] }) });
+  // unfiltered → the background SSE error gates the step
+  assert.equal((await runScript(d, { steps: [{ op: 'press', ref: 'X' }] })).steps[0].gate, 'errors');
+  // step-level pattern → passes (and the error is still on the result for visibility)
+  const stepIg = await runScript(d, { steps: [{ op: 'press', ref: 'X', ignoreErrors: 'EventSource|MIME type' }] });
+  assert.equal(stepIg.pass, true);
+  // script-level pattern (array) → applies to every step
+  assert.equal((await runScript(d, { ignoreErrors: ['EventSource'], steps: [{ op: 'press', ref: 'X' }] })).pass, true);
+  // a real error that does NOT match the filter still fails through the same gate
+  const d2 = fakeDriver({ press: (ref) => ({ ok: true, ref, fired: 1, drove: ['clickEvent'], errors: [{ level: 'pageerror', text: 'TypeError: boom' }] }) });
+  assert.equal((await runScript(d2, { steps: [{ op: 'press', ref: 'X', ignoreErrors: 'EventSource' }] })).steps[0].gate, 'errors');
+});
+
+test("errorGate:'uncaught' tolerates a console.error but still fails on a real throw; 'off' disables the gate", async () => {
+  const consoleErr = { level: 'error', text: '[GameLog] a recoverable warning logged via console.error' };
+  const thrown = { level: 'pageerror', text: 'TypeError: cannot read x of undefined' };
+  const withErrs = (errs) => fakeDriver({ press: (ref) => ({ ok: true, ref, fired: 1, drove: ['clickEvent'], errors: errs }) });
+  assert.equal((await runScript(withErrs([consoleErr]), { steps: [{ op: 'press', ref: 'X', errorGate: 'uncaught' }] })).pass, true);          // console.error tolerated
+  assert.equal((await runScript(withErrs([thrown]), { steps: [{ op: 'press', ref: 'X', errorGate: 'uncaught' }] })).steps[0].gate, 'errors'); // a real throw still fails
+  assert.equal((await runScript(withErrs([thrown]), { steps: [{ op: 'press', ref: 'X', errorGate: 'off' }] })).pass, true);                    // 'off' → nothing gates
 });
 
 test("drove gate: a press that actuated nothing fails; an explicit drove expect overrides", async () => {

@@ -15,8 +15,8 @@
 //   • CODE (an object/source string exposing detect/proxies/mediators/commands/retrieve) — for a
 //     framework the config shape can't express.
 // Pure over a `win` + `adapters` array (globalThis + the registry in-page; plain fakes in tests).
+import { jsonSafe } from './eval-cond.js'; // shared (cycle-safe) — one copy, not a second byte-for-byte one
 
-const jsonSafe = (v) => { try { JSON.stringify(v); return v; } catch { try { return String(v); } catch { return '[unserializable]'; } } };
 // Resolve a dotted path against an object ('a.b.c'); '' → the object itself.
 const getPath = (obj, path) => (path ? String(path).split('.').reduce((o, k) => (o == null ? o : o[k]), obj) : obj);
 // First present, object-valued path among candidates (a registry map like model.proxyMap).
@@ -38,21 +38,45 @@ function* facadeCandidates(win, exprs) {
   }
 }
 
-// A candidate is a valid facade/root if the adapter can retrieve proxies through it (a `via` method
-// exists, or a proxy map resolves) — config-driven, so this never hard-codes a PureMVC method name.
+// A candidate is a valid facade/root if the adapter can reach ANY registry through it — a `via` method
+// or a resolvable map for proxy, mediator, OR command. Anchoring on proxy alone hid a facade whose
+// proxy field didn't match but whose mediator/command did. Config-driven, so no PureMVC name is hard-coded.
+const hasRegistry = (root, spec) => !!spec && ((spec.via && typeof root[spec.via] === 'function') || !!mapObj(root, spec.map));
 const canRoot = (root, cfg) => !!root && typeof root === 'object'
-  && ((cfg.proxy && cfg.proxy.via && typeof root[cfg.proxy.via] === 'function') || !!mapObj(root, cfg.proxy && cfg.proxy.map));
+  && (hasRegistry(root, cfg.proxy) || hasRegistry(root, cfg.mediator) || hasRegistry(root, cfg.command));
+
+const asList = (v, dflt) => (Array.isArray(v) ? v : (v != null ? [v] : dflt));
 
 /**
- * Turn a CONFIG object into the adapter interface (detect/proxies/mediators/commands/retrieve).
+ * Turn a CONFIG object into the adapter interface. `via`/`map` field-name CANDIDATE lists absorb the
+ * per-game/per-port NAME differences; a code adapter (its own detect/retrieve/commandTarget/notify)
+ * covers STRUCTURAL differences the config can't express.
  * @param {any} cfg
  */
 function configAdapter(cfg) {
-  const facExprs = Array.isArray(cfg.facade) ? cfg.facade : (cfg.facade ? [cfg.facade] : []);
+  const facExprs = asList(cfg.facade, []);
   const retrieveVia = (root, name, spec) => {
     if (!spec) return null;
     if (spec.via && typeof root[spec.via] === 'function') { try { const o = root[spec.via](name); if (o) return o; } catch { /* */ } }
     const m = mapObj(root, spec.map); return m ? (m[name] ?? null) : null;
+  };
+  const commandEntry = (root, name) => { const m = mapObj(root, cfg.command && cfg.command.map); return m ? m[name] : undefined; };
+  // A command is TRANSIENT (a fresh instance per notification) → we patch its CLASS prototype, not an
+  // instance. Resolve the class from the commandMap entry (usually the class fn itself), then the execute
+  // method by candidate name. `member` (from the sel) wins if given, else the first execute candidate.
+  const commandTarget = (root, name, member) => {
+    const entry = commandEntry(root, name);
+    const cls = (typeof entry === 'function' && entry.prototype) ? entry : null;   // entry IS the class (standard PureMVC)
+    if (!cls) return null;
+    const proto = cls.prototype;
+    const m = (member && typeof proto[member] === 'function') ? member : asList(cfg.command && cfg.command.execute, ['execute']).find((k) => typeof proto[k] === 'function');
+    return m ? { proto, member: m } : null;
+  };
+  const notify = (root, name, body, type) => {
+    for (const v of asList(cfg.notify && cfg.notify.via, ['sendNotification'])) {
+      if (typeof root[v] === 'function') { try { return { ok: true, via: v, value: jsonSafe(root[v](name, body, type)) }; } catch (e) { return { ok: false, reason: 'threw', error: (e && e.message) || String(e) }; } }
+    }
+    return { ok: false, reason: 'no-notify-method' };
   };
   return {
     kind: cfg.kind || 'framework',
@@ -61,6 +85,17 @@ function configAdapter(cfg) {
     mediators: (root) => Object.keys(mapObj(root, cfg.mediator && cfg.mediator.map) || {}),
     commands: (root) => Object.keys(mapObj(root, cfg.command && cfg.command.map) || {}),
     retrieve: (root, name) => retrieveVia(root, name, cfg.proxy) || retrieveVia(root, name, cfg.mediator),
+    commandTarget, notify,
+    // Self-diagnostic: which capabilities RESOLVE on this build (so pointing copse at a new PureMVC game
+    // shows what to fix in the config, instead of a silent no-op). Mirrors probe()'s per-internal report.
+    capabilities: (root) => {
+      const has = (spec) => !!((spec && spec.via && typeof root[spec.via] === 'function') || mapObj(root, spec && spec.map));
+      const cmap = mapObj(root, cfg.command && cfg.command.map);
+      const first = cmap && Object.values(cmap)[0];
+      const command = !cmap ? 'unresolved' : (first === undefined ? 'empty-map' : ((typeof first === 'function' && first.prototype) ? 'class' : 'map-only'));
+      let notifyVia = false; for (const v of asList(cfg.notify && cfg.notify.via, ['sendNotification'])) if (typeof root[v] === 'function') { notifyVia = v; break; }
+      return { proxy: has(cfg.proxy), mediator: has(cfg.mediator), command, notify: notifyVia };
+    },
   };
 }
 
@@ -109,7 +144,41 @@ export function describe(win, adapters) {
   if (!hit) return { kind: 'none' };
   const { adapter: a, root } = hit;
   const safe = (fn) => { try { return fn() || []; } catch { return []; } };
-  return { kind: a.kind, proxies: safe(() => a.proxies(root)), mediators: safe(() => a.mediators(root)), commands: safe(() => a.commands(root)) };
+  const caps = (() => { try { return a.capabilities ? a.capabilities(root) : undefined; } catch { return undefined; } })();
+  return { kind: a.kind, proxies: safe(() => a.proxies(root)), mediators: safe(() => a.mediators(root)), commands: safe(() => a.commands(root)), ...(caps ? { capabilities: caps } : {}) };
+}
+
+/**
+ * Resolve sel="Name.method" to a PATCHABLE target for pm_patch: a proxy/mediator INSTANCE, or — when the
+ * name is a command (transient per notification) — its CLASS PROTOTYPE, so one wrap covers all instances.
+ * Returns the live target for the in-page patch machinery (never crosses a JSON boundary). Fails LOUD.
+ * @param {any} win @param {any[]} adapters @param {string} sel
+ */
+export function patchTargetWith(win, adapters, sel) {
+  const hit = detectWith(win, adapters);
+  if (!hit) return { ok: false, reason: 'no-framework' };
+  const { name, path } = splitSel(sel);
+  if (path.length !== 1) return { ok: false, reason: 'need-Name.method' };
+  const member = path[0];
+  const obj = (typeof hit.adapter.retrieve === 'function') ? hit.adapter.retrieve(hit.root, name) : null; // guard: command-only adapters omit retrieve
+  if (obj) { if (typeof obj[member] !== 'function') return { ok: false, reason: 'no-method', method: member }; return { ok: true, kind: 'instance', target: obj, member, name }; }
+  const ct = hit.adapter.commandTarget ? hit.adapter.commandTarget(hit.root, name, member) : null;
+  if (ct && typeof ct.proto[ct.member] === 'function') return { ok: true, kind: 'command', target: ct.proto, member: ct.member, name };
+  return { ok: false, reason: 'not-found', name };
+}
+
+/**
+ * Fire a framework notification (PureMVC facade.sendNotification etc.) — the most direct entry into a
+ * notification-driven flow. Uses the adapter's `notify` (config: `via` method-name candidates; code
+ * adapter: its own fn). Fails LOUD when no notify path resolves.
+ * @param {any} win @param {any[]} adapters @param {string} name @param {any} [body] @param {any} [type]
+ */
+export function notifyWith(win, adapters, name, body, type) {
+  const hit = detectWith(win, adapters);
+  if (!hit) return { ok: false, reason: 'no-framework' };
+  if (!hit.adapter.notify) return { ok: false, reason: 'adapter-has-no-notify' };
+  try { return hit.adapter.notify(hit.root, name, body, type); }
+  catch (e) { return { ok: false, reason: 'threw', error: (e && e.message) || String(e) }; }
 }
 
 /**
@@ -119,6 +188,7 @@ export function describe(win, adapters) {
 export function stateWith(win, adapters, sel, hasValue, value) {
   const hit = detectWith(win, adapters);
   if (!hit) return { ok: false, reason: 'no-framework' };
+  if (typeof hit.adapter.retrieve !== 'function') return { ok: false, reason: 'adapter-no-retrieve' };
   const { name, path } = splitSel(sel);
   const obj = hit.adapter.retrieve(hit.root, name);
   if (!obj) return { ok: false, reason: 'not-found', name };
@@ -127,8 +197,32 @@ export function stateWith(win, adapters, sel, hasValue, value) {
   for (let i = 0; i < path.length - 1; i++) cur = cur == null ? cur : cur[path[i]];
   if (cur == null || typeof cur !== 'object') return { ok: false, reason: 'no-path', at: path.slice(0, -1).join('.') };
   const leaf = path[path.length - 1];
-  if (hasValue) { cur[leaf] = value; return { ok: true, ref: sel, wrote: jsonSafe(value) }; }
+  if (hasValue) {
+    // GUARD the assignment (a read-only/getter leaf throws in strict mode) + VERIFY it landed (in sloppy
+    // mode the assignment silently no-ops) — so a fix-probe never reports a write that didn't take effect.
+    const before = (() => { try { return cur[leaf]; } catch { return undefined; } })();
+    try { cur[leaf] = value; } catch (e) { return { ok: false, reason: 'write-failed', error: (e && e.message) || String(e) }; }
+    let after; try { after = cur[leaf]; } catch { after = undefined; }
+    if (after !== value && after === before) return { ok: false, reason: 'write-no-effect', ref: sel, note: 'leaf appears read-only / getter-backed' };
+    // wrote = the intent; if a setter TRANSFORMED it (after !== value, but it DID change), surface the
+    // read-back as `landed` so silent normalisation/coercion is visible. Omitted when it landed exactly.
+    return { ok: true, ref: sel, wrote: jsonSafe(value), ...(after !== value ? { landed: jsonSafe(after) } : {}) };
+  }
   return { ok: true, ref: sel, value: jsonSafe(cur[leaf]) };
+}
+
+/**
+ * Hand back the RAW live proxy/mediator OBJECT by name (the thing `retrieveProxy`/`mediatorMap[...]`
+ * returns), for ad-hoc in-page poking from `eval` — no JSON boundary, so the live object is returned
+ * as-is. Forgiving lookup: the adapter's `retrieve` tries the proxy registry then the mediator one,
+ * so `pm.proxy('GameDataProxy')` and `pm.mediator('XxxViewMediator')` both resolve. null when there's
+ * no framework / no such name. (`pm_get`/`stateWith` are the SELECTOR path; this is the object path.)
+ * @param {any} win @param {any[]} adapters @param {string} name @returns {any|null}
+ */
+export function retrieveWith(win, adapters, name) {
+  const hit = detectWith(win, adapters);
+  if (!hit || typeof hit.adapter.retrieve !== 'function') return null;
+  try { return hit.adapter.retrieve(hit.root, name) || null; } catch { return null; }
 }
 
 /**
@@ -138,6 +232,7 @@ export function stateWith(win, adapters, sel, hasValue, value) {
 export function callWith(win, adapters, sel, args = []) {
   const hit = detectWith(win, adapters);
   if (!hit) return { ok: false, reason: 'no-framework' };
+  if (typeof hit.adapter.retrieve !== 'function') return { ok: false, reason: 'adapter-no-retrieve' };
   const { name, path } = splitSel(sel);
   const obj = hit.adapter.retrieve(hit.root, name);
   if (!obj) return { ok: false, reason: 'not-found', name };

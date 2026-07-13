@@ -16,7 +16,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // ---- framework adapters (SUGGESTIONS #4) ----------------------------------------------------
 // copse core ships NO framework knowledge; the driver auto-loads adapters from copse.frameworks.mjs
 // (this machine's, git-ignored, next to the copse package — "all the games I attach"; then a per-project
-// one in cwd) plus any passed via connect({frameworks}), and injects them so framework/pm_state/pm_call
+// one in cwd) plus any passed via connect({frameworks}), and injects them so framework/pm_get/pm_set/pm_call
 // light up. Later sources override earlier ones by `kind` (the in-page registry de-dupes on kind).
 async function loadModuleAdapters(href) {
   try { const mod = await import(href); const def = mod.default ?? mod.frameworks ?? mod.adapters; return Array.isArray(def) ? def : (def ? [def] : []); }
@@ -26,13 +26,30 @@ async function loadModuleAdapters(href) {
 async function coerceFrameworkItem(it) {
   if (it && typeof it === 'object') return [it];
   if (typeof it === 'string') {
-    if (/\.(mjs|js|json)$/.test(it) && existsSync(it)) {
-      if (it.endsWith('.json')) { try { return [JSON.parse(readFileSync(it, 'utf8'))]; } catch { return []; } }
+    // A .mjs/.js/.json string is a PATH, not code source (a code adapter reads `({…})`). If it looks like a
+    // path, it MUST exist — fail loud on a typo rather than injecting the path as a bogus code-adapter source.
+    if (/\.(mjs|js|json)$/.test(it)) {
+      if (!existsSync(it)) throw new Error(`framework file not found: ${it} (a --framework / connect({frameworks}) path must exist)`);
+      if (it.endsWith('.json')) return [JSON.parse(readFileSync(it, 'utf8'))];
       return await loadModuleAdapters(pathToFileURL(resolvePath(it)).href);
     }
     return [it]; // an in-page code-adapter source string
   }
   return [];
+}
+// A framework adapter crosses into the page via frame.evaluate, which JSON-serializes its argument and
+// DROPS function properties — so a code-adapter written as a natural .mjs OBJECT (detect/retrieve/… fns)
+// would arrive as just {kind} and silently fail to register. Serialize such an object to a SOURCE STRING
+// (functions via .toString()) so it survives; plain config objects (no functions) and existing source
+// strings pass through untouched. Only CLOSURE-FREE adapter fns round-trip — they operate on the passed
+// root, which is the documented shape; a closure-bearing fn would ReferenceError in-page (fail loud).
+function adapterToInjectable(a) {
+  if (typeof a === 'string') return a;
+  if (a && typeof a === 'object' && Object.values(a).some((v) => typeof v === 'function')) {
+    const parts = Object.entries(a).map(([k, v]) => `${JSON.stringify(k)}:${typeof v === 'function' ? v.toString() : JSON.stringify(v)}`);
+    return '({' + parts.join(',') + '})';
+  }
+  return a;
 }
 async function resolveFrameworks(opts) {
   const items = [];
@@ -45,26 +62,24 @@ async function resolveFrameworks(opts) {
   return items;
 }
 
-// Server-side filters for the captured console/network buffers — applied in THIS Node process so a
-// chatty game's 65KB of logs never crosses back to an MCP client's token budget (SUGGESTIONS #2/#7).
-// `arg` is a number (back-compat: an index/`since`) or an options object.
-function filterLogs(buf, arg) {
+// Server-side filter for the captured console/network ring buffers — applied in THIS Node process so a
+// chatty game's 65KB never crosses back to an MCP client's token budget (SUGGESTIONS #2/#7). ONE core
+// (since → optional per-buffer `specific` → grep on a field → tail); `arg` is a number (back-compat:
+// a `since` index) or an options object. filterLogs/filterNet are thin specialisations.
+function filterBuffer(buf, arg, grepField, specific) {
   const o = typeof arg === 'number' ? { since: arg } : (arg || {});
   let out = buf.slice(o.since || 0);
-  if (o.level) { const L = Array.isArray(o.level) ? o.level : [o.level]; out = out.filter((l) => L.includes(l.level)); }
-  if (o.grep) { let re = null; try { re = new RegExp(o.grep, 'i'); } catch { /* literal */ } out = out.filter((l) => (re ? re.test(l.text || '') : (l.text || '').includes(o.grep))); }
+  if (specific) out = specific(out, o);
+  if (o.grep) { let re = null; try { re = new RegExp(o.grep, 'i'); } catch { /* literal */ } out = out.filter((x) => (re ? re.test(x[grepField] || '') : (x[grepField] || '').includes(o.grep))); }
   if (o.tail) out = out.slice(-o.tail);
   return out;
 }
-function filterNet(buf, arg) {
-  const o = typeof arg === 'number' ? { since: arg } : (arg || {});
-  let out = buf.slice(o.since || 0);
+const filterLogs = (buf, arg) => filterBuffer(buf, arg, 'text', (out, o) => (o.level ? out.filter((l) => (Array.isArray(o.level) ? o.level : [o.level]).includes(l.level)) : out));
+const filterNet = (buf, arg) => filterBuffer(buf, arg, 'url', (out, o) => {
   if (o.status != null) { const S = (Array.isArray(o.status) ? o.status : [o.status]).map(String); out = out.filter((r) => S.includes(String(r.status))); }
   if (o.type) { const T = Array.isArray(o.type) ? o.type : [o.type]; out = out.filter((r) => T.includes(r.type)); }
-  if (o.grep) { let re = null; try { re = new RegExp(o.grep, 'i'); } catch { /* literal */ } out = out.filter((r) => (re ? re.test(r.url || '') : (r.url || '').includes(o.grep))); }
-  if (o.tail) out = out.slice(-o.tail);
   return out;
-}
+});
 const DEFAULT_CHROME = process.platform === 'darwin'
   ? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
   : process.platform === 'win32'
@@ -76,10 +91,44 @@ async function loadPuppeteer() {
   catch { throw new Error("copse/driver-puppeteer needs `puppeteer-core` — run: npm i -D puppeteer-core"); }
 }
 
+// ---- attach tab selection (SUGGESTIONS B4) --------------------------------------------------------
+// `match` may be a URL substring, a LIST of substrings (ALL must be present), or {url?,title?} — every
+// condition is ANDed, and title is matchable too, so two builds sharing a url fragment (both carry
+// `e=rd`) are still told apart. Empty (no match/url) → active-tab mode.
+function normMatch(m) {
+  if (!m) return [];
+  if (Array.isArray(m)) return m.filter(Boolean).map((s) => ({ field: 'url', needle: String(s) }));
+  if (typeof m === 'object') { const c = []; if (m.url) c.push({ field: 'url', needle: String(m.url) }); if (m.title) c.push({ field: 'title', needle: String(m.title) }); return c; }
+  return [{ field: 'url', needle: String(m) }];
+}
+const condMatch = (conds, url, title) => conds.every((c) => (c.field === 'title' ? (title || '') : (url || '')).includes(c.needle));
+
+// Enumerate a browser's open tabs → [{index,url,title,active}] (active = visible + focused). No injection,
+// no navigation — safe reconnaissance. `active` is race-bounded so a paused/breakpointed tab can't hang it.
+export async function listTabs(browser) {
+  const pages = await browser.pages();
+  const out = [];
+  for (let i = 0; i < pages.length; i++) {
+    const pg = pages[i]; let t = '', active = false;
+    try { t = await pg.title(); } catch { /* */ }
+    try { active = await Promise.race([pg.evaluate(() => document.visibilityState === 'visible' && document.hasFocus()).then((v) => v, () => false), sleep(600).then(() => false)]); } catch { /* */ }
+    out.push({ index: i, url: pg.url(), title: t, active });
+  }
+  return out;
+}
+// Connect to an existing Chrome JUST to list its tabs, then disconnect — for choosing a `match`/`pick`
+// BEFORE connect (the chrome-devtools-mcp composition: it opens tabs, you pick which to attach).
+export async function browseTabs({ browserURL, browserWSEndpoint } = {}) {
+  if (!browserURL && !browserWSEndpoint) throw new Error('list tabs needs browserURL/browserWSEndpoint — start Chrome with --remote-debugging-port=9222');
+  const puppeteer = await loadPuppeteer();
+  const browser = await puppeteer.connect({ browserURL, browserWSEndpoint, defaultViewport: null });
+  try { return await listTabs(browser); } finally { try { browser.disconnect(); } catch { /* */ } }
+}
+
 /**
  * Launch (or connect to) a browser, load the game, inject copse → a Driver for
  * runHarness. The returned object is the Driver (snapshot/interactive/press/get/call/eval/
- * reachable/node/diff/listeners/probe/logs/watch/patch/patchClear/framework/pmState/pmCall/network/
+ * reachable/node/diff/listeners/probe/logs/watch/patch/patchClear/framework/pmGet/pmSet/pmCall/network/
  * screenshot) plus `page`, `frame` (the frame cc was found in — may be a
  * nested/cross-origin iframe), `browser`, and `close()`.
  * @param {string} url
@@ -115,9 +164,10 @@ export async function connect(url, opts = {}) {
   // 'visible' only for each window's front tab; prefer the focused window when several qualify. Each
   // probe is race-bounded so a tab halted at a breakpoint can't hang the scan — which also means a
   // PAUSED tab reads 'hidden' and won't be picked: attach to a paused game via `match`.
-  let page;
+  let page, attachedTab = null;
   if (opts.attach) {
-    const needle = opts.match || url || '';
+    const conds = normMatch(opts.match || url);   // [] → active-tab mode
+    const shown = JSON.stringify(opts.match || url);
     const probe = (pg, fn, dflt) => Promise.race([pg.evaluate(fn).then((v) => v, () => dflt), sleep(800).then(() => dflt)]);
     const activeTab = async (pages) => {
       const vis = [];
@@ -127,10 +177,24 @@ export async function connect(url, opts = {}) {
     };
     for (let i = 0, n = opts.attachTries ?? 30; i < n && !page; i++) {
       const pages = await browser.pages();
-      page = needle ? (pages.find((pg) => pg.url().includes(needle)) || null) : await activeTab(pages);
+      if (conds.length) {
+        // Collect ALL matches (url + title) — a lone `.find()` silently grabbed the FIRST, so two builds
+        // sharing a url fragment connected to the wrong one, discovered late. >1 match is an ambiguity.
+        const cand = [];
+        for (const pg of pages) { const u = pg.url(); let t = ''; try { t = await pg.title(); } catch { /* */ } if (condMatch(conds, u, t)) cand.push({ pg, url: u, title: t }); }
+        if (cand.length > 1 && opts.pick == null) {
+          throw new Error(`attach: ${cand.length} open tabs match ${shown} — narrow the match (a list ANDs, title matches too) or pass pick:<index>:\n`
+            + cand.map((c, k) => `  [${k}] ${c.title || '(no title)'} — ${c.url}`).join('\n'));
+        }
+        const chosen = cand[opts.pick || 0];
+        if (chosen) { page = chosen.pg; attachedTab = { url: chosen.url, title: chosen.title, index: opts.pick || 0, of: cand.length }; }
+      } else {
+        page = await activeTab(pages);
+        if (page) { let t = ''; try { t = await page.title(); } catch { /* */ } attachedTab = { url: page.url(), title: t, index: 0, of: 1, active: true }; }
+      }
       if (!page) await sleep(1000);
     }
-    if (!page) throw new Error(needle ? `attach: no open tab matching "${needle}" — open the game in that Chrome first` : 'attach: no open tab in that Chrome — open the game first');
+    if (!page) throw new Error(conds.length ? `attach: no open tab matching ${shown} — open the game in that Chrome first (or \`list_tabs\` to see what's open)` : 'attach: no open tab in that Chrome — open the game first');
   } else {
     page = await browser.newPage();
     await page.setViewport(opts.viewport || { width: 414, height: 896, isMobile: true, hasTouch: true, deviceScaleFactor: 2 });
@@ -142,7 +206,10 @@ export async function connect(url, opts = {}) {
   const logs = [];
   // `level` matches the in-page __copse.logs() field name (console method / 'pageerror'),
   // so the Driver/MCP log shape and the console-paste log shape agree.
-  const cap = (level, text, extra) => { logs.push({ level, text, t: Date.now(), ...extra }); if (logs.length > (opts.maxLogs ?? 2000)) logs.shift(); };
+  // logWindows: per-action collectors — a window keeps its OWN rows even after the ring buffer shift()s
+  // its front off (an absolute index into `logs`/`net` slides once >maxLogs/maxNet rows arrive mid-window).
+  const logWindows = new Set();
+  const cap = (level, text, extra) => { const row = { level, text, t: Date.now(), ...extra }; logs.push(row); if (logs.length > (opts.maxLogs ?? 2000)) logs.shift(); for (const w of logWindows) w.push(row); };
   page.on('console', (m) => { try { cap(m.type(), m.text()); } catch {} });
   page.on('pageerror', (e) => cap('pageerror', e.message, { stack: e.stack }));
 
@@ -150,7 +217,8 @@ export async function connect(url, opts = {}) {
   // request that came back 500): cp.network() reads it, or press({captureNetwork:true}) attaches the
   // slice a press triggered. xhr/fetch rows carry a truncated request payload; failures land as status:'failed'.
   const net = [];
-  const capNet = (row) => { net.push(row); if (net.length > (opts.maxNet ?? 500)) net.shift(); };
+  const netWindows = new Set();  // per-action collectors (see logWindows) — survive net.shift() on a chatty window
+  const capNet = (row) => { net.push(row); if (net.length > (opts.maxNet ?? 500)) net.shift(); for (const w of netWindows) w.push(row); };
   page.on('response', (res) => {
     try {
       const req = res.request(); const type = req.resourceType();
@@ -201,7 +269,7 @@ export async function connect(url, opts = {}) {
     await frame.evaluate(() => { if (!window.__copse && window.copse) window.copse.install(window.cc); });
     await frame.waitForFunction(() => !!window.__copse, { timeout: 10000 });
     // register framework adapters (PureMVC etc.) into the fresh __copse before anything reads state
-    for (const a of fwAdapters) { try { await frame.evaluate((x) => { try { window.__copse.registerFramework && window.__copse.registerFramework(x); } catch { /* */ } }, a); } catch { /* */ } }
+    for (const a of fwAdapters) { try { await frame.evaluate((x) => { try { window.__copse.registerFramework && window.__copse.registerFramework(x); } catch { /* */ } }, adapterToInjectable(a)); } catch { /* */ } }
     if (fps != null) await rawEv((f) => { const G = window.cc.game; try { G.frameRate = f; } catch {} try { G.setFrameRate && G.setFrameRate(f); } catch {} }, fps);
     for (let i = 0, n = opts.readyTries ?? 25; i < n; i++) {
       if (await rawEv(() => { try { return window.__copse.interactive().length > 0; } catch { return false; } })) break;
@@ -270,22 +338,23 @@ export async function connect(url, opts = {}) {
   // result — so callers/agents get "what this did" without manual snapshot/diff steps.
   async function mutate(action, captureNetwork) {
     const before = settleCfg ? await snapDiff() : null;
-    const errFrom = logs.length;          // mark the log buffer so we can attribute new errors to THIS action
-    const netFrom = net.length;           // and the network buffer, for captureNetwork
-    const r = await action();
-    await settle();
+    const logWin = []; logWindows.add(logWin);                 // collect THIS action's logs/net directly (not by index)
+    const netWin = captureNetwork ? [] : null; if (netWin) netWindows.add(netWin);
+    let r;
+    try { r = await action(); await settle(); }
+    finally { logWindows.delete(logWin); if (netWin) netWindows.delete(netWin); }
     if (before && r && typeof r === 'object') {
       const c = coreDiff(before, await snapDiff());
       if (c.appeared.length || c.disappeared.length || c.activated.length || c.deactivated.length || c.labelChanged.length) r.changed = c;
     }
     // captureNetwork (SUGGESTIONS #7): attach the requests this action triggered — for the
     // "client action → server error code" case where the client state looks fine but the server rejected it.
-    if (captureNetwork && r && typeof r === 'object') { const reqs = net.slice(netFrom); if (reqs.length) r.network = reqs.map((x) => ({ ...x })); }
+    if (netWin && r && typeof r === 'object' && netWin.length) r.network = netWin.map((x) => ({ ...x }));
     // doesn't-crash signal: any error console / uncaught pageerror during the action+settle window. Catches a
-    // handler that THREW even when the engine swallowed it to console.error — `press` still returns ok:true, but
+    // handler that THREW even when the engine swallowed it to console.error — the action still returns ok:true, but
     // `errors` surfaces it (and the harness hard-fails on it). Captured out-of-band over CDP, so it's reliable.
     if (r && typeof r === 'object') {
-      const errs = logs.slice(errFrom).filter((l) => l.level === 'error' || l.level === 'pageerror');
+      const errs = logWin.filter((l) => l.level === 'error' || l.level === 'pageerror');
       if (errs.length) r.errors = errs.map((l) => ({ level: l.level, text: l.text, ...(l.stack ? { stack: l.stack } : {}) }));
     }
     return r;
@@ -391,31 +460,93 @@ export async function connect(url, opts = {}) {
       } catch (e) { return { ok: false, error: (e && e.message) || String(e) }; }
     }, expr),
     get: (sel) => ev((s) => window.__copse.get(s), sel),
-    reachable: (sel) => ev((s) => window.__copse.reachable(s), sel),
+    // Best-effort reachability. Default: cheap touch z-order → { reachable, blockedBy, visible, occludedBy }.
+    // {visual:true} ALSO runs the pixel pass and returns the full "usable" verdict (reach ∧ what's on screen)
+    // — the old reachable_visual, folded in. `usable` is three-state; pass a `baseline` (from visual_baseline)
+    // to confirm the node's OWN art rather than just "something is drawn".
+    reachable: async (sel, o = {}) => {
+      const r = await ev((s) => window.__copse.reachable(s), sel);
+      if (!o || !o.visual) return r;
+      const v = await cp.visualCheck(sel, o);
+      const usable = r.reachable === false ? false          // a confident block → not usable
+        : r.reachable !== true ? 'unknown'                  // 'unsure' → copse couldn't tell; never a hard false
+          : v.visible === false ? false
+            : v.clear === true ? true
+              : v.clear === false ? false
+                : v.drawn === false ? false
+                  : 'unknown';                              // reachable+visible but no baseline to confirm the art
+      return { ...r, usable, visual: v };
+    },
     node: (sel) => ev((s) => window.__copse.node(s), sel),
     diff: (a, b) => ev(([a, b]) => window.__copse.diff(a, b), [a, b]),
     listeners: (sel) => ev((s) => window.__copse.listeners(s), sel),   // user node.on() handlers (best-effort)
+    // one-call bearings after connect: scene + engine + framework caps + pressable entry points + a hint.
+    orient: async () => {
+      const o = await ev(() => window.__copse.orient());
+      try { o.url = page.url(); } catch { o.url = null; }
+      const fw = o.framework || {};
+      o.hint = (fw.kind === 'none' && !fw.registered)
+        ? 'no framework adapter loaded → app-layer state (pm_*) is unreachable; register_framework / copse.frameworks.mjs if this game uses PureMVC'
+        : (o.entryPoints && o.entryPoints.length ? 'press an entryPoint, or read state with get / pm_get' : 'no reachable buttons yet — snapshot / wait for the scene to settle');
+      return o;
+    },
     probe: () => ev(() => window.__copse.probe()),                     // engine-coupling self-diagnostic (version + per-capability resolution)
     // console + page errors (all frames), server-side filtered (grep/level/tail/since) so a chatty
     // game doesn't blow the caller's token budget; a bare number stays `since`-index for back-compat.
     logs: (arg = 0) => filterLogs(logs, arg),
     network: (arg = {}) => filterNet(net, arg),           // captured requests (url/status/payload), filtered like logs
     // diff-only state timeline over time — one in-page evaluate runs the whole poll loop (SUGGESTIONS #1).
-    watch: (o) => ev((oo) => window.__copse.watch(oo), o ?? {}),
+    // captureNetwork:true attaches the CDP requests fired during the watch window (SUGGESTIONS #7).
+    watch: async (o) => {
+      o = o || {};                                          // guard: a null opts must not reach the in-page destructure
+      const netWin = o.captureNetwork ? [] : null; if (netWin) netWindows.add(netWin);
+      let r;
+      try { r = await ev((oo) => window.__copse.watch(oo), o); }
+      finally { if (netWin) netWindows.delete(netWin); }
+      if (netWin && r && typeof r === 'object' && netWin.length) r.network = netWin.map((x) => ({ ...x }));
+      return r;
+    },
     // wrap/restore a live component method to verify a fix before rebuilding (SUGGESTIONS #3). hooks =
-    // { before?, after?, replace? } as JS function-expression SOURCE strings (compiled in-page).
+    // { before?, after?, replace?, trace? } — before/after/replace are JS fn-expr SOURCE strings (compiled
+    // in-page); trace:true records each call's args/ret/timing, read back via patchCalls.
     patch: (sel, hooks) => ev(([s, h]) => window.__copse.patch(s, h), [sel, hooks ?? {}]),
     patchClear: (sel) => ev((s) => window.__copse.patch_clear(s || undefined), sel ?? null),
+    hold: (sel, opts) => ev(([s, o]) => window.__copse.hold(s, o), [sel, opts ?? {}]),   // freeze the loop at a trigger (SUGGESTIONS C1)
+    release: () => ev(() => window.__copse.release()),
+    holdStatus: () => ev(() => window.__copse.hold_status()),
+    patchCalls: (sel) => ev((s) => window.__copse.patch_calls(s), sel),   // a trace:true patch's recorded calls
+
     // framework-aware state access (PureMVC etc.) — reach logic state OUTSIDE the cc tree (SUGGESTIONS #4).
     framework: () => ev(() => window.__copse.framework()),
-    registerFramework: (a) => ev((x) => window.__copse.registerFramework(x), a),  // add an adapter mid-session
-    pmState: (sel, hasValue, value) => ev(([s, hv, v]) => window.__copse.pmState(s, hv, v), [sel, !!hasValue, value]),
-    pmCall: (sel, ...args) => ev(([s, a]) => window.__copse.pmCall(s, a), [sel, args]),
+    // add an adapter mid-session: ALSO persist it into fwAdapters so the auto-reboot / reload() re-injects it
+    // (otherwise pm_* silently goes dark after a navigation). Serialize object code-adapters so functions survive.
+    registerFramework: (a) => { fwAdapters.push(a); return ev((x) => window.__copse.registerFramework(x), adapterToInjectable(a)); },
+    // pm ACTUATIONS (pmSet / pmCall / pmNotify) run through `mutate` — same as press/call — so they carry
+    // `errors` (a crashing flow → run_script's errors gate fires, not a false green PASS) and `changed`.
+    // pmGet (a READ) and pmPatch (installing a wrapper, like cc `patch`) don't actuate → stay direct.
+    pmGet: (sel) => ev(([s]) => window.__copse.pmGet(s), [sel]),
+    pmSet: (sel, value) => mutate(() => ev(([s, v]) => window.__copse.pmSet(s, v), [sel, value])),
+    pmCall: (sel, ...args) => mutate(() => ev(([s, a]) => window.__copse.pmCall(s, a), [sel, args])),
+    pmPatch: (sel, hooks) => ev(([s, h]) => window.__copse.pmPatch(s, h), [sel, hooks ?? {}]),   // patch a proxy/mediator/command method
+    pmNotify: (name, body, type) => mutate(() => ev(([n, b, t]) => window.__copse.pmNotify(n, b, t), [name, body, type])), // fire a notification
     // on-demand screenshot (SUGGESTIONS #8): pair a logic state with what's on screen. `selector` clips to a
-    // node's screen rect (best-effort — falls back to full frame); `path` writes a PNG, else returns base64.
+    // node's screen rect via the SAME `visualManifest` projection visual_check signs through (one projection,
+    // viewport CSS px, resolution-policy correct) — best-effort, falls back to full frame; `path` writes a PNG.
     screenshot: async (o = {}) => {
       let clip = null;
-      if (o.selector) { try { clip = await ev((s) => (window.__copse.screenRect ? window.__copse.screenRect(s) : null), o.selector); } catch { clip = null; } }
+      if (o.selector) {
+        try {
+          const m = await ev((s) => (window.__copse.visualManifest ? window.__copse.visualManifest(s) : null), o.selector);
+          const r = m && m.rect;
+          if (r) {
+            // the manifest rect is iframe-LOCAL; page.screenshot clips in TOP-page coords — add the cc frame's
+            // offset (visualSig does the same). If the offset is unknown (OOPIF), fall back to full frame rather
+            // than clip the wrong region.
+            const foff = await ccFrameOffset();
+            if (foff) clip = { x: r.x + foff.x, y: r.y + foff.y, width: r.w, height: r.h };
+          }
+        } catch { clip = null; }
+      }
       if (clip && !(clip.width > 0 && clip.height > 0 && clip.x >= 0 && clip.y >= 0)) clip = null;
       const b64 = await page.screenshot({ encoding: 'base64', ...(clip ? { clip } : {}) });
       if (o.path) { writeFileSync(o.path, Buffer.from(b64, 'base64')); return { ok: true, path: o.path, clipped: !!clip }; }
@@ -441,24 +572,17 @@ export async function connect(url, opts = {}) {
       for (const ref of refs) { const { sig } = await visualSig(ref, o); if (sig) out[ref] = Array.from(sig); }
       return out;
     },
-    // reachable (touch z-order) ∧ the pixel pass → "can a player actually SEE and USE it". usable is
-    // three-state: reachable+visible+clear → true; any hard-negative → false; reachable+visible+drawn but no
-    // baseline to confirm the art → 'unknown'. The headline combine — closes reachable's occlusion caveat.
-    reachableVisual: async (ref, o = {}) => {
-      const r = await ev((s) => window.__copse.reachable(s), ref);
-      const v = await cp.visualCheck(ref, o);
-      const usable = r.reachable === false ? false          // a confident block → not usable
-        : r.reachable !== true ? 'unknown'                  // 'unsure' → copse couldn't tell; never fold into a hard false
-          : v.visible === false ? false
-            : v.clear === true ? true
-              : v.clear === false ? false
-                : v.drawn === false ? false
-                  : 'unknown';                              // reachable+visible but no baseline to confirm the art
-      return { ref, usable, reachable: r, visual: v };
-    },
     // attach mode drives the user's own browser → disconnect, don't close it.
     // `paused`: attached while the renderer is HALTED (debugger) → inject deferred until resume.
     // `stalled`: init didn't settle in time (game on a loading/intro screen) → __copse usually already up.
+    // NOTE (contract change): `paused` USED to mean "inject deferred for ANY reason"; it now means the
+    // debugger case ONLY. A consumer that gated on `paused` to wait for the game to be live must now gate on
+    // `!paused && !stalled` (a stalled/loading tab reads paused:false), or it will act on a not-yet-ready tree.
+    // list all open tabs in the attached/launched browser → {index,url,title,active} (SUGGESTIONS B4).
+    // Pre-attach reconnaissance (which of several look-alike tabs to match) and post-attach sanity.
+    tabs: () => listTabs(browser),
+    // which tab attach chose ({url,title,index,of}; null when launched) — surfaced so a wrong pick shows now.
+    attachedTab,
     page, get frame() { return frame; }, browser, ready, paused, stalled,
     close: () => (opts.attach ? browser.disconnect() : browser.close()),
   };

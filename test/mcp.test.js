@@ -3,7 +3,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createDispatcher } from '../src/mcp/server.js';
-import { TOOLS, TOOLS_BY_NAME } from '../src/mcp/tools.js';
+import { TOOLS, TOOLS_BY_NAME, FAMILY, HEADLINE } from '../src/mcp/tools.js';
+import { runScript } from '../src/script.js';
 
 // A fake copse Driver that records calls and returns plausible shapes.
 function fakeCp() {
@@ -17,11 +18,12 @@ function fakeCp() {
     press(ref, o) { this.calls.push(['press', ref, o]); return { ok: true, ref, fired: 1, changed: { appeared: [{ ref: 'Canvas/Panel' }] } }; },
     get(sel) { this.calls.push(['get', sel]); return { ok: true, value: '42' }; },
     call(sel, ...a) { this.calls.push(['call', sel, a]); return { ok: true, value: a[0] }; },
-    reachable(ref) { this.calls.push(['reachable', ref]); return { ok: true, reachable: false, blockedBy: 'Canvas/Mask' }; },
+    reachable(ref, o = {}) { this.calls.push(['reachable', ref, o]); const r = { ok: true, reachable: false, blockedBy: 'Canvas/Mask', visible: true }; return o.visual ? { ...r, usable: false, visual: { drawn: true, clear: 'unknown' } } : r; },
     node(ref) { this.calls.push(['node', ref]); return { ok: true, active: true }; },
     diff(a, b) { this.calls.push(['diff', a, b]); return { appeared: [{ ref: 'Canvas/Panel' }], disappeared: [], activated: [], deactivated: [], labelChanged: [] }; },
     listeners(ref) { this.calls.push(['listeners', ref]); return [{ type: 'click', fn: 'onBuy' }]; },
     probe() { this.calls.push(['probe']); return { version: '3.8.6', framework: { kind: 'puremvc' }, ok: true }; },
+    orient() { this.calls.push(['orient']); return { url: 'http://x/', scene: 'game1', engine: '3.8.6', framework: { kind: 'puremvc', registered: 1, capabilities: { proxy: true } }, buttons: 3, entryPoints: ['Canvas/Btn'], hint: 'press an entryPoint' }; },
     logs(arg = 0) {
       this.calls.push(['logs', arg]);
       const o = typeof arg === 'number' ? { since: arg } : (arg || {});
@@ -33,16 +35,19 @@ function fakeCp() {
     },
     network(arg = {}) { this.calls.push(['network', arg]); return [{ t: 1, method: 'POST', url: '/action', status: 200, type: 'xhr' }]; },
     watch(o) { this.calls.push(['watch', o]); return { timeline: [{ t: 0, dt: 0, changes: { '{gdp.active}': true } }], stoppedBy: 'until', elapsed: 1000, samples: 1 }; },
-    patch(sel, hooks) { this.calls.push(['patch', sel, hooks]); return { ok: true, ref: sel, method: 'setBet', hooks: ['before'] }; },
+    patch(sel, hooks) { this.calls.push(['patch', sel, hooks]); return { ok: true, ref: sel, method: 'setBet', hooks: ['before'], ...(hooks && hooks.trace ? { trace: true } : {}) }; },
     patchClear(sel) { this.calls.push(['patchClear', sel]); return { ok: true, cleared: sel ? [sel] : [] }; },
-    framework() { this.calls.push(['framework']); return { kind: 'puremvc', proxies: ['GameDataProxy'], mediators: ['PanelMediator'], commands: [], registered: 1 }; },
+    patchCalls(sel) { this.calls.push(['patchCalls', sel]); return { ok: true, ref: sel, calls: [{ t: 0, args: [1], ret: 2 }] }; },
+    framework() { this.calls.push(['framework']); return { kind: 'puremvc', proxies: ['GameDataProxy'], mediators: ['PanelMediator'], commands: ['ActionCommand'], registered: 1, capabilities: { proxy: true, mediator: true, command: 'class', notify: 'sendNotification' } }; },
     registerFramework(a) { this.calls.push(['registerFramework', a]); return { ok: true, kind: a && a.kind || 'framework', registered: 1 }; },
-    pmState(sel, hasValue, value) { this.calls.push(['pmState', sel, hasValue, value]); return hasValue ? { ok: true, ref: sel, wrote: value } : { ok: true, ref: sel, value: true }; },
+    pmGet(sel) { this.calls.push(['pmGet', sel]); return { ok: true, ref: sel, value: true }; },
+    pmSet(sel, value) { this.calls.push(['pmSet', sel, value]); return { ok: true, ref: sel, wrote: value }; },
     pmCall(sel, ...args) { this.calls.push(['pmCall', sel, args]); return { ok: true, ref: sel, value: 'switched' }; },
+    pmPatch(sel, hooks) { this.calls.push(['pmPatch', sel, hooks]); return { ok: true, ref: sel, method: sel.split('.').pop(), kind: sel.includes('Command') ? 'command' : 'instance', ...(hooks && hooks.trace ? { trace: true } : {}) }; },
+    pmNotify(name, body, type) { this.calls.push(['pmNotify', name, body, type]); return { ok: true, via: 'sendNotification', value: 'sent:' + name }; },
     screenshot(o = {}) { this.calls.push(['screenshot', o]); return o.path ? { ok: true, path: o.path, clipped: false } : { base64: 'AAAA', mimeType: 'image/png', clipped: !!o.selector }; },
     visualCheck(ref, o) { this.calls.push(['visualCheck', ref, o]); const based = !!(o && o.baseline); return { ref, drawn: true, matches: based ? true : 'unknown', clear: based ? true : 'unknown', via: based ? 'pixel-confirmed' : 'geometric', visible: true }; },
     captureBaseline(o) { this.calls.push(['captureBaseline', o]); return { 'Canvas/Btn': [0, 0, 0] }; },
-    reachableVisual(ref, o) { this.calls.push(['reachableVisual', ref, o]); return { ref, usable: true, reachable: { reachable: true }, visual: { drawn: true } }; },
     close() { this.closed = true; },
   };
 }
@@ -73,10 +78,10 @@ test('tools registry: each tool has name/description/object inputSchema; core to
     assert.equal(typeof t.run, 'function');
   }
   const names = TOOLS.map((t) => t.name);
-  for (const n of ['connect', 'reload', 'snapshot', 'interactive', 'click_surface', 'resolve', 'coverage', 'press', 'get', 'call', 'reachable', 'node', 'probe', 'logs', 'close',
+  for (const n of ['connect', 'reload', 'snapshot', 'interactive', 'click_surface', 'resolve', 'coverage', 'press', 'get', 'call', 'reachable', 'node', 'orient', 'probe', 'logs', 'close',
     'run_script', 'dump_script',
-    'watch', 'patch', 'patch_clear', 'framework', 'register_framework', 'pm_state', 'pm_call', 'network', 'screenshot',
-    'visual_check', 'visual_baseline', 'reachable_visual',
+    'watch', 'patch', 'patch_clear', 'patch_calls', 'framework', 'register_framework', 'pm_get', 'pm_set', 'pm_call', 'pm_patch', 'pm_notify', 'network', 'screenshot',
+    'visual_check', 'visual_baseline',
     'break_at', 'break_in', 'break_exceptions', 'wait_pause', 'eval_frame', 'debug_step', 'clear_breakpoints']) {
     assert.ok(names.includes(n), `missing tool ${n}`);
   }
@@ -100,6 +105,26 @@ test('tools/list returns the registry shape', async () => {
   const names = list.result.tools.map((t) => t.name);
   assert.ok(names.includes('press') && names.includes('snapshot') && names.includes('connect'));
   list.result.tools.forEach((t) => { assert.equal(typeof t.description, 'string'); assert.equal(t.inputSchema.type, 'object'); });
+});
+
+test('every tool has a family; tools/list is family-tagged, grouped, headline-first', async () => {
+  for (const t of TOOLS) assert.ok(FAMILY[t.name], `tool ${t.name} has no family`);
+  // exactly one ★ headline per family
+  const heads = {};
+  for (const t of TOOLS) if (HEADLINE.has(t.name)) heads[FAMILY[t.name]] = (heads[FAMILY[t.name]] || 0) + 1;
+  for (const f of Object.keys(heads)) assert.equal(heads[f], 1, `family ${f} must have exactly one headline`);
+
+  const list = await createDispatcher({ cp: null })({ id: 1, method: 'tools/list' });
+  const tools = list.result.tools;
+  assert.ok(tools.find((t) => t.name === 'snapshot').description.startsWith('[see ★] '), 'snapshot is the see headline');
+  assert.ok(tools.find((t) => t.name === 'interactive').description.startsWith('[see] '), 'interactive is a see member (no ★)');
+  assert.ok(tools.find((t) => t.name === 'orient').description.startsWith('[orient ★] '), 'orient is the orient headline');
+  assert.ok(tools.find((t) => t.name === 'eval').description.startsWith('[escape] '), 'eval is the escape hatch — no ★, its own family');
+  // grouped + ordered: all session tools precede all orient tools; press leads its family
+  const fams = tools.map((t) => FAMILY[t.name]);
+  assert.ok(fams.lastIndexOf('session') < fams.indexOf('orient'), 'families are contiguous & ordered');
+  const drive = tools.filter((t) => FAMILY[t.name] === 'drive');
+  assert.equal(drive[0].name, 'press', 'the ★ headline leads its family');
 });
 
 test('tools/call dispatches to the Driver and wraps the result as MCP text content', async () => {
@@ -157,7 +182,7 @@ test('tools/call dispatches to the Driver and wraps the result as MCP text conte
   assert.deepEqual(JSON.parse(lgf.result.content[0].text), [{ level: 'error', text: 'boom 500' }]);
 });
 
-test('new tools dispatch to the Driver (watch/patch/patch_clear/framework/pm_state/pm_call/network)', async () => {
+test('new tools dispatch to the Driver (watch/patch/patch_clear/framework/pm_get/pm_set/pm_call/network)', async () => {
   const cp = fakeCp();
   const handle = createDispatcher({ cp });
 
@@ -172,17 +197,17 @@ test('new tools dispatch to the Driver (watch/patch/patch_clear/framework/pm_sta
   await handle({ id: 3, method: 'tools/call', params: { name: 'patch_clear', arguments: { sel: 'Canvas/Mgr:Ctrl.setBet' } } });
   assert.deepEqual(cp.calls.at(-1), ['patchClear', 'Canvas/Mgr:Ctrl.setBet']);
 
-  // framework detection (no args) + register_framework + pm_state read/write + pm_call
+  // framework detection (no args) + register_framework + pm_get (read) + pm_set (write) + pm_call
   const fw = await handle({ id: 4, method: 'tools/call', params: { name: 'framework', arguments: {} } });
   assert.deepEqual(cp.calls.at(-1), ['framework']);
   assert.equal(JSON.parse(fw.result.content[0].text).kind, 'puremvc');
   const reg = await handle({ id: 4.5, method: 'tools/call', params: { name: 'register_framework', arguments: { adapter: { kind: 'puremvc', facade: ['x'] } } } });
   assert.deepEqual(cp.calls.at(-1), ['registerFramework', { kind: 'puremvc', facade: ['x'] }]);
   assert.equal(JSON.parse(reg.result.content[0].text).ok, true);
-  await handle({ id: 5, method: 'tools/call', params: { name: 'pm_state', arguments: { sel: 'GameDataProxy.active' } } });
-  assert.deepEqual(cp.calls.at(-1), ['pmState', 'GameDataProxy.active', false, undefined]); // no value key → read
-  await handle({ id: 6, method: 'tools/call', params: { name: 'pm_state', arguments: { sel: 'GameDataProxy.mode', value: 'off' } } });
-  assert.deepEqual(cp.calls.at(-1), ['pmState', 'GameDataProxy.mode', true, 'off']); // value key present → write
+  await handle({ id: 5, method: 'tools/call', params: { name: 'pm_get', arguments: { sel: 'GameDataProxy.active' } } });
+  assert.deepEqual(cp.calls.at(-1), ['pmGet', 'GameDataProxy.active']);
+  await handle({ id: 6, method: 'tools/call', params: { name: 'pm_set', arguments: { sel: 'GameDataProxy.mode', value: 'off' } } });
+  assert.deepEqual(cp.calls.at(-1), ['pmSet', 'GameDataProxy.mode', 'off']);
   await handle({ id: 7, method: 'tools/call', params: { name: 'pm_call', arguments: { sel: 'PanelMediator.toggle', args: [1] } } });
   assert.deepEqual(cp.calls.at(-1), ['pmCall', 'PanelMediator.toggle', [1]]);
 
@@ -190,6 +215,113 @@ test('new tools dispatch to the Driver (watch/patch/patch_clear/framework/pm_sta
   const nw = await handle({ id: 8, method: 'tools/call', params: { name: 'network', arguments: { grep: 'action', status: 200 } } });
   assert.deepEqual(cp.calls.at(-1), ['network', { grep: 'action', status: 200 }]);
   assert.equal(JSON.parse(nw.result.content[0].text)[0].url, '/action');
+});
+
+test('patch trace + patch_calls + watch captureNetwork pass through', async () => {
+  const cp = fakeCp();
+  const handle = createDispatcher({ cp });
+
+  // patch trace:true → hooks carry trace; result echoes trace:true
+  const p = await handle({ id: 1, method: 'tools/call', params: { name: 'patch', arguments: { sel: 'Canvas/Mgr:Ctrl.setBet', trace: true } } });
+  assert.deepEqual(cp.calls.at(-1), ['patch', 'Canvas/Mgr:Ctrl.setBet', { before: undefined, after: undefined, replace: undefined, trace: true }]);
+  assert.equal(JSON.parse(p.result.content[0].text).trace, true);
+
+  // patch_calls reads the recorded calls
+  const pc = await handle({ id: 2, method: 'tools/call', params: { name: 'patch_calls', arguments: { sel: 'Canvas/Mgr:Ctrl.setBet' } } });
+  assert.deepEqual(cp.calls.at(-1), ['patchCalls', 'Canvas/Mgr:Ctrl.setBet']);
+  assert.equal(JSON.parse(pc.result.content[0].text).calls[0].ret, 2);
+
+  // watch captureNetwork flag reaches the driver
+  await handle({ id: 3, method: 'tools/call', params: { name: 'watch', arguments: { exprs: ['x'], captureNetwork: true } } });
+  assert.deepEqual(cp.calls.at(-1), ['watch', { exprs: ['x'], captureNetwork: true }]);
+});
+
+test('pm_patch (proxy/mediator/command) + pm_notify dispatch to the Driver', async () => {
+  const cp = fakeCp();
+  const handle = createDispatcher({ cp });
+
+  // pm_patch a command with trace → hooks carry trace; result echoes kind:'command'
+  const pp = await handle({ id: 1, method: 'tools/call', params: { name: 'pm_patch', arguments: { sel: 'ActionCommand.execute', trace: true } } });
+  assert.deepEqual(cp.calls.at(-1), ['pmPatch', 'ActionCommand.execute', { before: undefined, after: undefined, replace: undefined, trace: true }]);
+  assert.equal(JSON.parse(pp.result.content[0].text).kind, 'command');
+
+  // pm_notify fires the notification (name + body + type)
+  const pn = await handle({ id: 2, method: 'tools/call', params: { name: 'pm_notify', arguments: { name: 'StartFlow', body: { amount: 5 } } } });
+  assert.deepEqual(cp.calls.at(-1), ['pmNotify', 'StartFlow', { amount: 5 }, undefined]);
+  assert.equal(JSON.parse(pn.result.content[0].text).value, 'sent:StartFlow');
+
+  // framework surfaces capabilities so a new build shows what resolved
+  const fw = await handle({ id: 3, method: 'tools/call', params: { name: 'framework', arguments: {} } });
+  assert.equal(JSON.parse(fw.result.content[0].text).capabilities.command, 'class');
+});
+
+test('framework-aware + patch ops record into the session + freeze into replayable steps', async () => {
+  const state = { cp: fakeCp() };
+  const handle = createDispatcher(state);
+  await handle({ id: 1, method: 'tools/call', params: { name: 'pm_set', arguments: { sel: 'GameDataProxy.mode', value: 'off' } } });
+  await handle({ id: 2, method: 'tools/call', params: { name: 'pm_call', arguments: { sel: 'PanelMediator.toggle', args: [1] } } });
+  await handle({ id: 3, method: 'tools/call', params: { name: 'patch', arguments: { sel: 'Canvas/Mgr:Ctrl.setBet', trace: true } } });
+  const r = await handle({ id: 4, method: 'tools/call', params: { name: 'dump_script', arguments: { name: 'pm-flow' } } });
+  const dump = JSON.parse(r.result.content[0].text);
+  assert.deepEqual(dump.steps.map((s) => s.op), ['pmSet', 'pmCall', 'patch']);
+  assert.deepEqual(dump.steps[0], { op: 'pmSet', sel: 'GameDataProxy.mode', value: 'off', observed: { ok: true, ref: 'GameDataProxy.mode', wrote: 'off' } });
+  assert.deepEqual(dump.steps[2].hooks, { trace: true });
+});
+
+test('runScript replays framework-aware + patch ops via the Driver', async () => {
+  const cp = fakeCp();
+  const out = await runScript(cp, { steps: [
+    { op: 'registerFramework', adapter: { kind: 'puremvc' } },
+    { op: 'pmSet', sel: 'GameDataProxy.mode', value: 'off', expect: { wrote: 'off' } },
+    { op: 'pmCall', sel: 'M.go', args: [1], expect: { value: 'switched' } },
+    { op: 'patch', sel: 'Canvas/Mgr:Ctrl.setBet', hooks: { trace: true }, expect: { ok: true } },
+  ] });
+  assert.equal(out.pass, true);
+  assert.deepEqual(cp.calls.map((c) => c[0]), ['registerFramework', 'pmSet', 'pmCall', 'patch']);
+});
+
+test('runScript pmGet/pmSet are unambiguous; a legacy pmState step still routes to the split', async () => {
+  const cp = fakeCp();
+  const out = await runScript(cp, { continueOnFail: true, steps: [
+    { op: 'pmSet', sel: 'GameDataProxy.mode', value: 'off', expect: { wrote: 'off' } },
+    { op: 'pmGet', sel: 'GameDataProxy.active', expect: { value: true } },
+    { op: 'pmState', sel: 'X.y', value: 'Z', expect: { wrote: 'Z' } },   // legacy write (value present) → pmSet
+    { op: 'pmState', sel: 'X.z', expect: { value: true } },              // legacy read (no value) → pmGet
+  ] });
+  assert.equal(out.pass, true);
+  assert.deepEqual(cp.calls[0], ['pmSet', 'GameDataProxy.mode', 'off']);
+  assert.deepEqual(cp.calls[1], ['pmGet', 'GameDataProxy.active']);
+  assert.deepEqual(cp.calls[2], ['pmSet', 'X.y', 'Z']);   // legacy pmState + value → pmSet
+  assert.deepEqual(cp.calls[3], ['pmGet', 'X.z']);        // legacy pmState no value → pmGet
+});
+
+test('runScript capture: a read op auto-captures its value on green; capture:false opts out', async () => {
+  const cp = fakeCp();
+  const out = await runScript(cp, { steps: [
+    { op: 'get', sel: 'x' },                  // read op → auto-captures (value is the point)
+    { op: 'get', sel: 'y', capture: false },  // explicit opt-out → result omitted
+  ] });
+  assert.equal(out.pass, true);
+  assert.deepEqual(out.steps[0].result, { ok: true, value: '42' });
+  assert.equal(out.steps[1].result, undefined);
+  // script-level capture → every passing step carries it
+  const all = await runScript(cp, { capture: true, steps: [{ op: 'get', sel: 'x' }] });
+  assert.deepEqual(all.steps[0].result, { ok: true, value: '42' });
+});
+
+test('runScript is a BATCH over the full surface — "call + pm_call then watch" in one call', async () => {
+  const cp = fakeCp();
+  const out = await runScript(cp, { steps: [
+    { op: 'call', sel: 'Canvas/Mgr:PanelCtrl.trigger' },
+    { op: 'pmCall', sel: 'PanelMediator.toggle', args: [1] },
+    { op: 'watch', opts: { exprs: ['gdp.active'], until: 'gdp.active===false' }, expect: { stoppedBy: 'until' } },
+    { op: 'network', opts: { grep: 'action' } },
+    { op: 'reachable', ref: 'Canvas/Btn', opts: { visual: true }, expect: { usable: false } }, // the folded-in visual combine, as a step
+  ] });
+  assert.equal(out.pass, true);
+  assert.deepEqual(cp.calls.map((c) => c[0]), ['call', 'pmCall', 'watch', 'network', 'reachable']);
+  assert.deepEqual(cp.calls.find((c) => c[0] === 'watch')[1], { exprs: ['gdp.active'], until: 'gdp.active===false' }); // opts reach the driver
+  assert.deepEqual(cp.calls.find((c) => c[0] === 'reachable'), ['reachable', 'Canvas/Btn', { visual: true }]);
 });
 
 test('screenshot returns an MCP image block inline, or a path when written to disk', async () => {
@@ -221,9 +353,13 @@ test('inspection tools dispatch to the Driver (diff/listeners/probe)', async () 
   const p = await handle({ id: 3, method: 'tools/call', params: { name: 'probe', arguments: {} } });
   assert.deepEqual(cp.calls.at(-1), ['probe']);
   assert.equal(JSON.parse(p.result.content[0].text).version, '3.8.6');
+  const o = await handle({ id: 4, method: 'tools/call', params: { name: 'orient', arguments: {} } });
+  assert.deepEqual(cp.calls.at(-1), ['orient']);
+  const oj = JSON.parse(o.result.content[0].text);
+  assert.equal(oj.scene, 'game1'); assert.deepEqual(oj.entryPoints, ['Canvas/Btn']); assert.equal(oj.framework.kind, 'puremvc');
 });
 
-test('visual tools dispatch to the Driver (visual_check/visual_baseline/reachable_visual)', async () => {
+test('visual tools dispatch to the Driver (visual_check/visual_baseline); reachable(visual) combines', async () => {
   const cp = fakeCp();
   const handle = createDispatcher({ cp });
 
@@ -247,10 +383,14 @@ test('visual tools dispatch to the Driver (visual_check/visual_baseline/reachabl
   await handle({ id: 4, method: 'tools/call', params: { name: 'visual_baseline', arguments: { refs: ['A'] } } });
   assert.deepEqual(cp.calls.at(-1), ['captureBaseline', { refs: ['A'] }]);
 
-  // reachable_visual: the combine → usable
-  const rv = await handle({ id: 5, method: 'tools/call', params: { name: 'reachable_visual', arguments: { ref: 'Canvas/Btn' } } });
-  assert.deepEqual(cp.calls.at(-1), ['reachableVisual', 'Canvas/Btn', {}]);
-  assert.equal(JSON.parse(rv.result.content[0].text).usable, true);
+  // reachable(visual:true) is the folded-in combine → carries `usable` + a `visual` block; plain reachable doesn't
+  const rv = await handle({ id: 5, method: 'tools/call', params: { name: 'reachable', arguments: { ref: 'Canvas/Btn', visual: true } } });
+  assert.deepEqual(cp.calls.at(-1), ['reachable', 'Canvas/Btn', { visual: true }]);
+  const rvj = JSON.parse(rv.result.content[0].text);
+  assert.equal(rvj.usable, false); assert.ok(rvj.visual, 'carries the visual block');
+  const plain = await handle({ id: 6, method: 'tools/call', params: { name: 'reachable', arguments: { ref: 'Canvas/Btn' } } });
+  assert.deepEqual(cp.calls.at(-1), ['reachable', 'Canvas/Btn', {}]);
+  assert.equal(JSON.parse(plain.result.content[0].text).usable, undefined); // no visual → no usable
 });
 
 test('tools/list hides debug tools by default; --debug (state.debug) surfaces them; hidden ≠ disabled', async () => {

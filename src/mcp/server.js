@@ -7,7 +7,7 @@
 // to stderr; stdout is reserved for the JSON-RPC stream.
 import readline from 'node:readline';
 import { readFileSync } from 'node:fs';
-import { TOOLS, TOOLS_BY_NAME } from './tools.js';
+import { TOOLS, TOOLS_BY_NAME, FAMILY, FAMILY_ORDER, HEADLINE, familyTag } from './tools.js';
 
 const VERSION = (() => { try { return JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8')).version; } catch { return '?'; } })();
 const PROTOCOL_VERSION = '2025-06-18';
@@ -37,7 +37,11 @@ export function createDispatcher(state) {
         // `copse mcp --debug` (state.debug). They stay dispatchable by name in tools/call below —
         // hiding them just keeps the default menu focused on the testing primitives.
         const advertised = state.debug ? TOOLS : TOOLS.filter((t) => !t.debug);
-        return { result: { tools: advertised.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })) } };
+        // Group by family and put each family's ★ headline first, then prefix each description with its
+        // family tag — a guided map over the flat list (signposting; see FAMILY in tools.js). Stable within a family.
+        const rank = (t) => FAMILY_ORDER.indexOf(FAMILY[t.name]) * 10 + (HEADLINE.has(t.name) ? 0 : 1);
+        const sorted = advertised.slice().sort((a, b) => rank(a) - rank(b));
+        return { result: { tools: sorted.map((t) => ({ name: t.name, description: familyTag(t.name) + t.description, inputSchema: t.inputSchema })) } };
       }
       case 'tools/call': {
         const { name, arguments: args = {} } = msg.params || {};

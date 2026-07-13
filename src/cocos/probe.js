@@ -32,16 +32,18 @@ const walkUntil = (root, fn) => {
 
 /**
  * @param {any} cc
+ * @param {any} [win] the install target the framework registry lives on (install passes its `target`);
+ *                    defaults to globalThis. Must match install's target, or the framework read misdiagnoses.
  * @returns {{version:string, classes:Record<string,boolean>, reach:object, events:object, touch:object, framework:object, ok:boolean}}
  */
-export function probe(cc) {
+export function probe(cc, win = (typeof globalThis !== 'undefined' ? globalThis : {})) {
   const version = (cc && cc.ENGINE_VERSION) || '?';
 
   // (0) app framework — is the game's logic state reachable OUTSIDE the cc tree (PureMVC etc.)?
-  // Uses the adapters registered for THIS session (auto-loaded from copse.frameworks.mjs, or via
-  // registerFramework) — core ships none, so `registered:0` / kind:'none' until one is installed.
+  // Reads the registry off the SAME target install stored it on (win) — not always globalThis (an
+  // embedding/test may install into a non-global surface). Adapters come from copse.frameworks.mjs / registerFramework.
   const framework = (() => {
-    try { const g = (typeof globalThis !== 'undefined') ? globalThis : {}; const store = g.__copseFrameworks || []; return { ...describe(g, store), registered: store.length }; }
+    try { const store = (win && win.__copseFrameworks) || []; return { ...describe(win, store), registered: store.length }; }
     catch { return { kind: 'unknown' }; }
   })();
 

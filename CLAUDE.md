@@ -160,13 +160,16 @@ Layout (grouped by concern; `src/index.js` is the public barrel):
   MCP tools so ANY MCP client (Claude Code / browser-use / Stagehand / a plain tool-use loop) drives
   the canvas. `server.js` = hand-rolled JSON-RPC-over-stdio (mirrors coir's `mcp/server.js`: stderr-only
   logging, serialized handler, `createDispatcher(state)` exported for tests; gates debug-tagged tools
-  out of `tools/list` when `state.debug` is falsy); `tools.js` = the tool registry — 32 testing primitives
-  (`connect`/`reload`/`snapshot`/`interactive`/`click_surface`/`resolve`/`coverage`/`press`/`get`/`call`/`eval`/`reachable`/`node`/`diff`/
-  `listeners`/`probe`/`logs`/`watch`/`patch`/`patch_clear`/`framework`/`register_framework`/`pm_state`/`pm_call`/`network`/`screenshot`/`visual_check`/`visual_baseline`/`reachable_visual`/`run_script`/`dump_script`/`close`)
+  out of `tools/list` when `state.debug` is falsy, and GROUPS the advertised list by `FAMILY` with one ★
+  `HEADLINE` per family — each description prefixed `[family ★]`/`[family]` so the flat surface reads as a
+  guided map (signposting, not gating; families: session/see/read/drive/usable/observe/fix/coverage/script/orient/escape,
+  `eval` alone in `escape` — the raw hatch, no ★); `tools.js` = the tool registry — 40 testing primitives
+  (`connect`/`list_tabs`/`reload`/`snapshot`/`interactive`/`click_surface`/`resolve`/`coverage`/`press`/`get`/`call`/`eval`/`reachable`/`node`/`diff`/
+  `listeners`/`orient`/`probe`/`logs`/`watch`/`hold`/`release`/`hold_status`/`patch`/`patch_clear`/`patch_calls`/`framework`/`register_framework`/`pm_get`/`pm_set`/`pm_call`/`pm_patch`/`pm_notify`/`network`/`screenshot`/`visual_check`/`visual_baseline`/`run_script`/`dump_script`/`close`)
   + 7 `debug:true`-tagged Debugger tools (`break_*`/`wait_pause`/
-  `eval_frame`/`debug_step`/`clear_breakpoints`), **all advertised by default** (chrome-devtools-mcp has no
-  Debugger domain, so the breakpoint surface is copse-unique; `copse mcp --no-debug` hides the debug 7
-  against protected/anti-debug games) — over a live
+  `eval_frame`/`debug_step`/`clear_breakpoints`, family `debug`), **hidden from `tools/list` by default**
+  (dev-build-only — pausing the runtime is intrusive; `copse mcp --debug` surfaces them, still callable by
+  name regardless) — over a live
   `connect()` session (the MCP tool names match the library 1:1, incl. `connect`). `record:true`-tagged
   tools (press/get/call/node/reachable/eval/snapshot/interactive) are wrapped at the bottom of tools.js to
   push `{…step, observed}` onto `state.history` on success — `dump_script` exports that recording as a
@@ -231,24 +234,34 @@ __copse.node('Canvas/Panel')                      // node intrinsics → { activ
 __copse.get('Canvas/Panel:Node.active')           // read a single node intrinsic via the `Node` pseudo-component
 __copse.diff(before, after)                       // → { appeared, disappeared, activated, deactivated (node descriptors w/ label/click), labelChanged }
 __copse.listeners('Canvas/ShopBtn')               // user node.on() handlers (engine-internal + Button's own filtered out)
+__copse.orient()                                  // one-call bearings → { scene, engine, framework:{kind,registered,capabilities}, buttons, entryPoints[] } (driver adds url + a next-step hint)
 __copse.probe()                                   // engine-coupling self-diagnostic → { version, classes, reach, events, touch, framework } — which version-sensitive internals resolve on THIS build (drift → visible, not a silent 'unsure')
 
 __copse.logs(sinceTs?)                            // captured console.* + uncaught errors → [{level,text,t,stack?}] (started on inject load)
 __copse.watch({exprs?,selectors?,interval?,until?,timeout?,settle?})  // diff-only state TIMELINE over time → { timeline:[{t,dt,changes}], stoppedBy } (one in-page loop; replaces hand-written polling)
-__copse.patch('Canvas/Mgr:Ctrl.setBet', {before?,after?,replace?})   // wrap a live method (JS fn-expr src) to verify a fix pre-rebuild → { ok, method, hooks }; __copse.patch_clear(sel?) restores
+__copse.patch('Canvas/Mgr:Ctrl.setBet', {before?,after?,replace?,trace?})  // wrap a live method (JS fn-expr src) to verify a fix pre-rebuild; trace:true records calls → { ok, method, hooks }; patch_clear(sel?) restores, patch_calls(sel) reads trace
+__copse.hold('PanelMediator.toggle', {at?,pmMode?,holdMs?})  // arm a ONE-SHOT freeze of the engine loop at a trigger → the transient state is held (screenshot/inspect), then release(); { ok, armed } or { ok:false, reason:'no-freeze-api' }. hold_status() → { armed, held, sel, via, sinceMs }; release() resumes
 __copse.registerFramework(adapterOrSrc)           // install a framework adapter for this session → { ok, kind, registered }  (core ships NONE)
-__copse.framework()                               // detect via REGISTERED adapters + enumerate → { kind, proxies, mediators, commands, registered }  (logic state OUTSIDE the cc tree)
-__copse.pmState('GameDataProxy.active' [,true,value])  // read/write a proxy/mediator prop (get/call can't reach these) → { ok, value|wrote }
+__copse.framework()                               // detect via REGISTERED adapters + enumerate → { kind, proxies, mediators, commands, registered, capabilities:{proxy,mediator,command,notify} }  (capabilities = what resolved on THIS build)
+__copse.pmGet('GameDataProxy.active')         // READ a proxy/mediator prop (get can't reach these) → { ok, value }
+__copse.pmSet('GameDataProxy.mode', v)     // WRITE a proxy/mediator leaf (verified; write=actuation) → { ok, wrote[, landed if a setter transformed it] }
 __copse.pmCall('PanelMediator.toggle', args)  // call a proxy/mediator method → { ok, value }
+__copse.pmPatch('StartCommand.execute', {trace?})  // patch a proxy/mediator INSTANCE or a command CLASS prototype (patch_clear/patch_calls apply) → { ok, method, kind:'instance'|'command' }
+__copse.pmNotify('StartFlow', body?, type?)   // fire a framework notification — the direct flow entry → { ok, via, value }
+__copse.pm.get(sel) / pm.set(sel,v) / pm.call(sel,...args) / pm.notify(name,body?,type?) / pm.patch(sel,hooks)  // `pm.*` = a stable, eval-ergonomic namespace over the camelCase members above (the snake_case TOOL names like `pm_get` DON'T exist in-page → `__copse.pm_get` throws). pm.proxy('GameDataProxy') / pm.mediator('XxxViewMediator') hand back the RAW live object to poke.
 ```
 **Framework-aware access is a PLUGIN, not core knowledge** (`src/cocos/framework.js` is a generic adapter
 engine — no PureMVC baked in; not every game has a framework and those that do wire it differently). The
 driver auto-loads adapters from `copse.frameworks.mjs` (this machine's, next to the package, **git-ignored**;
 then a per-project one in cwd) + `connect({frameworks})` / `--framework <file>` / the `register_framework`
-tool, and injects them so `framework`/`pm_state`/`pm_call` light up. An adapter is a CONFIG object
-(`{kind, facade:[…locations], proxy:{via?,map?}, mediator, command}` — field-name candidates absorb per-game
-differences) or a code-adapter source string. `probe.framework.registered` says how many are loaded. See
-`copse.frameworks.example.mjs`.
+tool, and injects them so `framework`/`pm_state`/`pm_call`/`pm_patch`/`pm_notify` light up. An adapter is a
+CONFIG object (`{kind, facade:[…locations], proxy:{via?,map?}, mediator, command:{map?,execute?}, notify:{via?}}`
+— field-name CANDIDATE lists absorb per-game NAME differences) or a code-adapter source string (its own
+`detect`/`retrieve`/`commandTarget`/`notify` for STRUCTURAL quirks the config can't express). `pm_patch` wraps a
+proxy/mediator INSTANCE or a command CLASS prototype (transient commands); `pm_notify` fires a notification (the
+direct flow entry). Per-game variance is handled purely in `copse.frameworks.mjs` — core stays zero-assumption,
+fails LOUD when a target can't resolve, and `framework().capabilities` reports what resolved on THIS build (like
+`probe` for engine internals). See `copse.frameworks.example.mjs`.
 
 (The driver adds two Node-side surfaces that don't need `cc`: `cp.network({grep,status,type,tail,since})`
 — CDP-captured requests for "client action → server error code" bugs, also attachable via `press({captureNetwork:true})`;
@@ -356,7 +369,10 @@ Remaining:
    debug tools advertised by default
    (`--no-debug` hides them — flipped once chrome-devtools-mcp made the Debugger surface the copse-unique part);
    ✅ active-tab attach (no `match` needed) + the shared-Chrome composition with `chrome-devtools-mcp`
-   documented as the recommended shape (`docs/MCP.md`).
+   documented as the recommended shape (`docs/MCP.md`); ✅ **tab disambiguation** — `list_tabs` + multi-condition
+   `match` (list ANDs, title too) + ambiguity error / `pick` + `attachedTab` in the connect summary (no more
+   silent wrong-tab attach); ✅ **`hold`/`release`** — freeze the engine loop at a trigger to screenshot/inspect
+   a transient state (the ~1s intermediate window a self-running flow blows past).
    Remaining: multi-session, a browser-use custom-actions example.
 5. ~~**Adaptive re-planning within a round**~~ — DEPRIORITIZED: that's "make the harness's agent
    smarter", and interactive/adaptive exploration is Claude Code over MCP's lane now (the harness's

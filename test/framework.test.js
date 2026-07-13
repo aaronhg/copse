@@ -3,7 +3,7 @@
 // plus a code-adapter string. Pure over win + adapters: no browser, no cc.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { normalizeAdapter, registerInto, detectWith, describe, stateWith, callWith } from '../src/cocos/framework.js';
+import { normalizeAdapter, registerInto, detectWith, describe, stateWith, callWith, patchTargetWith, notifyWith, retrieveWith } from '../src/cocos/framework.js';
 
 // The PureMVC config adapter (the shape shipped as copse.frameworks.example.mjs).
 const PUREMVC = {
@@ -11,7 +11,8 @@ const PUREMVC = {
   facade: ['puremvc.Facade.instance', 'puremvc.Facade.instanceMap.*', 'facade'],
   proxy: { via: 'retrieveProxy', map: ['model.proxyMap', 'model._proxyMap'] },
   mediator: { via: 'retrieveMediator', map: ['view.mediatorMap'] },
-  command: { map: ['controller.commandMap'] },
+  command: { map: ['controller.commandMap'], execute: ['execute'] },
+  notify: { via: ['sendNotification', 'notify'] },
 };
 
 function fakeFacade() {
@@ -19,14 +20,19 @@ function fakeFacade() {
   const med = { toggle(n) { return 'switched:' + n; } };
   const proxyMap = { GameDataProxy: gdp };
   const mediatorMap = { PanelMediator: med };
+  class StartupCommand { execute() { return 'started'; } }
+  class ActionCommand { execute() { return 'spun'; } }        // transient per notification → patched at the class prototype
+  const commandMap = { StartupCommand, ActionCommand };         // keys are the notification names too
+  const notes = [];
   const facade = {
-    model: { proxyMap }, view: { mediatorMap }, controller: { commandMap: { StartupCommand: 1, ActionCommand: 1 } },
+    model: { proxyMap }, view: { mediatorMap }, controller: { commandMap },
     retrieveProxy(n) { return proxyMap[n] || null; },
     retrieveMediator(n) { return mediatorMap[n] || null; },
+    sendNotification(name, body, type) { notes.push({ name, body, type }); return 'sent:' + name; },
   };
-  return { facade, gdp };
+  return { facade, gdp, notes, ActionCommand };
 }
-const singletonWin = () => { const { facade, gdp } = fakeFacade(); return { win: { puremvc: { Facade: { instance: facade } } }, gdp }; };
+const singletonWin = () => { const f = fakeFacade(); return { win: { puremvc: { Facade: { instance: f.facade } } }, ...f }; };
 
 const store = (...adapters) => { const s = []; for (const a of adapters) registerInto(s, a); return s; };
 
@@ -77,6 +83,15 @@ test('stateWith fails loud: no framework / unknown name / non-object path', () =
   assert.equal(stateWith(singletonWin().win, s, 'GameDataProxy.active.deeper').ok, false); // boolean isn't an object
 });
 
+test('retrieveWith hands back the RAW proxy/mediator object (the pm.proxy/pm.mediator path); null when absent', () => {
+  const s = store(PUREMVC);
+  const { win, gdp } = singletonWin();
+  assert.equal(retrieveWith(win, s, 'GameDataProxy'), gdp);                 // the live object, not a JSON copy
+  assert.ok(retrieveWith(win, s, 'PanelMediator'));                  // forgiving: resolves a mediator too
+  assert.equal(retrieveWith(win, s, 'NopeProxy'), null);                    // unknown name → null
+  assert.equal(retrieveWith({}, s, 'GameDataProxy'), null);                 // no framework → null
+});
+
 test('callWith invokes a mediator method and a proxy method', () => {
   const s = store(PUREMVC);
   const { win, gdp } = singletonWin();
@@ -103,6 +118,89 @@ test('registerInto de-dupes by kind (re-register replaces); junk is rejected', (
   assert.equal(s.length, 2);
   assert.deepEqual(registerInto(s, { nonsense: true }), { ok: false, reason: 'bad-adapter' });
   assert.equal(s.length, 2);
+});
+
+test('describe reports capabilities — which of proxy/mediator/command/notify resolved on this build', () => {
+  const caps = describe(singletonWin().win, store(PUREMVC)).capabilities;
+  assert.deepEqual(caps, { proxy: true, mediator: true, command: 'class', notify: 'sendNotification' });
+  // a build whose commandMap holds non-class entries reports command:'map-only' (→ needs a code adapter)
+  const win2 = { puremvc: { Facade: { instance: { model: { proxyMap: {} }, view: { mediatorMap: {} }, controller: { commandMap: { X: 1 } }, retrieveProxy: () => null, retrieveMediator: () => null } } } };
+  assert.equal(describe(win2, store(PUREMVC)).capabilities.command, 'map-only');
+  assert.equal(describe(win2, store(PUREMVC)).capabilities.notify, false); // no sendNotification on that facade
+});
+
+test('patchTargetWith resolves a proxy/mediator INSTANCE and a command CLASS PROTOTYPE', () => {
+  const s = store(PUREMVC);
+  const { win, gdp, ActionCommand } = singletonWin();
+  const inst = patchTargetWith(win, s, 'GameDataProxy.setBet');
+  assert.equal(inst.ok, true); assert.equal(inst.kind, 'instance'); assert.equal(inst.member, 'setBet'); assert.equal(inst.target, gdp);
+  const cmd = patchTargetWith(win, s, 'ActionCommand.execute');
+  assert.equal(cmd.ok, true); assert.equal(cmd.kind, 'command'); assert.equal(cmd.member, 'execute'); assert.equal(cmd.target, ActionCommand.prototype);
+  // fail loud
+  assert.deepEqual(patchTargetWith({}, s, 'X.y'), { ok: false, reason: 'no-framework' });
+  assert.deepEqual(patchTargetWith(win, s, 'GameDataProxy.nope'), { ok: false, reason: 'no-method', method: 'nope' });
+  assert.deepEqual(patchTargetWith(win, s, 'Nope.execute'), { ok: false, reason: 'not-found', name: 'Nope' });
+});
+
+test('notifyWith fires the facade notification via a config `via` candidate', () => {
+  const s = store(PUREMVC);
+  const { win, notes } = singletonWin();
+  assert.deepEqual(notifyWith(win, s, 'StartFlow', { amount: 5 }), { ok: true, via: 'sendNotification', value: 'sent:StartFlow' });
+  assert.deepEqual(notes[0], { name: 'StartFlow', body: { amount: 5 }, type: undefined });
+  assert.deepEqual(notifyWith({}, s, 'X'), { ok: false, reason: 'no-framework' });
+});
+
+test('a code adapter supplies its OWN commandTarget/notify for structural quirks', () => {
+  // a game whose commandMap holds {ctor} wrappers + dispatches via a custom method — config can't express it.
+  const CODE = "({ kind:'q', detect:(w)=> w.app || null, proxies:()=>[], mediators:()=>[], commands:(r)=>Object.keys(r.cmds), "
+    + "retrieve:()=>null, commandTarget:(r,name,member)=>{ const c=r.cmds[name]; return c && { proto:c.ctor.prototype, member: member||'run' }; }, "
+    + "notify:(r,name,body)=>({ ok:true, via:'dispatch', value: r.dispatch(name, body) }) })";
+  class Boot { run() { return 'ran'; } }
+  const fired = [];
+  const win = { app: { cmds: { Boot: { ctor: Boot } }, dispatch: (n, b) => { fired.push([n, b]); return 'ok'; } } };
+  const s = store(CODE);
+  const ct = patchTargetWith(win, s, 'Boot.run');
+  assert.equal(ct.ok, true); assert.equal(ct.kind, 'command'); assert.equal(ct.target, Boot.prototype);
+  assert.deepEqual(notifyWith(win, s, 'Go', 1), { ok: true, via: 'dispatch', value: 'ok' });
+  assert.deepEqual(fired, [['Go', 1]]);
+});
+
+test('stateWith surfaces `landed` when a setter TRANSFORMS the value; omits it when it lands exactly', () => {
+  const gdp = { plain: 1 };
+  Object.defineProperty(gdp, 'amount', { get() { return this._b; }, set(v) { this._b = String(v); }, enumerable: true }); // normalising setter
+  const win = { puremvc: { Facade: { instance: { model: { proxyMap: { P: gdp } }, retrieveProxy(n) { return this.model.proxyMap[n]; } } } } };
+  const s = store({ kind: 'pm', facade: ['puremvc.Facade.instance'], proxy: { via: 'retrieveProxy' } });
+  assert.deepEqual(stateWith(win, s, 'P.amount', true, 5), { ok: true, ref: 'P.amount', wrote: 5, landed: '5' }); // wrote number, landed string
+  assert.deepEqual(stateWith(win, s, 'P.plain', true, 2), { ok: true, ref: 'P.plain', wrote: 2 });          // landed exactly → no `landed`
+});
+
+test('a facade with ONLY a mediator registry (no proxy match) is still detected', () => {
+  // canRoot used to anchor on proxy alone → a mediator/command-only facade read as frameworkless.
+  const win = { puremvc: { Facade: { instance: { view: { mediatorMap: { M: { go() { return 'g'; } } } } } } } };
+  const s = store({ kind: 'pm', facade: ['puremvc.Facade.instance'], mediator: { map: ['view.mediatorMap'] } });
+  assert.equal(describe(win, s).kind, 'pm');
+  assert.deepEqual(describe(win, s).mediators, ['M']);
+  assert.deepEqual(callWith(win, s, 'M.go'), { ok: true, ref: 'M.go', value: 'g' });
+});
+
+test('stateWith write is VERIFIED: a no-op (read-only) write fails loud, not a false ok', () => {
+  // a Proxy whose set trap silently ignores 'frozen' (the sloppy-mode no-op the fix guards against)
+  const proxy = new Proxy({ real: 1 }, { set(t, k, v) { if (k === 'frozen') return true; t[k] = v; return true; }, get(t, k) { return t[k]; } });
+  const win = { puremvc: { Facade: { instance: { model: { proxyMap: { P: proxy } }, retrieveProxy(n) { return this.model.proxyMap[n]; } } } } };
+  const s = store({ kind: 'pm', facade: ['puremvc.Facade.instance'], proxy: { via: 'retrieveProxy' } });
+  const bad = stateWith(win, s, 'P.frozen', true, 9);
+  assert.equal(bad.ok, false); assert.equal(bad.reason, 'write-no-effect');
+  const good = stateWith(win, s, 'P.real', true, 2);
+  assert.deepEqual(good, { ok: true, ref: 'P.real', wrote: 2 });
+});
+
+test('a code adapter missing `retrieve` fails loud (adapter-no-retrieve), not a raw TypeError', () => {
+  const CODE = "({ kind:'noret', detect:(w)=> w.x || null, proxies:()=>[], mediators:()=>[], commands:()=>[] })";
+  const s = store(CODE);
+  assert.deepEqual(stateWith({ x: {} }, s, 'A.b'), { ok: false, reason: 'adapter-no-retrieve' });
+  assert.deepEqual(callWith({ x: {} }, s, 'A.b'), { ok: false, reason: 'adapter-no-retrieve' });
+  // patchTargetWith degrades to not-found (a command-only adapter may omit retrieve legitimately)
+  assert.deepEqual(patchTargetWith({ x: {} }, s, 'A.b'), { ok: false, reason: 'not-found', name: 'A' });
 });
 
 test('detectWith honors registration order: first matching adapter wins', () => {

@@ -66,7 +66,7 @@ const USAGE = `copse — drive & assert a running Cocos game
                          (for your game behind a login/staging gate you opened yourself) — needs --browser-url;
                          omit --match (and <url>) to drive the ACTIVE tab (the one you're looking at)
            --framework <file>[,<file>]   extra framework adapter file(s) (config/code) on top of the
-                         auto-loaded copse.frameworks.mjs — enables framework/pm_state/pm_call
+                         auto-loaded copse.frameworks.mjs — enables framework/pm_get/pm_set/pm_call
 
 Setup:  npm run build   (produces dist/copse.inject.js)   +   npm i -D puppeteer-core
 The 'ai' command also needs the 'claude' CLI logged in.`;

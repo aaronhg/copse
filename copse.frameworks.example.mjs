@@ -29,11 +29,19 @@ export default [
     // (`map`). copse tries `via` first, then the map. List the field variants your build uses.
     proxy: { via: 'retrieveProxy', map: ['model.proxyMap', 'model._proxyMap', '_model.proxyMap', 'm_model.proxyMap'] },
     mediator: { via: 'retrieveMediator', map: ['view.mediatorMap', 'view._mediatorMap', '_view.mediatorMap', 'm_view.mediatorMap'] },
-    command: { map: ['controller.commandMap', 'controller._commandMap', '_controller.commandMap'] },
+    // command: for pm_patch of a COMMAND (transient → its class prototype is patched). `map` locates the
+    // name→class registry; `execute` names the method to wrap. `map` keys are the notification names too.
+    command: { map: ['controller.commandMap', 'controller._commandMap', '_controller.commandMap'], execute: ['execute'] },
+    // notify: how pm_notify FIRES a notification — the facade method name candidates. If your game dispatches
+    // notifications a non-standard way, use a code adapter's own notify(root,name,body,type) instead.
+    notify: { via: ['sendNotification', 'notify'] },
   },
 
   // CODE adapter (advanced) — a source string eval'd IN-PAGE to an object with the same interface, for a
-  // custom framework the config can't describe. `detect(win)` returns the root (or null); the rest read it.
+  // custom framework the config can't describe. `detect(win)` returns the root; the rest read it. STRUCTURAL
+  // quirks (commandMap holds a factory not a class, a custom dispatch) go here via commandTarget / notify:
   // "({ kind:'mystore', detect: (w) => w.myApp?.store ?? null, proxies:(r)=>Object.keys(r.modules), " +
-  // "mediators:()=>[], commands:()=>[], retrieve:(r,name)=>r.modules[name] ?? null })",
+  // "mediators:()=>[], commands:()=>Object.keys(r.cmds), retrieve:(r,name)=>r.modules[name] ?? null, " +
+  // "commandTarget:(r,name,member)=>{ const c=r.cmds[name]; return c && { proto:c.prototype, member: member||'run' }; }, " +
+  // "notify:(r,name,body)=>({ ok:true, value: r.dispatch(name, body) }) })",
 ];

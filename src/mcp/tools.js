@@ -13,12 +13,44 @@
 // aren't blocked.
 
 import { resolveCoirPath, coverageJoin } from '../coverage.js';
-import { runScript } from '../script.js';
+import { runScript, truncate } from '../script.js';
 
 const needCp = (state) => {
   if (!state.cp) throw new Error('no open game — call the `connect` tool with a url first');
   return state.cp;
 };
+
+// A schema `type` for a slot that carries ANY JSON value. A TYPELESS slot lets the client coerce a
+// scalar to a STRING as it crosses to the tool (a boolean `true` arrived as "true", a number 30 as "30")
+// — the explicit union tells the client to send the real JSON type. Used for pm_set's value, method
+// args, and notification bodies. (Nested-in-an-object args — e.g. run_script's opaque `script` — dodge this,
+// which is why the same write worked there; declaring the type fixes the direct path too.)
+const JSON_VALUE = ['string', 'number', 'boolean', 'object', 'array', 'null'];
+
+// ---- family taxonomy: signposting, NOT gating -------------------------------------------------
+// Every tool belongs to one FAMILY (a task you'd want to do); one tool per family is the ★ HEADLINE
+// ("reach for this first; the rest of the family are variants / lower-level"). server.js prefixes each
+// advertised description with `[family ★]` / `[family]` and groups tools/list by family, so an agent
+// scanning the surface gets a guided map instead of a flat 34-tool list. NOTHING is hidden (the debug
+// family is gated separately by `--debug`) — this only labels + orders.
+export const FAMILY_ORDER = ['session', 'see', 'read', 'drive', 'usable', 'observe', 'fix', 'coverage', 'script', 'orient', 'escape', 'debug'];
+export const FAMILY = {
+  connect: 'session', list_tabs: 'session', reload: 'session', close: 'session',
+  snapshot: 'see', interactive: 'see', diff: 'see', listeners: 'see',
+  get: 'read', node: 'read', pm_get: 'read',
+  press: 'drive', call: 'drive', pm_set: 'drive', pm_call: 'drive', pm_notify: 'drive',
+  reachable: 'usable', visual_check: 'usable', visual_baseline: 'usable',
+  watch: 'observe', logs: 'observe', network: 'observe', screenshot: 'observe', hold: 'observe', release: 'observe', hold_status: 'observe',
+  patch: 'fix', patch_clear: 'fix', patch_calls: 'fix', pm_patch: 'fix',
+  coverage: 'coverage', click_surface: 'coverage', resolve: 'coverage',
+  run_script: 'script', dump_script: 'script',
+  orient: 'orient', probe: 'orient', framework: 'orient', register_framework: 'orient',
+  eval: 'escape', // its own family: the raw escape hatch, NOT a peer of press/call — no ★ (never reach for it first)
+  break_at: 'debug', break_in: 'debug', break_exceptions: 'debug', wait_pause: 'debug', eval_frame: 'debug', debug_step: 'debug', clear_breakpoints: 'debug',
+};
+// one ★ headline per family (the go-to); the `escape` family deliberately has NONE (eval is a last resort).
+export const HEADLINE = new Set(['connect', 'snapshot', 'get', 'press', 'reachable', 'watch', 'patch', 'coverage', 'run_script', 'orient', 'break_in']);
+export const familyTag = (name) => { const f = FAMILY[name]; return f ? `[${f}${HEADLINE.has(name) ? ' ★' : ''}] ` : ''; };
 
 // ---- session recording (docs/SCRIPTS.md) ----------------------------------------------
 // Tools tagged `record: true` push a script step + `observed` onto state.history after each
@@ -37,8 +69,19 @@ const toStep = (name, a = {}) => {
     case 'get': return { op: 'get', sel: a.sel };
     case 'call': return { op: 'call', sel: a.sel, ...(a.args && a.args.length ? { args: a.args } : {}) };
     case 'node': return { op: 'node', ref: a.ref };
-    case 'reachable': return { op: 'reachable', ref: a.ref };
+    case 'reachable': return { op: 'reachable', ref: a.ref, ...((a.visual || a.baseline) ? { opts: { ...(a.visual ? { visual: true } : {}), ...(a.baseline ? { baseline: a.baseline } : {}) } } : {}) };
     case 'eval': return { op: 'eval', expr: a.expr };
+    // framework-aware + patch ops freeze into replayable steps so a PureMVC flow (register → read/write
+    // proxy state → call a mediator → patch a method) can be dumped and re-run by script.js/run_script.
+    case 'pm_get': return { op: 'pmGet', sel: a.sel };
+    case 'pm_set': return { op: 'pmSet', sel: a.sel, value: a.value };
+    case 'pm_call': return { op: 'pmCall', sel: a.sel, ...(a.args && a.args.length ? { args: a.args } : {}) };
+    case 'pm_patch': { const h = {}; for (const k of ['before', 'after', 'replace', 'trace']) if (a[k] !== undefined) h[k] = a[k]; return { op: 'pmPatch', sel: a.sel, ...(Object.keys(h).length ? { hooks: h } : {}) }; }
+    case 'pm_notify': return { op: 'pmNotify', name: a.name, ...(a.body !== undefined ? { body: a.body } : {}), ...(a.type !== undefined ? { type: a.type } : {}) };
+    case 'framework': return { op: 'framework' };
+    case 'register_framework': return { op: 'registerFramework', adapter: a.adapter };
+    case 'patch': { const h = {}; for (const k of ['before', 'after', 'replace', 'trace']) if (a[k] !== undefined) h[k] = a[k]; return { op: 'patch', sel: a.sel, ...(Object.keys(h).length ? { hooks: h } : {}) }; }
+    case 'patch_clear': return { op: 'patchClear', ...(a.sel ? { sel: a.sel } : {}) };
     case 'snapshot': {
       const o = {}; for (const k of ['relevant', 'includeInactive', 'components']) if (a[k] !== undefined) o[k] = a[k];
       return { op: 'snapshot', ...(Object.keys(o).length ? { opts: o } : {}) };
@@ -48,21 +91,8 @@ const toStep = (name, a = {}) => {
   }
 };
 
-// Cap `observed` so a whole-scene snapshot doesn't bloat the recording: long arrays keep the
-// first 12 elements (+ a marker), long strings are sliced, depth is bounded. Structure is
-// preserved — the agent trims observed into a minimal `expect` at dump time.
-const truncate = (v, depth = 0) => {
-  if (v === null || typeof v !== 'object') return typeof v === 'string' && v.length > 500 ? v.slice(0, 500) + '…' : v;
-  if (depth >= 6) return '…(deep)';
-  if (Array.isArray(v)) {
-    const head = v.slice(0, 12).map((x) => truncate(x, depth + 1));
-    if (v.length > 12) head.push(`…(+${v.length - 12} more)`);
-    return head;
-  }
-  const o = {};
-  for (const k of Object.keys(v)) o[k] = truncate(v[k], depth + 1);
-  return o;
-};
+// `truncate` (shared with script.js — it caps a captured/observed result so a whole-scene snapshot
+// doesn't bloat the recording) is imported above; dump's `observed` and run_script's `capture` use one copy.
 
 // Lazily attach the CDP Debugger over the live session (state.dbg). Tests can pre-seed state.dbg.
 const ensureDbg = async (state) => {
@@ -87,8 +117,9 @@ export const TOOLS = [
         fps: { type: 'number', description: 'frame-rate cap (default 10; raise to watch smoothly)' },
         browserURL: { type: 'string', description: 'CDP URL of an existing Chrome (e.g. http://127.0.0.1:9222) — required for attach' },
         attach: { type: 'boolean', description: 'drive an already-open tab (no navigation) instead of opening a new one' },
-        match: { type: 'string', description: 'when attach:true, pick the open tab whose URL contains this substring (omit match AND url to attach the ACTIVE tab)' },
-        frameworks: { type: 'array', items: {}, description: 'extra framework adapters (config objects / code-adapter source strings / file paths) on top of the auto-loaded copse.frameworks.mjs — enables framework/pm_state/pm_call' },
+        match: { description: 'when attach:true, pick the open tab to drive: a URL substring, a LIST of substrings (ALL must be present — ANDed, to tell apart two builds sharing a fragment), or {url?,title?} (title is matchable too). >1 tab matches → an error listing them (use `list_tabs` first, or `pick`). Omit match AND url → the ACTIVE tab.' },
+        pick: { type: 'number', description: 'when several tabs match, attach to this index (from the ambiguity list / list_tabs) instead of erroring' },
+        frameworks: { type: 'array', items: {}, description: 'extra framework adapters (config objects / code-adapter source strings / file paths) on top of the auto-loaded copse.frameworks.mjs — enables framework/pm_get/pm_set/pm_call' },
       },
     },
     run: async (state, a) => {
@@ -99,7 +130,7 @@ export const TOOLS = [
       if (a.headed) opts.headless = false;
       if (typeof a.fps === 'number') opts.fpsCap = a.fps;
       if (a.browserURL) opts.browserURL = a.browserURL;
-      if (a.attach) { opts.attach = true; opts.match = a.match || a.url; }
+      if (a.attach) { opts.attach = true; opts.match = a.match || a.url; if (a.pick != null) opts.pick = a.pick; }
       if (a.frameworks) opts.frameworks = a.frameworks;
       const target = a.url || opts.match || '';
       state.cp = await connect(target, opts);
@@ -114,8 +145,14 @@ export const TOOLS = [
       if (state.cp.stalled) return { data: { ok: true, url: at(), attached: true, injecting: true, note: 'inject still settling — the game looks like it is on a loading/intro screen (no interactive buttons yet). __copse is likely already installed: call snapshot/interactive again in a moment, or reload.' } };
       const snap = await state.cp.snapshot({ relevant: true });
       const inter = await state.cp.interactive();
-      return { data: { ok: true, url: at(), attached: !!opts.attach, relevantNodes: snap.length, buttons: inter.length } };
+      return { data: { ok: true, url: at(), attached: !!opts.attach, ...(state.cp.attachedTab ? { attachedTab: state.cp.attachedTab } : {}), relevantNodes: snap.length, buttons: inter.length } };
     },
+  },
+  {
+    name: 'list_tabs',
+    description: "List the open tabs in a running Chrome (started with --remote-debugging-port) WITHOUT attaching — [{index,url,title,active}]. Use it BEFORE connect to see which tab to attach when several look alike (e.g. two game builds sharing a url fragment): read the titles, then connect with attach:true + a fuller `match` (a list ANDs; title matches too) or `pick:<index>`. No session needed — it connects, lists, disconnects. `active` = visible + focused.",
+    inputSchema: { type: 'object', properties: { browserURL: { type: 'string', description: 'CDP URL of the Chrome to inspect (e.g. http://127.0.0.1:9222)' } }, required: ['browserURL'] },
+    run: async (state, a) => { const { browseTabs } = await import('../drivers/puppeteer.js'); return { data: { tabs: await browseTabs({ browserURL: a.browserURL }) } }; },
   },
   {
     name: 'reload',
@@ -139,7 +176,7 @@ export const TOOLS = [
   },
   {
     name: 'click_surface',
-    description: "Join-ready RUNTIME click surface for cross-referencing with coir (copse's static sibling). One row per editor-wired clickEvent: [{ref, method, component?, target?, interactable, reachable?(true|false|'unsure'), blockedBy?, occludedBy?, visible?}]. `method` (the serialized handler name) joins 1:1 to coir's static ClickEvent map — coir's `loc.nodePath` + the method inside its `click → method()` edge — so you can compare what's WIRED (coir, every scene/prefab) against what's LIVE & pressable now (copse, this scene). Buttons wired via raw touch/code (outside coir's static surface) get method:null — and carry `codeHandlers` (their live node.on() listeners) when present, so coverageJoin can call them `codeRegistered` (has a code handler) vs bare `codeOnly` (none) rather than one opaque bucket. `component` is minified on release builds — coir holds the real handler-class name. Set reachability:false to skip the O(buttons×nodes) reachable pass.",
+    description: "Join-ready RUNTIME click surface (the copse side of the coir cross-reference): one row per editor-wired clickEvent [{ref, method, component?, interactable, reachable?(true|false|'unsure'), blockedBy?, visible?}]. `method` joins 1:1 to coir's static ClickEvent map, so you can compare what's WIRED (coir, every scene) against what's LIVE & pressable now (copse). Touch-/code-wired buttons get method:null (+ `codeHandlers` when present, so the join can tell codeRegistered from codeOnly). reachability:false skips the O(buttons×nodes) reachable pass.",
     inputSchema: { type: 'object', properties: { reachability: { type: 'boolean', description: 'include reachable/blockedBy/visible (default true)' }, includeInactive: { type: 'boolean', description: 'also walk hidden subtrees' } } },
     run: async (state, a) => ({ data: await needCp(state).clickSurface({ reachability: a.reachability, includeInactive: a.includeInactive }) }),
   },
@@ -151,14 +188,14 @@ export const TOOLS = [
   },
   {
     name: 'coverage',
-    description: "THE coir×copse coverage join, as one call — cross-reference coir's STATIC ClickEvent map against copse's LIVE click surface and bucket every wired button. Pass coir's static rows as `staticRows` ([{nodePath, method, component?}], from coir's `click → method()` edges); copse runs clickSurface() on the connected scene and joins on (nodePath, method) with a symmetric tail match (absorbs coir's scene/prefab-file root + a prefab mount). Returns {covered, blocked, uncertain, unreached, ambiguous, codeRegistered, codeOnly}: covered = wired+live+reachable&interactable (press & assert a state delta); blocked = wired+live but reachable:false/disabled; uncertain = reachable:'unsure'/occluded (verify, NOT a confident pass); unreached = coir-only, not live in this scene (navigate there, re-snapshot); ambiguous = can't attribute 1:1 — `reason:'fan-out'` (one static row tail-matched >1 live button) or `reason:'fan-in'` (one live button claimed by >1 static row, e.g. same-named across scenes), resolve by hand, never silently double-counted; codeRegistered = live, method:null but has a code handler; codeOnly = live, no detectable handler. This is the combined coir+copse capability behind docs/COVERAGE.md, invokable directly. Get coir's rows from coir's MCP/CLI; reachability:false skips the reachable pass.",
+    description: "THE coir×copse coverage join in one call: pass coir's static ClickEvent rows `staticRows` ([{nodePath, method, component?}], from coir's MCP/CLI); copse joins them against its live click surface on (nodePath, method) (symmetric tail match — absorbs coir's root prefix + a prefab mount). Returns buckets: covered (wired+live+reachable&interactable), blocked (live but reachable:false/disabled), uncertain (reachable:'unsure'/occluded — verify, not a pass), unreached (coir-only, not live here — navigate there), ambiguous (can't attribute 1:1 — reason 'fan-out'/'fan-in', resolve by hand), codeRegistered (method:null but has a code handler), codeOnly (no detectable handler). reachability:false skips the reachable pass. Full recipe: docs/COVERAGE.md.",
     inputSchema: { type: 'object', properties: { staticRows: { type: 'array', description: "coir's static ClickEvent rows: [{nodePath, method, component?}]", items: { type: 'object' } }, reachability: { type: 'boolean', description: 'compute reachable on the live surface (default true)' }, includeInactive: { type: 'boolean', description: 'also walk hidden subtrees when building the live surface' } }, required: ['staticRows'] },
     run: async (state, a) => ({ data: coverageJoin(a.staticRows, await needCp(state).clickSurface({ reachability: a.reachability, includeInactive: a.includeInactive })) }),
   },
   {
     name: 'press',
     record: true,
-    description: "Press a button by ref — runs its wired clickEvents + emits CLICK (NOT a coordinate click). Returns {ok, fired, drove, wired?, changed?, errors?}; `drove` = what actuated: ['clickEvent'] (serialized) / ['click'] (a real on('click')) / ['touch'] (a synthetic tap, best-effort) / 'nothing' — so a press that did NOTHING isn't misread as a pass (the harness hard-fails drove:'nothing'); `wired:false` on the ambiguous cases flags a button with no visible handler. `changed` auto-reports what the action did once the tree settles (appeared/disappeared/activated/deactivated/labelChanged as node descriptors, so you can read a panel's contents straight from it). `errors` lists any console-error / uncaught pageerror the handler produced during the press — present even when the engine swallowed the throw and `fired` looks fine, so a crashing handler is NOT a silent pass (the harness hard-fails on it). Honors interactable unless force:true. Set reachableGate:true to ALSO refuse a button a player can't reach (a confident reachable:false → {ok:false, reason:'unreachable', blockedBy}) — the same gate runHarness applies, off by default since press is for driving handler logic regardless of reach.",
+    description: "Press a button by ref — runs its wired clickEvents + emits CLICK (NOT a coordinate click). Returns {ok, fired, drove, wired?, changed?, errors?}. `drove` = what actuated: ['clickEvent']/['click']/['touch'] (synthetic tap, best-effort) / 'nothing' — so a no-op press isn't misread as a pass; `wired:false` flags a button with no handler. `changed` = what the action did after the tree settles (appeared/disappeared/activated/deactivated/labelChanged descriptors — read a panel's contents straight off it). `errors` = any console-error/uncaught throw during the press, even if the engine swallowed it (a crashing handler is never a silent pass). Honors interactable unless force:true. reachableGate:true also refuses a confident reachable:false button ({ok:false, reason:'unreachable', blockedBy}). captureNetwork:true attaches the requests it fired.",
     inputSchema: { type: 'object', properties: { ref: { type: 'string', description: 'node ref, e.g. Canvas/Panel/CloseBtn' }, force: { type: 'boolean', description: 'press even if interactable:false' }, reachableGate: { type: 'boolean', description: 'refuse the press if the button is a confident reachable:false (covered/off-screen)' }, captureNetwork: { type: 'boolean', description: 'attach the network requests this press triggered (url/status/payload) — for client-action→server-error bugs' } }, required: ['ref'] },
     run: async (state, a) => { const o = {}; if (a.force) o.force = true; if (a.reachableGate) o.reachableGate = true; if (a.captureNetwork) o.captureNetwork = true; return { data: await needCp(state).press(a.ref, o) }; },
   },
@@ -173,22 +210,22 @@ export const TOOLS = [
     name: 'call',
     record: true,
     description: 'Invoke any method on any component: path:Comp.method(...args) — drives game logic beyond buttons. Returns {ok, value, changed?, errors?} (`errors` = any console-error / uncaught pageerror the method produced — surfaces a swallowed throw the same way press does).',
-    inputSchema: { type: 'object', properties: { sel: { type: 'string', description: 'path:Comp.method selector' }, args: { type: 'array', items: {}, description: 'method arguments' } }, required: ['sel'] },
+    inputSchema: { type: 'object', properties: { sel: { type: 'string', description: 'path:Comp.method selector' }, args: { type: 'array', items: { type: JSON_VALUE }, description: 'method arguments (each keeps its JSON type — see JSON_VALUE)' } }, required: ['sel'] },
     run: async (state, a) => ({ data: await needCp(state).call(a.sel, ...(a.args || [])) }),
   },
   {
     name: 'eval',
     record: true,
-    description: "Evaluate an arbitrary JS expression in the game frame's MAIN WORLD (global scope), WITHOUT pausing the renderer — unlike eval_frame, which needs a breakpoint and freezes the game (collapsing async timing). `cc`, `window`, `window.__copse`, `cc.find(path)` are all in reach, so you can read engine/proxy state, fire REAL input the press tool can't (e.g. cc.find('…/Btn').emit('touch-end') on raw node.on(TOUCH_*) buttons), or drive game logic and watch its async timing play out live. A returned Promise is awaited (so `await`/thenables work). Returns {ok, value} with value coerced to a JSON-safe form (non-serialisable → String()), or {ok:false, error} on a throw. Big hammer — for your OWN dev build; pass an IIFE for multi-statement logic.",
+    description: "ESCAPE HATCH — arbitrary JS in the game frame's main world (no pause). LAST RESORT: prefer the curated tools (they carry the guardrails — reachable/drove/errors gates, structured output — that raw eval bypasses); reach here only when nothing else fits. `cc`, `window`, `window.__copse`, `cc.find(path)` in reach: read engine/proxy state, fire input press can't (e.g. cc.find('…/Btn').emit('touch-end')), or drive logic and watch async timing live. For framework state use the in-page `__copse.pm` namespace (NOT the snake_case tool names — `__copse.pm_get` is not a function): `__copse.pm.get('GameDataProxy.active')` / `pm.set` / `pm.call` / `pm.notify`, and `pm.proxy('GameDataProxy')`/`pm.mediator('XxxViewMediator')` for the RAW live object to poke. `await`/thenables work (a returned Promise is awaited). Returns {ok, value} (coerced JSON-safe) or {ok:false, error}. Pass an IIFE for multi-statement logic.",
     inputSchema: { type: 'object', properties: { expr: { type: 'string', description: 'a JS expression (or IIFE) evaluated in-page at global scope' } }, required: ['expr'] },
     run: async (state, a) => ({ data: await needCp(state).eval(a.expr) }),
   },
   {
     name: 'reachable',
     record: true,
-    description: "Best-effort geometric reachability. Returns {ok, reachable, blockedBy?, occludedBy?, visible}. `reachable` is TRI-STATE: true | false | 'unsure' — 'unsure' (NOT true) when it genuinely can't judge (no UITransform/camera/projection), so uncertainty fails LOUD, not open. `blockedBy` = an input-consumer (overlay / BlockInputEvents) swallowing the touch. `occludedBy` = an opaque sprite drawn OVER the button hiding it VISUALLY while a touch still passes through (reachable:true but a player can't see it). Treat reachable:false / 'unsure' / occludedBy as signals to verify, not gospel — no alpha hit-areas.",
-    inputSchema: { type: 'object', properties: { ref: { type: 'string' } }, required: ['ref'] },
-    run: async (state, a) => ({ data: await needCp(state).reachable(a.ref) }),
+    description: "Can a player reach/use this node — THE 'usable' headline. Default (cheap): geometric TOUCH reachability → {ok, reachable, blockedBy?, occludedBy?, visible}. `reachable` is TRI-STATE: true | false | 'unsure' (NOT true when it genuinely can't judge — fails LOUD, not open). `blockedBy` = an input-consumer (overlay/BlockInputEvents) swallowing the touch; `occludedBy` = an opaque sprite drawn OVER it (touch passes but a player can't SEE it). `visual:true` ALSO runs the pixel pass and returns the full combine: a three-state `usable` (reach ∧ on-screen) + a `visual` block — pass a `baseline` (from visual_baseline) to confirm the node's OWN art, not just 'something drawn'. Treat false/'unsure'/occludedBy as verify-signals, not gospel — no alpha hit-areas.",
+    inputSchema: { type: 'object', properties: { ref: { type: 'string' }, visual: { type: 'boolean', description: 'also run the pixel pass → a three-state `usable` verdict (reach ∧ visible)' }, baseline: { type: 'array', items: {}, description: "a golden signature (from visual_baseline[ref]) to confirm the node's own art" } }, required: ['ref'] },
+    run: async (state, a) => { const o = {}; if (a.visual) o.visual = true; if (a.baseline) o.baseline = a.baseline; return { data: await needCp(state).reachable(a.ref, o) }; },
   },
   {
     name: 'node',
@@ -210,8 +247,14 @@ export const TOOLS = [
     run: async (state, a) => ({ data: await needCp(state).listeners(a.ref) }),
   },
   {
+    name: 'orient',
+    description: "Get your bearings in ONE call — where you are + what you can do right now. Returns {url, scene, engine, framework:{kind, registered, capabilities}, buttons, entryPoints:[refs a player can press now], hint}. Call it after connect instead of stitching probe + framework + interactive by hand. If framework.kind==='none' the game's app-layer state (pm_get/pm_set/pm_call) is unreachable until an adapter is registered.",
+    inputSchema: { type: 'object', properties: {} },
+    run: async (state) => ({ data: await needCp(state).orient() }),
+  },
+  {
     name: 'probe',
-    description: "Engine-coupling self-diagnostic — run it once on an unfamiliar build to see whether copse's version-sensitive internals resolve on THIS Cocos version, instead of finding out via a silent 'unsure'. Read-only (walks + reads, patches nothing → non-invasive). Returns {version, classes:{Node/Button/UITransform/Camera/EventTouch/…present?}, reach:{batcher2D, getFirstRenderCamera, cameraPriority}, events:{eventProcessor, shouldHandleEventTouch, capturingKey, tableKey, infosKey}, touch:{EventTouch, Touch, NodeEventType}}. Anything 'absent'/'unknown'/'error' is a tier that will fall back (or fail loud) here — e.g. getFirstRenderCamera:false → reachable uses the camOf heuristic (via.camera:'heuristic'); events.tableNote:'no-registered-listener-found' just means no node had wired a listener yet (open a scene with buttons and re-probe). The event key names (tableKey:'_callbackTable', infosKey:'callbackInfos' on 3.8.x) are the arms of copse's internal `||` ladders that actually matched — a shift there is exactly the drift this surfaces.",
+    description: "Engine-coupling self-diagnostic — run once on an unfamiliar build to see whether copse's version-sensitive internals resolve on THIS Cocos version, instead of finding out via a silent 'unsure'. Read-only (non-invasive). Returns {version, classes (which cc.* globals present), reach (batcher2D/getFirstRenderCamera/cameraPriority), events (eventProcessor/shouldHandleEventTouch/tableKey/infosKey), touch, framework}. Any 'absent'/'unknown' is a tier that falls back or fails loud here (e.g. getFirstRenderCamera:false → reachable uses the camOf heuristic). `orient` is the higher-level 'where am I'; this is the low-level version-drift check.",
     inputSchema: { type: 'object', properties: {} },
     run: async (state) => ({ data: await needCp(state).probe() }),
   },
@@ -223,51 +266,102 @@ export const TOOLS = [
   },
   {
     name: 'watch',
-    description: "Record a diff-only TIMELINE of game state over time — the state-machine observation primitive (replaces hand-written polling loops). Samples `exprs` (in-page JS expressions read in the game frame, e.g. 'gdp.active') and/or `selectors` (path:Comp.prop, read via get) every `interval` (default '1s'), recording ONLY changed keys with relative timestamps {t, dt} (so you can answer 'hit → bigwin, how many seconds?'). Stops when `until` (an in-page boolean expr, e.g. 'gdp.active===false') is true or `timeout` (default '40s') elapses; after `until` it keeps recording for `settle` (e.g. '2s') to catch the tail. Returns {timeline:[{t, dt, changes}], stoppedBy:'until'|'timeout', elapsed, samples}. Durations accept '1s'/'500ms'/a number(ms). The whole poll loop runs in ONE in-page call.",
-    inputSchema: { type: 'object', properties: { exprs: { type: 'array', items: { type: 'string' }, description: 'in-page JS expressions to sample' }, selectors: { type: 'array', items: { type: 'string' }, description: 'path:Comp.prop selectors to sample via get' }, interval: { type: 'string', description: "sample interval (default '1s')" }, until: { type: 'string', description: 'stop when this in-page boolean expression is true' }, timeout: { type: 'string', description: "hard stop (default '40s')" }, settle: { type: 'string', description: "after `until`, keep recording this long to catch the tail" } } },
+    description: "Record a diff-only TIMELINE of game state over time. Samples `exprs` (in-page JS, e.g. 'gdp.active') and/or `selectors` (path:Comp.prop via get) every `interval` (default '1s'), recording ONLY changed keys with relative timestamps {t, dt} (answers 'hit → bigwin, how many seconds?'). Stops when `until` (an in-page boolean expr, e.g. 'gdp.active===false') is true or `timeout` (default '40s'); after `until` keeps recording for `settle` to catch the tail. Durations accept '1s'/'500ms'/'2m'/a number(ms). captureNetwork:true attaches requests fired during the window. Returns {timeline, stoppedBy, elapsed, samples}.",
+    inputSchema: { type: 'object', properties: { exprs: { type: 'array', items: { type: 'string' }, description: 'in-page JS expressions to sample' }, selectors: { type: 'array', items: { type: 'string' }, description: 'path:Comp.prop selectors to sample via get' }, interval: { type: 'string', description: "sample interval (default '1s')" }, until: { type: 'string', description: 'stop when this in-page boolean expression is true' }, timeout: { type: 'string', description: "hard stop (default '40s')" }, settle: { type: 'string', description: "after `until`, keep recording this long to catch the tail" }, captureNetwork: { type: 'boolean', description: 'also attach the network requests fired during the watch window' } } },
     run: async (state, a) => ({ data: await needCp(state).watch(a) }),
   },
   {
     name: 'patch',
-    description: "Wrap a live component method to verify a fix WITHOUT rebuilding — the 'try the fix on the running game first' primitive. sel = path:Comp.method (e.g. Canvas/Mgr:PanelCtrl.setRoundInfo). `before`/`after`/`replace` are JS FUNCTION-EXPRESSION source strings; copse compiles them, finds the real method, binds `this`, and wraps the hooks in try/catch (a throwing hook can't break the original call), restorably. `before(args, self)` runs first — return an ARRAY to replace the args; `replace(args, self)` runs INSTEAD of the original (its return becomes the result); `after(args, ret, self)` runs last — return non-undefined to replace the result. Example fix-probe: before=\"(a,self)=>{ self.mode = self.off; }\". Returns {ok, method, hooks}. Undo with patch_clear.",
-    inputSchema: { type: 'object', properties: { sel: { type: 'string', description: 'path:Comp.method selector' }, before: { type: 'string', description: 'JS fn-expr (args, self) => …  (return an array to replace args)' }, after: { type: 'string', description: 'JS fn-expr (args, ret, self) => …  (return non-undefined to replace the result)' }, replace: { type: 'string', description: 'JS fn-expr (args, self) => …  runs INSTEAD of the original' } }, required: ['sel'] },
-    run: async (state, a) => ({ data: await needCp(state).patch(a.sel, { before: a.before, after: a.after, replace: a.replace }) }),
+    record: true,
+    description: "Wrap a live component method to verify a fix WITHOUT rebuilding. sel = path:Comp.method (e.g. Canvas/Mgr:PanelCtrl.setRoundInfo). `before`/`after`/`replace` are JS FUNCTION-EXPRESSION source strings (compiled in-page, `this` bound, hooks wrapped in try/catch so a bad hook can't break the call): before(args, self) runs first (return an ARRAY to replace args); replace(args, self) runs INSTEAD of the original; after(args, ret, self) runs last (return non-undefined to replace the result). trace:true records each call's {t, args, ret} → read via patch_calls (confirm real order/timing live). Example: before=\"(a,self)=>{ self.mode = self.off; }\". Returns {ok, method, hooks}. Undo with patch_clear.",
+    inputSchema: { type: 'object', properties: { sel: { type: 'string', description: 'path:Comp.method selector' }, before: { type: 'string', description: 'JS fn-expr (args, self) => …  (return an array to replace args)' }, after: { type: 'string', description: 'JS fn-expr (args, ret, self) => …  (return non-undefined to replace the result)' }, replace: { type: 'string', description: 'JS fn-expr (args, self) => …  runs INSTEAD of the original' }, trace: { type: 'boolean', description: 'record each call (args/ret/timing) for patch_calls' } }, required: ['sel'] },
+    run: async (state, a) => { const h = { before: a.before, after: a.after, replace: a.replace }; if (a.trace) h.trace = true; return { data: await needCp(state).patch(a.sel, h) }; },
   },
   {
     name: 'patch_clear',
+    record: true,
     description: 'Undo `patch`: restore the original method (all patches if no sel). Returns {ok, cleared:[sels], hookErrors?} — hookErrors surfaces any exception your before/after hooks threw while the patch was active (so a silently-swallowed hook bug is still visible).',
     inputSchema: { type: 'object', properties: { sel: { type: 'string', description: 'the same path:Comp.method you patched (omit to clear all)' } } },
     run: async (state, a) => ({ data: await needCp(state).patchClear(a.sel) }),
   },
   {
+    name: 'patch_calls',
+    description: "Read a trace:true patch's recorded calls: {ok, ref, calls:[{t (ms since patch), args, ret | threw}]}. Shows the METHOD's real call order + timing on the running game — pair with coir's static command flow to confirm what actually fired when (e.g. did setRoundInfo run before the action request?).",
+    inputSchema: { type: 'object', properties: { sel: { type: 'string', description: 'the path:Comp.method you patched with trace:true' } }, required: ['sel'] },
+    run: async (state, a) => ({ data: await needCp(state).patchCalls(a.sel) }),
+  },
+  {
     name: 'framework',
-    description: "Detect the game's app framework and enumerate its state registry: {kind, proxies:[names], mediators:[names], commands:[names], registered}. copse core ships NO framework knowledge — this reports whatever ADAPTER is registered this session (auto-loaded from copse.frameworks.mjs, or added via register_framework / connect({frameworks})). kind:'none' + registered:0 = no adapter installed; kind:'none' + registered>0 = an adapter is loaded but didn't match this build (widen its facade candidates). PureMVC etc. keep LOGIC state OUTSIDE the cc node tree, which get/call can't reach — use pm_state/pm_call for those.",
+    record: true,
+    description: "Detect the game's app framework and enumerate its state registry: {kind, proxies:[names], mediators:[names], commands:[names], registered}. copse core ships NO framework knowledge — this reports whatever ADAPTER is registered this session (auto-loaded from copse.frameworks.mjs, or added via register_framework / connect({frameworks})). kind:'none' + registered:0 = no adapter installed; kind:'none' + registered>0 = an adapter is loaded but didn't match this build (widen its facade candidates). PureMVC etc. keep LOGIC state OUTSIDE the cc node tree, which get/call can't reach — use pm_get/pm_set/pm_call for those.",
     inputSchema: { type: 'object', properties: {} },
     run: async (state) => ({ data: await needCp(state).framework() }),
   },
   {
     name: 'register_framework',
-    description: "Install a framework adapter for THIS session so framework/pm_state/pm_call can reach app-layer state (core ships none). `adapter` is a CONFIG object {kind, facade:[…locations], proxy:{via?,map?}, mediator:{via?,map?}, command:{map?}} — `facade` lists candidate window paths ('puremvc.Facade.instance', or 'a.b.*' to expand a map), `via` a retrieve method name, `map` registry-map path candidates — OR a code-adapter SOURCE string \"({detect,proxies,mediators,commands,retrieve})\" for a framework the config can't express. De-duped by `kind`. Persist it in copse.frameworks.mjs (auto-loaded on connect); use this to add/adjust one on the fly. Returns {ok, kind, registered}.",
+    record: true,
+    description: "Install a framework adapter this session so framework/pm_* can reach app-layer state (core ships none). `adapter` is a CONFIG object {kind, facade:[…window paths, 'a.b.*' expands a map], proxy:{via?,map?}, mediator:{…}, command:{map?}} — `via` a retrieve method name, `map` registry-path candidates — OR a code-adapter SOURCE string \"({detect,proxies,mediators,retrieve,…})\" for a framework the config can't express. De-duped by `kind`. Persist it in copse.frameworks.mjs (auto-loaded on connect); this adds one on the fly. Returns {ok, kind, registered}.",
     inputSchema: { type: 'object', properties: { adapter: { description: 'a config object, or a code-adapter source string' } }, required: ['adapter'] },
     run: async (state, a) => ({ data: await needCp(state).registerFramework(a.adapter) }),
   },
   {
-    name: 'pm_state',
-    description: "Read (or write) a PureMVC proxy/mediator's state — the logic state OUTSIDE the cc node tree that get/call can't reach. sel = 'Name.prop.subprop' (e.g. 'GameDataProxy.active' or 'GameDataProxy.sessionData.remaining'); Name is resolved via retrieveProxy then retrieveMediator. Pass `value` to WRITE the leaf (e.g. set 'GameDataProxy.mode'); omit it to READ. Returns {ok, value} or {ok, wrote}. Run `framework` first to see the names.",
-    inputSchema: { type: 'object', properties: { sel: { type: 'string', description: "'ProxyOrMediatorName.prop.subprop'" }, value: { description: 'when present, WRITE this value to the leaf (any JSON value)' } }, required: ['sel'] },
-    run: async (state, a) => ({ data: await needCp(state).pmState(a.sel, Object.prototype.hasOwnProperty.call(a, 'value'), a.value) }),
+    name: 'pm_get',
+    record: true,
+    description: "READ a PureMVC proxy/mediator's state — the logic state OUTSIDE the cc node tree that `get` can't reach. sel = 'Name.prop.subprop' (e.g. 'GameDataProxy.active' or 'GameDataProxy.sessionData.remaining'); Name is resolved via retrieveProxy then retrieveMediator. Returns {ok, value}. Run `framework` first to see the names. (The write half is a separate tool, `pm_set` — a write is an actuation.)",
+    inputSchema: { type: 'object', properties: { sel: { type: 'string', description: "'ProxyOrMediatorName.prop.subprop'" } }, required: ['sel'] },
+    run: async (state, a) => ({ data: await needCp(state).pmGet(a.sel) }),
+  },
+  {
+    name: 'pm_set',
+    record: true,
+    description: "WRITE a PureMVC proxy/mediator leaf — an actuation (routed through the same `mutate` as press/call, so it carries `errors`/`changed`). sel = 'Name.prop.subprop' (e.g. set 'GameDataProxy.mode'); the write is VERIFIED (a read-only/getter leaf fails loud with reason 'write-no-effect'/'write-failed', never a false ok). Returns {ok, wrote}; if a setter TRANSFORMED the value (e.g. normalised it) the read-back also rides along as `landed` — so silent coercion is visible. `value` is explicitly multi-typed so the client sends the true JSON type — otherwise a scalar (boolean/number) crosses as a STRING. CAUTION: writing an INTERNAL state field MID-FLOW can wedge the state machine (e.g. forcing active while a action runs) — do forced writes at IDLE for isolated checks, not during a live flow.",
+    inputSchema: { type: 'object', properties: { sel: { type: 'string', description: "'ProxyOrMediatorName.prop.subprop'" }, value: { type: JSON_VALUE, description: 'the value to write (any JSON type)' } }, required: ['sel', 'value'] },
+    run: async (state, a) => ({ data: await needCp(state).pmSet(a.sel, a.value) }),
   },
   {
     name: 'pm_call',
+    record: true,
     description: "Call a method on a PureMVC proxy/mediator: sel = 'Name.method' (e.g. 'PanelMediator.toggle'), args = the arguments. Drives app-layer logic that isn't a cc component method. Returns {ok, value}.",
-    inputSchema: { type: 'object', properties: { sel: { type: 'string', description: "'ProxyOrMediatorName.method'" }, args: { type: 'array', items: {}, description: 'method arguments' } }, required: ['sel'] },
+    inputSchema: { type: 'object', properties: { sel: { type: 'string', description: "'ProxyOrMediatorName.method'" }, args: { type: 'array', items: { type: JSON_VALUE }, description: 'method arguments (each keeps its JSON type — see JSON_VALUE)' } }, required: ['sel'] },
     run: async (state, a) => ({ data: await needCp(state).pmCall(a.sel, ...(a.args || [])) }),
+  },
+  {
+    name: 'pm_patch',
+    record: true,
+    description: "The app-layer analogue of `patch`: wrap a PureMVC proxy/mediator/command method (state OUTSIDE the cc tree). sel='Name.method' — a proxy/mediator is patched as an INSTANCE; a COMMAND (transient) is patched at its CLASS prototype so one wrap covers every run, e.g. pm_patch('StartCommand.execute', {trace:true}) traces the command chain's real order/timing (pair with coir's static command flow). before/after/replace/trace + patch_clear/patch_calls behave like `patch`. Returns {ok, method, kind:'instance'|'command'}. Fails loud if unresolvable — check `framework().capabilities.command` ('class' = works; else the adapter needs a code hook).",
+    inputSchema: { type: 'object', properties: { sel: { type: 'string', description: "'ProxyOrMediatorName.method' or 'CommandName.execute'" }, before: { type: 'string' }, after: { type: 'string' }, replace: { type: 'string' }, trace: { type: 'boolean', description: 'record each call for patch_calls' } }, required: ['sel'] },
+    run: async (state, a) => { const h = { before: a.before, after: a.after, replace: a.replace }; if (a.trace) h.trace = true; return { data: await needCp(state).pmPatch(a.sel, h) }; },
+  },
+  {
+    name: 'pm_notify',
+    record: true,
+    description: "Fire a PureMVC notification — the most DIRECT entry into a notification-driven flow (trigger it without pressing a button / calling a specific method). `name` is the notification string (= the command's registration name; `framework().commands` lists them), `body`/`type` optional. Dispatches via the adapter's facade method (sendNotification/notify/… by config candidate). Returns {ok, via, value} or {ok:false, reason}. Combine with pm_patch(trace) + watch/network to trigger a flow and watch its command chain + server round-trip.",
+    inputSchema: { type: 'object', properties: { name: { type: 'string', description: 'the notification name (see framework().commands)' }, body: { type: JSON_VALUE, description: 'optional notification body (any JSON value; typed so a scalar keeps its JSON type)' }, type: { type: 'string', description: 'optional notification type' } }, required: ['name'] },
+    run: async (state, a) => ({ data: await needCp(state).pmNotify(a.name, a.body, a.type) }),
   },
   {
     name: 'network',
     description: "Recent network requests captured from the game (all frames), SERVER-SIDE filtered: [{t, method, url, status, type, payload?}]. Purpose-built for 'client action → server error code' bugs (e.g. a action request that came back 500): press with captureNetwork:true, or call this after an action. Filters: `grep` (regex over url), `status` (e.g. 200 or 'failed'), `type` ('xhr'|'fetch'|…), `tail` (last N), `since` (index). xhr/fetch rows include a truncated request `payload`.",
     inputSchema: { type: 'object', properties: { grep: { type: 'string', description: 'case-insensitive regex over the request url' }, status: { description: "keep only this HTTP status (a number, or 'failed')" }, type: { type: 'string', description: "keep only this resourceType ('xhr'|'fetch'|'document'|…)" }, tail: { type: 'number', description: 'keep only the last N matching requests' }, since: { type: 'number', description: 'return requests from this index onward' } } },
     run: async (state, a) => ({ data: await needCp(state).network(a || {}) }),
+  },
+  {
+    name: 'hold',
+    description: "FREEZE the game's engine loop the moment a trigger method fires, so a transient state (e.g. a ~1s intermediate window in a self-running flow) can be screenshot / inspected, then `release`d. Arms a ONE-SHOT patch on `sel` (a path:Comp.method, or a framework Command/method with pm:true) — when it fires, the loop pauses with the last frame on screen. While held, `screenshot`/`get`/`pm_get`/`snapshot` all work (reads don't need the loop); `release` resumes. `at`:'after' (default — hold the state the trigger PRODUCES) or 'before'. `holdMs` auto-releases after N ms. Returns {ok, armed, sel} or {ok:false, reason:'no-freeze-api'}. Boundary: freezes everything on the engine loop (scheduler/tween/animation); a bare setTimeout-driven state won't freeze, and a held game can't be driven until release.",
+    inputSchema: { type: 'object', properties: { sel: { type: 'string', description: "trigger method: 'path:Comp.method', or a framework 'Name.method' with pm:true" }, at: { type: 'string', description: "'after' (default, hold the resulting state) | 'before'" }, pm: { type: 'boolean', description: 'the trigger is a framework proxy/mediator/command method (uses pm_patch resolution)' }, holdMs: { type: 'number', description: 'auto-release after this many ms (omit = hold until release)' } }, required: ['sel'] },
+    run: async (state, a) => { const o = {}; if (a.at) o.at = a.at; if (a.pm) o.pmMode = true; if (a.holdMs != null) o.holdMs = a.holdMs; return { data: await needCp(state).hold(a.sel, o) }; },
+  },
+  {
+    name: 'release',
+    description: "Resume the engine loop after a `hold` (or clear an armed-but-not-yet-fired hold). Returns {ok, resumed, wasHeld, heldMs}. Idempotent — safe when nothing is held.",
+    inputSchema: { type: 'object', properties: {} },
+    run: async (state) => ({ data: await needCp(state).release() }),
+  },
+  {
+    name: 'hold_status',
+    description: "Current hold state: {armed, held, sel, via, sinceMs} — `armed` = a trigger is waiting to fire, `held` = the loop is frozen now, `via` = which freeze API engaged ('game'|'director').",
+    inputSchema: { type: 'object', properties: {} },
+    run: async (state) => ({ data: await needCp(state).holdStatus() }),
   },
   {
     name: 'screenshot',
@@ -277,7 +371,7 @@ export const TOOLS = [
   },
   {
     name: 'visual_check',
-    description: "Node-anchored VISUAL check — the PIXEL complement to the logic tree (copse otherwise reads the node tree, never pixels). Screenshots JUST this node's screen rect (dynamic children — labels/particles/spine — masked so they don't trip it) and returns a three-state verdict {drawn, matches, clear, score?, visible, via, reason?} in the SAME grammar as reachable (true|false|'unknown' + a `via` provenance tag): drawn = is anything actually rendered at the rect (catches the 'tree says active, screen is blank' case reachable/snapshot can't); with a golden `baseline` signature (from visual_baseline) matches = it looks like the golden and clear = the node's OWN art is what's visible — which is how you close reachable's headline blind spot (a button covered by an opaque sprite with no input-consumer reads reachable:true but clear:false). via becomes 'pixel-confirmed' once a baseline is used; with no baseline matches/clear are 'unknown' (drawn still answers). Needs a screenshot-capable session (connect first).",
+    description: "Node-anchored PIXEL check (copse otherwise reads the node tree, never pixels). Screenshots JUST this node's screen rect (dynamic children — labels/particles/spine — masked) → three-state {drawn, matches, clear, score?, visible, via, reason?} in reachable's grammar (true|false|'unknown'). drawn = anything actually rendered there (catches 'tree says active, screen blank'). With a golden `baseline` (from visual_baseline): matches = looks like the golden, clear = the node's OWN art is visible — this closes reachable's blind spot (an opaque sprite over a button reads reachable:true but clear:false). No baseline → matches/clear are 'unknown' (drawn still answers).",
     inputSchema: { type: 'object', properties: { ref: { type: 'string', description: 'node ref' }, baseline: { type: 'array', items: { type: 'number' }, description: "a golden signature for THIS ref (from visual_baseline) to compare against" } }, required: ['ref'] },
     run: async (state, a) => { const o = {}; if (a.baseline) o.baseline = a.baseline; return { data: await needCp(state).visualCheck(a.ref, o) }; },
   },
@@ -286,12 +380,6 @@ export const TOOLS = [
     description: "Capture a golden per-node visual baseline on the CURRENT (known-good) screen — signs every interactive node (or the passed `refs`) and returns { ref: signature[] }. Feed an entry back as visual_check's `baseline` on a later run/build to detect a node that stopped rendering, got occluded, or changed art. Per-node (NOT a full-frame screenshot) baselines survive animation/RNG because each node's dynamic descendants are masked out. Needs an open session.",
     inputSchema: { type: 'object', properties: { refs: { type: 'array', items: { type: 'string' }, description: 'refs to baseline (default: every interactive node)' } } },
     run: async (state, a) => ({ data: await needCp(state).captureBaseline(a.refs ? { refs: a.refs } : {}) }),
-  },
-  {
-    name: 'reachable_visual',
-    description: "The headline COMBINE: touch-reachability (logic z-order) ∧ the pixel pass → \"can a player actually SEE and USE this\". Returns {ref, usable, reachable, visual}; `usable` is three-state — reachable+visible+clear → true, any hard-negative → false, reachable+visible+drawn but no baseline to confirm the art → 'unknown'. This is what turns reachable's opaque-sprite-occlusion caveat (reachable:true but visually covered) into a real answer. Pass a `baseline` (from visual_baseline) to reach a confident true. Needs an open session.",
-    inputSchema: { type: 'object', properties: { ref: { type: 'string' }, baseline: { type: 'array', items: { type: 'number' }, description: "golden signature for this ref (from visual_baseline)" } }, required: ['ref'] },
-    run: async (state, a) => ({ data: await needCp(state).reachableVisual(a.ref, a.baseline ? { baseline: a.baseline } : {}) }),
   },
   {
     name: 'break_at',
@@ -344,7 +432,7 @@ export const TOOLS = [
   },
   {
     name: 'run_script',
-    description: 'Replay a FROZEN test script deterministically (no LLM) against the connected game — the regression half of the test loop (docs/SCRIPTS.md). `script` = {name?, continueOnFail?, steps:[…]}; each step is the harness Step shape {op, ref?/sel?/args?/opts?/expr?/note?} plus `expect` (subset match: primitives ===, objects by key, arrays CONTAINS) and `allowErrors`; {op:"sleep", ms} waits. A step with no expect passes on ok!==false; fact gates mirror runHarness: result.errors fails the step (unless allowErrors / an explicit errors expect) and a press with drove:"nothing" fails (unless an explicit drove expect). Default stops at the first failed step (continueOnFail:true runs all). Returns {pass, name?, failedAt?, steps:[{step, ok, ms, mismatch?, result?, gate?}]} — failing steps carry the full result.',
+    description: 'Run a sequence of steps in ONE call — BOTH a frozen regression script AND your ad-hoc BATCH (ops run back-to-back, no agent-turn latency between: e.g. call + pm_call then watch). Each step\'s `op` is any driver op (the camelCase form of an MCP tool: press/get/call/pmGet/pmSet/pmCall/pmNotify/pmPatch/patch/watch/network/reachable/… + {op:"sleep",ms}) with that op\'s fields (ref/sel/args/opts/value/…). `script` = {name?, continueOnFail?, steps:[…]}; a step may carry `expect` (subset match: primitives ===, objects by key, arrays CONTAINS) and `allowErrors`. No expect → passes on ok!==false; fact gates: result.errors fails (unless allowErrors / an errors expect), a press with drove:"nothing" fails. Narrow the errors gate without going all-or-nothing (on a step or the whole script): `ignoreErrors` (regex|regex[]) drops matching background noise (e.g. a game\'s "EventSource … MIME type … Aborting" SSE warning) from the gate while keeping it in result.errors; `errorGate` sets the source floor — "uncaught" fails only on a real throw (a pageerror), tolerating console.error; "off" = allowErrors. Stops at the first fail unless continueOnFail:true. A passing READ step (get/pmGet/node/reachable/framework/probe/orient/listeners/patchCalls/diff) AUTO-captures its (truncated) result so you can PEEK at the value in a green run without a re-fetch; `capture:false` on the step suppresses it. Actuations (press/call/…) and big list ops (snapshot/watch/…) stay silent unless `capture:true` (on the step, or `capture` on the whole script). Returns {pass, failedAt?, steps}.',
     inputSchema: { type: 'object', properties: { script: { type: 'object', description: 'the script: {name?, continueOnFail?, steps:[{op, ref?/sel?/args?/opts?, expect?, allowErrors?}, …]}' } }, required: ['script'] },
     run: async (state, a) => ({ data: await runScript(needCp(state), a.script) }),
   },

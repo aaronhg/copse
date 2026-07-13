@@ -55,31 +55,50 @@ npm i -D puppeteer-core # the browser edge (peer dep); the server launches syste
 
 ## Tools
 
-The default tool set is the 17 testing primitives below. The tool names match the library 1:1
-(`connect`, `snapshot`, `press`, …) — the MCP edge is the same surface over stdio.
+The default tool set is 36 testing primitives (the Debugger tools below are hidden unless `--debug`).
+The tool names match the library 1:1 (`connect`, `snapshot`, `press`, …) — the MCP edge is the same
+surface over stdio.
+
+`tools/list` groups these into **families**, each with one **★ headline** ("reach for this first; the
+rest are variants / lower-level"), and prefixes every description with its tag — `[drive ★]`, `[drive]`,
+`[see]`, … — so the flat list reads as a guided map. Nothing is hidden. The families (★ = headline):
+**session** (`connect`★) · **see** (`snapshot`★) · **read** (`get`★) · **drive** (`press`★) ·
+**usable** (`reachable`★) · **observe** (`watch`★) · **fix** (`patch`★) · **coverage** (`coverage`★) ·
+**script** (`run_script`★) · **orient** (`orient`★) · **escape** (`eval`, no ★ — the raw hatch, a last resort).
+The core loop is the ★s of session/see/drive/read.
 
 | tool | what it does |
 |---|---|
-| `connect(url, {headed?, fps?, browserURL?, attach?, match?})` | launch/attach Chrome, load the game, inject copse, wait until ready. **Call first.** (same op as the library's `connect()`) |
+| `connect(url, {headed?, fps?, browserURL?, attach?, match?, frameworks?})` | launch/attach Chrome, load the game, inject copse, wait until ready. **Call first.** (same op as the library's `connect()`) |
 | `reload({waitUntil?})` | reload the tab + re-inject — pick up the editor's CURRENT scene after opening a different one, or recover a wedged/empty preview |
 | `snapshot({relevant?=true, includeInactive?, components?})` | slim live node tree |
 | `interactive()` | buttons + `reachable`/`blockedBy` |
 | `click_surface({reachability?, includeInactive?})` | join-ready runtime click surface: one row per editor-wired clickEvent `{ref, method, …}` — the copse side of the coir join (see [`COVERAGE.md`](COVERAGE.md)) |
 | `resolve(path)` | translate a coir STATIC nodePath into the live `ref` (symmetric tail match — absorbs coir's root prefix / a prefab mount); feed the result into `press`/`get` |
-| `press(ref, {force?, reachableGate?})` | fire the wired handler (NOT a coordinate click) → `{ok, fired, changed}`; `reachableGate:true` refuses a covered (`reachable:false`) button — the same gate `runHarness` applies |
+| `press(ref, {force?, reachableGate?, captureNetwork?})` | fire the wired handler (NOT a coordinate click) → `{ok, fired, changed}`; `reachableGate:true` refuses a covered button; `captureNetwork:true` attaches the requests it fired |
 | `get(sel)` / `call(sel, args)` | read a member / invoke any method (`call` on a missing method → `{ok:false, reason:'no-method'}`, not a silent `value:undefined`) |
-| `reachable(ref)` / `node(ref)` | best-effort reachability / node intrinsics |
-| `coverage(staticRows)` | join coir's static ClickEvent rows against the live click surface → buckets `{covered, blocked, uncertain, unreached, ambiguous, codeRegistered, codeOnly}` — the coir×copse capability in one call (see [`COVERAGE.md`](COVERAGE.md)) |
-| `diff(before, after)` | diff two snapshots → `appeared/disappeared/activated/deactivated/labelChanged` (for manual before→act→after comparisons; `press`/`call` already attach this as `changed`) |
+| `reachable(ref, {visual?, baseline?})` / `node(ref)` | best-effort reachability (`visual:true` adds the pixel pass → a three-state `usable`) / node intrinsics |
+| `coverage(staticRows)` | join coir's static ClickEvent rows against the live click surface → buckets `{covered, blocked, uncertain, unreached, ambiguous, codeRegistered, codeOnly}` (see [`COVERAGE.md`](COVERAGE.md)) |
+| `diff(before, after)` | diff two snapshots → `appeared/disappeared/activated/deactivated/labelChanged` (`press`/`call` already attach this as `changed`) |
 | `listeners(ref)` | user `node.on()` handlers `[{type, fn?, target?}]` (minified builds strip names) |
-| `probe()` | engine-coupling self-diagnostic: `{version, classes, reach, events, touch}` — which version-sensitive internals resolve on this build (drift → visible, not a silent `'unsure'`) |
-| `logs(since?)` | captured `console.*` + uncaught errors (all frames) `[{level, text, t, stack?}]` — check if an action errored with no visible UI change |
-| `run_script({script})` | **replay a frozen test script** deterministically (no LLM): JSON steps + subset-match `expect`s → `{pass, failedAt?, steps}` — the regression half of the loop (see [`SCRIPTS.md`](SCRIPTS.md)) |
-| `dump_script({name?, reset?})` | export this session's recording (every press/get/call/… since `connect`, each with `observed`) as a script skeleton — trim `observed` into minimal `expect`s, save, replay |
+| `orient()` | **one-call bearings** after connect → `{url, scene, engine, framework:{kind, registered, capabilities}, buttons, entryPoints:[refs pressable now], hint}` — instead of stitching probe + framework + interactive by hand |
+| `probe()` | engine-coupling self-diagnostic: `{version, classes, reach, events, touch, framework}` — which version-sensitive internals resolve on this build (drift → visible, not a silent `'unsure'`) |
+| `logs({grep?, level?, tail?, since?})` | captured `console.*` + uncaught errors (all frames), server-side filtered so a chatty game can't blow the token budget |
+| `watch({exprs?, selectors?, interval?, until?, timeout?, settle?, captureNetwork?})` | diff-only state TIMELINE over time → `{timeline, stoppedBy}` (replaces hand-written polling loops) |
+| `patch(sel, {before?, after?, replace?, trace?})` / `patch_clear(sel?)` / `patch_calls(sel)` | wrap a live component method to verify a fix pre-rebuild; `trace:true` records calls, read via `patch_calls` |
+| `framework()` / `register_framework(adapter)` | detect the app framework (PureMVC etc.) + `{proxies, mediators, commands, capabilities}` / install an adapter this session (core ships none — see [`INJECT.md`](INJECT.md)/`copse.frameworks.mjs`) |
+| `pm_get(sel)` / `pm_set(sel, value)` / `pm_call(sel, args)` | READ (family `read`) / WRITE (family `drive` — an actuation, verified + carries `errors`/`changed`) proxy/mediator state OUTSIDE the cc tree / call a proxy/mediator method |
+| `pm_patch(sel, {…, trace?})` / `pm_notify(name, body?, type?)` | patch a proxy/mediator/command method / **fire a notification** — the direct entry into a notification-driven flow |
+| `network({grep?, status?, type?, tail?, since?})` | captured requests `[{t, method, url, status, type, payload?}]` — for "client action → server error code" bugs |
+| `screenshot({selector?, path?})` | canvas PNG (inline image, or written to `path`) — pair a logic state with what's on screen |
+| `visual_check(ref, {baseline?})` / `visual_baseline({refs?})` | node-anchored pixel check (drawn/matches/clear) / capture golden per-node signatures |
+| `run_script({script})` | run a step sequence in ONE call — a **frozen regression script** AND your ad-hoc **batch** (full-surface ops); subset-match `expect`s → `{pass, failedAt?, steps}` (see [`SCRIPTS.md`](SCRIPTS.md)) |
+| `dump_script({name?, reset?})` | export this session's recording as a script skeleton — trim `observed` into minimal `expect`s, save, replay |
 | `close()` | tear down the browser (also detaches the debugger) |
 
-`press`/`call` auto-attach `changed` (what the action did after the tree settles), so opening a
-panel hands the agent its contents with no follow-up snapshot.
+`press`/`call` (and the pm actuations `pm_set`/`pm_call`/`pm_notify`) auto-attach `changed`
+(what the action did after the tree settles) + `errors` (any console-error/uncaught throw during it),
+so a crashing flow is never a silent green pass and opening a panel hands the agent its contents.
 
 ### Debugger tools (hidden by default)
 
