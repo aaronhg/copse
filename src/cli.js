@@ -9,8 +9,8 @@
 // Heavy/optional bits (puppeteer-core driver, the claude agent, the MCP server) are
 // LAZY-imported per command, so `copse --help` / `copse mcp` don't require puppeteer-core
 // and the common path stays light. Needs a built dist/copse.inject.js (npm run build).
-import { mkdirSync, createWriteStream, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { mkdirSync, createWriteStream, readFileSync, readdirSync, writeFileSync, statSync } from 'node:fs';
+import { join, dirname } from 'node:path';
 
 const [, , cmd, ...rest] = process.argv;
 const flag = (f, d) => { const i = rest.indexOf(f); return i >= 0 ? rest[i + 1] : d; };
@@ -24,7 +24,7 @@ if (cmd === '--version' || cmd === '-V' || rest.includes('--version')) {
 }
 // value-taking flags — so the positional <url> finder below never grabs a flag's value
 // (e.g. `--browser-url http://…` must NOT be read as the game url, or `copse mcp` pre-opens it).
-const VAL_FLAGS = new Set(['--goal', '--stop', '--report', '--rounds', '--model', '--chrome', '--browser-url', '--fps', '--match', '--framework', '-o', '--output']);
+const VAL_FLAGS = new Set(['--goal', '--stop', '--report', '--rounds', '--model', '--chrome', '--browser-url', '--fps', '--match', '--framework', '-o', '--output', '--junit']);
 const url = rest.find((a, i) => /^https?:\/\//.test(a) && !VAL_FLAGS.has(rest[i - 1])); // declared AFTER VAL_FLAGS (no TDZ)
 const verbose = has('--verbose', '-v');
 const J = (x) => JSON.stringify(x, null, 2);
@@ -57,6 +57,7 @@ const USAGE = `copse — drive & assert a running Cocos game
   copse probe <url>                          engine-coupling self-diagnostic (version + which internals resolve)
   copse coverage <url> <coir-rows.json>      coir×copse join → coverage buckets (rows = coir's static ClickEvent JSON; file or inline)
   copse run  <url> <script.json>             replay a frozen test script (docs/SCRIPTS.md) → result JSON; exit 0 pass / 1 fail (CI)
+  copse run  <url> <dir> [--junit <file>]    run every *.json in <dir> as a suite (reset between) → JUnit + exit 0/1 (CI)
 
   common:  --version|-V   print the copse version    (--verbose|-v is untruncated step results)
            -o|--output <folder>   append the run log to <folder>/<cmd>.log
@@ -170,16 +171,42 @@ if (cmd === 'mcp') {
   if (!target && !connectOpts.attach) { console.error(`run: a <url> (or --attach [--match <substr>]) is required\n\n${USAGE}`); process.exit(1); } // bare --attach → active tab
   const positionals = rest.filter((a, i) => !/^-/.test(a) && !VAL_FLAGS.has(rest[i - 1]) && a !== url);
   const src = positionals[0];
-  if (!src) { console.error(`run: a script JSON (file path or inline) is required, e.g. copse run ${target || '<url>'} tests/shop.json\n\n${USAGE}`); process.exit(1); }
-  let raw = src; try { raw = readFileSync(src, 'utf8'); } catch { /* not a file → treat the arg as inline JSON */ }
-  let script; try { script = JSON.parse(raw); } catch (e) { console.error(`run: couldn't parse the script from "${src}" — need a JSON file path or inline JSON ({name?, steps:[…]}): ${e.message}`); process.exit(1); }
-  const { runScript } = await import('./script.js');
+  if (!src) { console.error(`run: a script JSON (file, inline, or a DIR of *.json) is required, e.g. copse run ${target || '<url>'} tests/shop.json\n\n${USAGE}`); process.exit(1); }
+  const junitPath = flag('--junit');
+  // A directory → run every *.json in it as a SUITE; else a single file / inline JSON.
+  let isDir = false; try { isDir = statSync(src).isDirectory(); } catch { /* not a path → inline or missing */ }
+  const parse1 = (raw, name) => { try { return JSON.parse(raw); } catch (e) { console.error(`run: couldn't parse ${name} — need JSON ({name?, steps:[…]}): ${e.message}`); process.exit(1); } };
+  /** @type {Array<{name:string, script:any}>} */
+  const scripts = [];
+  if (isDir) {
+    const files = readdirSync(src).filter((f) => f.endsWith('.json')).sort();
+    if (!files.length) { console.error(`run: no *.json scripts in ${src}`); process.exit(1); }
+    for (const f of files) scripts.push({ name: f.replace(/\.json$/, ''), script: parse1(readFileSync(join(src, f), 'utf8'), f) });
+  } else {
+    let raw = src, name = 'inline'; try { raw = readFileSync(src, 'utf8'); name = src.replace(/.*[/\\]/, '').replace(/\.json$/, ''); } catch { /* inline JSON */ }
+    scripts.push({ name, script: parse1(raw, src) });
+  }
+  const { runScript, runScripts } = await import('./script.js');
   const { connect } = await import('./drivers/puppeteer.js');
   const cp = await connect(target, connectOpts);
   try {
-    const r = await runScript(cp, script);
-    console.log(J(r));
-    process.exitCode = r.pass ? 0 : 1;
+    if (!isDir && !junitPath) {
+      // single script, no report → unchanged: print the one result object, exit 0/1.
+      const r = await runScript(cp, scripts[0].script);
+      console.log(J(r));
+      process.exitCode = r.pass ? 0 : 1;
+    } else {
+      // suite (a dir, or a single file asked to emit JUnit): reset between scripts, aggregate.
+      const agg = await runScripts(cp, scripts, { reset: !has('--no-reset') });
+      if (junitPath) {
+        const { toJUnit } = await import('./junit.js');
+        mkdirSync(dirname(junitPath) || '.', { recursive: true });
+        writeFileSync(junitPath, toJUnit(agg.suites));
+      }
+      for (const s of agg.suites) console.log(`${s.result.pass ? 'pass' : 'FAIL'}  ${s.name}  (${(s.result.steps || []).length} steps${s.result.pass ? '' : `, failed at ${s.result.failedAt}`})`);
+      console.log(`\n${agg.total - agg.failed}/${agg.total} scripts passed${junitPath ? `  ·  ${junitPath}` : ''}`);
+      process.exitCode = agg.pass ? 0 : 1;
+    }
   } finally { await cp.close(); }
 } else if (cmd === 'coverage') {
   // The combined coir×copse capability at the shell: connect → clickSurface(live) → coverageJoin(coir's

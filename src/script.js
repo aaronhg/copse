@@ -225,3 +225,26 @@ export async function runScript(driver, script) {
   if (!out.steps.length) out.pass = false; // an empty script proves nothing
   return out;
 }
+
+/**
+ * Run several scripts in ONE session — the suite half of `copse run <dir>`. Scripts are
+ * independent tests, so by default the game is reset (driver.reload) BETWEEN them for
+ * isolation (the first runs on the fresh connect); `reset:false` chains them on shared
+ * state instead, and a driver without reload (a fake in tests) is a no-op either way.
+ * Returns an aggregate + the per-script results (feed `suites` straight to toJUnit).
+ * @param {any} driver
+ * @param {Array<{name:string, script:Script}>} scripts
+ * @param {{reset?:boolean}} [opts]
+ * @returns {Promise<{pass:boolean, total:number, failed:number, suites:Array<{name:string, result:Awaited<ReturnType<typeof runScript>>}>}>}
+ */
+export async function runScripts(driver, scripts, { reset = true } = {}) {
+  const suites = [];
+  let failed = 0;
+  for (let i = 0; i < scripts.length; i++) {
+    if (reset && i > 0 && typeof driver.reload === 'function') await driver.reload();
+    const result = await runScript(driver, scripts[i].script);
+    if (!result.pass) failed++;
+    suites.push({ name: scripts[i].name || scripts[i].script.name || `script-${i}`, result });
+  }
+  return { pass: failed === 0, total: scripts.length, failed, suites };
+}
