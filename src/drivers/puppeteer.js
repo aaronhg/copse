@@ -271,8 +271,22 @@ export async function connect(url, opts = {}) {
     // register framework adapters (PureMVC etc.) into the fresh __copse before anything reads state
     for (const a of fwAdapters) { try { await frame.evaluate((x) => { try { window.__copse.registerFramework && window.__copse.registerFramework(x); } catch { /* */ } }, adapterToInjectable(a)); } catch { /* */ } }
     if (fps != null) await rawEv((f) => { const G = window.cc.game; try { G.frameRate = f; } catch {} try { G.setFrameRate && G.setFrameRate(f); } catch {} }, fps);
-    for (let i = 0, n = opts.readyTries ?? 25; i < n; i++) {
-      if (await rawEv(() => { try { return window.__copse.interactive().length > 0; } catch { return false; } })) break;
+    // Wait until the scene is actually LIVE before returning. A slow headless-CI SwiftShader renderer
+    // can take 20s+ to boot the first scene (pptr.dev/troubleshooting), and returning early makes the
+    // caller's first coverage/press read a null/empty scene. Break as soon as there are interactive
+    // buttons (fully ready); track `alive` so a genuinely button-less scene can still stop the wait
+    // once it's up rather than spinning the whole budget on a loading screen. snapshot() degrades to
+    // [] until the scene is live, so these reads never throw.
+    for (let i = 0, n = opts.readyTries ?? 45; i < n; i++) {
+      const st = await rawEv(() => {
+        try {
+          const s = window.cc.director.getScene(); const alive = !!(s && (s.children || []).length);
+          let buttons = 0; try { buttons = window.__copse.interactive().length; } catch { /* pre-install */ }
+          return { alive, buttons };
+        } catch { return { alive: false, buttons: 0 }; }
+      });
+      if (st.buttons > 0) break;                       // fully ready (a live scene WITH pressable controls)
+      if (st.alive && i >= 8) break;                   // live but no buttons after a grace period → a genuinely button-less scene
       await sleep(1000);
     }
   };

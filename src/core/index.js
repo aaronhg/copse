@@ -76,6 +76,7 @@ const slimClick = (h) => {
  */
 export function snapshot(root, rt, { onlyInteractive = false, includeInactive = false, reachability = false, relevant = false, components = false } = {}) {
   const out = [];
+  if (!root) return out;   // a not-yet-booted / mid-swap / torn-down scene (getScene()===null) → empty snapshot, never a null-tree crash
   const visit = (node, path) => {
     const active = rt.isActive(node);
     if (!active && !includeInactive) return;
