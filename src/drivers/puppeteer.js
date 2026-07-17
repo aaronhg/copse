@@ -430,8 +430,16 @@ export async function connect(url, opts = {}) {
       await page.reload({ waitUntil: o.waitUntil || 'load' });
       frame = page.mainFrame();   // the navigation replaced every frame; bootInPage re-finds the cc one
       await bootInPage();
-      const snap = await ev(() => window.__copse.snapshot({ relevant: true }));
-      const inter = await ev(() => window.__copse.interactive());
+      // bootInPage waits for a cc frame + interactive buttons, but a fresh navigation in a slow
+      // (headless CI) renderer can still be MID scene-swap when we read — poll for a LIVE scene so
+      // the summary snapshot below (and the caller's very next step, e.g. runScripts) don't hit a
+      // null getScene(). Belt-and-suspenders: the snapshot/interactive reads also degrade to [].
+      for (let i = 0; i < 40; i++) {
+        if (await rawEv(() => { try { const s = window.cc.director.getScene(); return !!(s && (s.children || []).length); } catch { return false; } })) break;
+        await sleep(200);
+      }
+      const snap = await ev(() => window.__copse.snapshot({ relevant: true })).catch(() => []);
+      const inter = await ev(() => window.__copse.interactive()).catch(() => []);
       return { ok: true, reloaded: true, url: page.url(), relevantNodes: snap.length, buttons: inter.length };
     },
     snapshot: (o) => ev((o) => window.__copse.snapshot(o), o ?? {}),
