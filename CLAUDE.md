@@ -17,7 +17,7 @@ It is the **runtime sibling to [coir](https://github.com/aaronhg/coir)** (at
 *running* scene's live UI tree. Both turn an opaque Cocos internal into structured
 data an AI (or a test) can query, and **both speak the same selector grammar**
 (`Parent/Child:Comp.prop`, `[i]` to disambiguate same-name siblings). The originating
-idea is `../aaron/canvas-ai-testing-plan.md` (the "make AI see into the canvas" plan,
+idea is an internal design note (the "make AI see into the canvas" plan,
 inspired by gstack's `/qa`); copse is the **runtime-pure-logic** route from it.
 
 Positioning vs generic CDP tooling: copse is the **Cocos scene layer over a CDP

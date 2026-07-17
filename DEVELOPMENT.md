@@ -18,7 +18,7 @@ events and **call their handlers directly** (serialized `clickEvents` via `Event
 In effect, integration/flow testing of the game's logic layer through the live object graph —
 fast, deterministic, no GPU.
 
-The originating idea is `../aaron/canvas-ai-testing-plan.md` ("make AI see into the canvas",
+The originating idea is an internal design note ("make AI see into the canvas",
 inspired by gstack's `/qa`). copse is the **runtime-pure-logic** route from it — see §16 for
 how the realisation diverged from that plan.
 
@@ -369,7 +369,7 @@ plain tool-use loop) the harness — no need to grow copse's own loop.
 
 ## 16. Relationship to the Originating Plan
 
-Compared to `canvas-ai-testing-plan.md`:
+Compared to that originating plan:
 
 - **Same thesis, validated**: AI + structured UI data + diff-awareness = autonomous QA; the AI
   decides *what* to test. copse's `plan`/`judge` is exactly this, and it ran on real games.
