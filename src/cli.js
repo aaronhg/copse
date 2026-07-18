@@ -54,8 +54,9 @@ const USAGE = `copse — drive & assert a running Cocos game
   copse call  <url> <path:Comp.method> [args…]  invoke a method (each arg JSON-parsed, else string)
   copse node  <url> <ref>                    node intrinsics (active/opacity/scale/worldPos/size)
   copse reachable <url> <ref>                best-effort: is the button covered by an overlay?
-  copse probe <url>                          engine-coupling self-diagnostic (version + which internals resolve)
+  copse doctor <url>                         health check: WebGL/scene/console + engine coupling → why won't it run (exit 0 booted / 1 not)
   copse coverage <url> <coir-rows.json>      coir×copse join → coverage buckets (rows = coir's static ClickEvent JSON; file or inline)
+  copse affected <risk.json|-> <tests-dir>   PURE (no game): which frozen tests a coir impact risk set touches (→ pick what to replay)
   copse run  <url> <script.json>             replay a frozen test script (docs/SCRIPTS.md) → result JSON; exit 0 pass / 1 fail (CI)
   copse run  <url> <dir> [--junit <file>]    run every *.json in <dir> as a suite (reset between) → JUnit + exit 0/1 (CI)
 
@@ -155,14 +156,38 @@ if (cmd === 'mcp') {
     console.log(J(r));
     process.exitCode = (r && r.ok === false) ? 1 : 0; // ok:false → non-zero so scripts can branch
   } finally { await cp.close(); }
-} else if (cmd === 'probe') {
-  // single-shot with NO selector: connect → __copse.probe() → print the engine-coupling diagnostic.
-  // Run it on an unfamiliar build to see whether copse's version-sensitive internals resolve here.
+} else if (cmd === 'doctor') {
+  // Health check — the "why won't it even run" verb (folds in the old `probe` + the boot diagnostic).
+  // connect → environment/boot (WebGL renderer, scene populated, game console errors) + copse's
+  // engine-coupling → ONE report; exit 0 if the game booted, 1 if not. Run it first when a build
+  // won't drive in headless CI (e.g. no software Vulkan device → NULL WebGL → empty scene).
   const target = url || connectOpts.match;
-  if (!target && !connectOpts.attach) { console.error(`probe: a <url> (or --attach [--match <substr>]) is required\n\n${USAGE}`); process.exit(1); } // bare --attach → active tab
+  if (!target && !connectOpts.attach) { console.error(`doctor: a <url> (or --attach [--match <substr>]) is required\n\n${USAGE}`); process.exit(1); } // bare --attach → active tab
   const { connect } = await import('./drivers/puppeteer.js');
   const cp = await connect(target, connectOpts);
-  try { console.log(J(await cp.probe())); } finally { await cp.close(); }
+  const val = (r) => (r && typeof r === 'object' && 'value' in r) ? r.value : r;
+  try {
+    const webgl = val(await cp.eval("(()=>{try{const c=document.createElement('canvas');const g=c.getContext('webgl2')||c.getContext('webgl');const e=g&&g.getExtension('WEBGL_debug_renderer_info');return g?((g instanceof WebGL2RenderingContext?'webgl2 ':'webgl1 ')+(e?g.getParameter(e.UNMASKED_RENDERER_WEBGL):'ctx-ok')):'NULL-CONTEXT'}catch(e){return 'ERR:'+e.message}})()").catch(() => 'eval-failed'));
+    const scene = val(await cp.eval("(()=>{try{const s=window.cc&&window.cc.director&&window.cc.director.getScene&&window.cc.director.getScene();return s?{name:s.name,children:(s.children||[]).length}:'NO-SCENE'}catch(e){return 'ERR:'+e.message}})()").catch(() => 'eval-failed'));
+    const cc = val(await cp.eval("(()=>{try{return{hasCc:!!window.cc,hasDirector:!!(window.cc&&window.cc.director),game:!!(window.cc&&window.cc.game),canvases:document.querySelectorAll('canvas').length}}catch(e){return 'ERR:'+e.message}})()").catch(() => 'eval-failed'));
+    const errors = (cp.logs({ level: ['error', 'pageerror'], tail: 20 }) || []).map((l) => l.text);
+    const coupling = await cp.probe().catch(() => null);
+    const booted = scene && typeof scene === 'object' && scene.children > 0;
+    console.log(J({ ok: booted, webgl, scene, cc, errors, coupling }));
+    process.exitCode = booted ? 0 : 1;
+  } finally { await cp.close(); }
+} else if (cmd === 'affected') {
+  // Pure (NO game): which frozen flow tests a change affects — the runtime-format sibling of coir's
+  // `impact`. <risk> = coir's `impact -o json` (file path or '-' for stdin); <dir> = the test scripts.
+  // A CI picks which tests to replay for a diff without launching Chrome. -> {affected, skipped, sceneOnly}.
+  const pos = rest.filter((a, i) => (a === '-' || !/^-/.test(a)) && !VAL_FLAGS.has(rest[i - 1]));
+  const riskSrc = pos[0], testsDir = pos[1];
+  if (!riskSrc || !testsDir) { console.error(`affected: a risk JSON (coir impact -o json; file path or '-' for stdin) and a tests dir are required, e.g. coir impact --patch d -o json | copse affected - tests/\n\n${USAGE}`); process.exit(1); }
+  let risk; try { risk = JSON.parse(riskSrc === '-' ? readFileSync(0, 'utf8') : readFileSync(riskSrc, 'utf8')); } catch (e) { console.error(`affected: couldn't read/parse risk from "${riskSrc}": ${e.message}`); process.exit(1); }
+  let files; try { files = readdirSync(testsDir).filter((f) => f.endsWith('.json')).sort(); } catch (e) { console.error(`affected: couldn't read tests dir "${testsDir}": ${e.message}`); process.exit(1); }
+  const tests = files.map((f) => ({ name: f, script: JSON.parse(readFileSync(join(testsDir, f), 'utf8')) }));
+  const { affectedData } = await import('./coverage.js');
+  console.log(J(affectedData(risk, tests)));
 } else if (cmd === 'run') {
   // Deterministic replay: connect → runScript(script.json) → result JSON → exit code for CI.
   // The zero-LLM half of the test loop (docs/SCRIPTS.md) — scripts come from a dumped MCP

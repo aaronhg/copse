@@ -22,7 +22,8 @@ function fakeCp() {
     node(ref) { this.calls.push(['node', ref]); return { ok: true, active: true }; },
     diff(a, b) { this.calls.push(['diff', a, b]); return { appeared: [{ ref: 'Canvas/Panel' }], disappeared: [], activated: [], deactivated: [], labelChanged: [] }; },
     listeners(ref) { this.calls.push(['listeners', ref]); return [{ type: 'click', fn: 'onBuy' }]; },
-    probe() { this.calls.push(['probe']); return { version: '3.8.6', framework: { kind: 'puremvc' }, ok: true }; },
+    async probe() { this.calls.push(['probe']); return { version: '3.8.6', framework: { kind: 'puremvc' }, ok: true }; },
+    async eval(expr) { this.calls.push(['eval', expr]); return { ok: true, value: { name: 'game', children: 2 } }; },
     orient() { this.calls.push(['orient']); return { url: 'http://x/', scene: 'game1', engine: '3.8.6', framework: { kind: 'puremvc', registered: 1, capabilities: { proxy: true } }, buttons: 3, entryPoints: ['Canvas/Btn'], hint: 'press an entryPoint' }; },
     logs(arg = 0) {
       this.calls.push(['logs', arg]);
@@ -78,7 +79,7 @@ test('tools registry: each tool has name/description/object inputSchema; core to
     assert.equal(typeof t.run, 'function');
   }
   const names = TOOLS.map((t) => t.name);
-  for (const n of ['connect', 'reload', 'snapshot', 'interactive', 'click_surface', 'resolve', 'coverage', 'press', 'get', 'call', 'reachable', 'node', 'orient', 'probe', 'logs', 'close',
+  for (const n of ['connect', 'reload', 'snapshot', 'interactive', 'click_surface', 'resolve', 'coverage', 'affected', 'press', 'get', 'call', 'reachable', 'node', 'orient', 'doctor', 'logs', 'close',
     'run_script', 'dump_script',
     'watch', 'patch', 'patch_clear', 'patch_calls', 'framework', 'register_framework', 'pm_get', 'pm_set', 'pm_call', 'pm_patch', 'pm_notify', 'network', 'screenshot',
     'visual_check', 'visual_baseline',
@@ -149,6 +150,20 @@ test('tools/call dispatches to the Driver and wraps the result as MCP text conte
   assert.deepEqual(Object.keys(buckets).sort(), ['ambiguous', 'blocked', 'codeOnly', 'codeRegistered', 'covered', 'uncertain', 'unreached']);
   assert.equal(buckets.covered.length, 1); // exact (Canvas/Btn,onBuy) match, reachable:true → covered
   assert.equal(buckets.covered[0].nodePath, 'Canvas/Btn');
+  // affected: PURE (no live session) — a coir `impact` risk set → which frozen flow tests it affects.
+  // Same tail-match key as coverage, but the live surface is replaced by the test scripts.
+  const aff = await handle({ id: 5.8, method: 'tools/call', params: { name: 'affected', arguments: {
+    risk: { impactedButtons: [{ nodePath: 'fixture/Canvas/AttackBtn', method: 'onAttack' }], impactedScenes: [] },
+    tests: [
+      { name: 'combat', script: { steps: [{ op: 'press', ref: 'Canvas/AttackBtn' }] } },
+      { name: 'menu', script: { steps: [{ op: 'press', ref: 'Canvas/StartBtn' }] } },
+    ],
+  } } });
+  const affJ = JSON.parse(aff.result.content[0].text);
+  assert.equal(affJ.affected.length, 1);
+  assert.equal(affJ.affected[0].name, 'combat');  // Canvas/AttackBtn tail-matches across coir's fixture/ scene-root prefix
+  assert.deepEqual(affJ.skipped, ['menu']);
+  assert.equal(affJ.sceneOnly, false);
   await handle({ id: 6, method: 'tools/call', params: { name: 'call', arguments: { sel: 'Canvas/Mgr:Ctrl.buy', args: [30] } } });
   assert.deepEqual(cp.calls.at(-1), ['call', 'Canvas/Mgr:Ctrl.buy', [30]]);
 
@@ -340,7 +355,7 @@ test('screenshot returns an MCP image block inline, or a path when written to di
   assert.equal(JSON.parse(toDisk.result.content[0].text).path, '/tmp/shot.png');
 });
 
-test('inspection tools dispatch to the Driver (diff/listeners/probe)', async () => {
+test('inspection tools dispatch to the Driver (diff/listeners/doctor)', async () => {
   const cp = fakeCp();
   const handle = createDispatcher({ cp });
 
@@ -350,9 +365,12 @@ test('inspection tools dispatch to the Driver (diff/listeners/probe)', async () 
 
   await handle({ id: 2, method: 'tools/call', params: { name: 'listeners', arguments: { ref: 'Canvas/Btn' } } });
   assert.deepEqual(cp.calls.at(-1), ['listeners', 'Canvas/Btn']);
-  const p = await handle({ id: 3, method: 'tools/call', params: { name: 'probe', arguments: {} } });
-  assert.deepEqual(cp.calls.at(-1), ['probe']);
-  assert.equal(JSON.parse(p.result.content[0].text).version, '3.8.6');
+  const p = await handle({ id: 3, method: 'tools/call', params: { name: 'doctor', arguments: {} } });
+  const doc = JSON.parse(p.result.content[0].text);
+  assert.equal(doc.ok, true);                          // fake scene reports children:2 > 0
+  assert.equal(doc.coupling.version, '3.8.6');         // doctor folds the old probe output under `coupling`
+  assert.ok(cp.calls.some((c) => c[0] === 'eval'));    // …after running the boot-diag evals (webgl/scene/cc)
+  assert.ok(cp.calls.some((c) => c[0] === 'probe'));
   const o = await handle({ id: 4, method: 'tools/call', params: { name: 'orient', arguments: {} } });
   assert.deepEqual(cp.calls.at(-1), ['orient']);
   const oj = JSON.parse(o.result.content[0].text);

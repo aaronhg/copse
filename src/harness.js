@@ -34,11 +34,14 @@ import { snapshot as snap, press, get, call, reachable as coreReachable } from '
 /**
  * One copse command the plan wants to run.
  * @typedef {Object} Step
- * @property {'press'|'get'|'call'|'snapshot'|'interactive'} op
+ * @property {'press'|'get'|'call'|'snapshot'|'interactive'|'sleep'|'patch'|'eval'} op
  * @property {string} [ref]   node ref — for `press`
- * @property {string} [sel]   selector — for `get` / `call`
+ * @property {string} [sel]   selector — for `get` / `call` / `patch`
  * @property {any[]} [args]   arguments — for `call`
  * @property {any} [opts]     options — for `press` (e.g. `{force:true}`) / `snapshot`
+ * @property {number} [ms]    duration — for `sleep`
+ * @property {any} [hooks]    {before?,after?,replace?} — for `patch`
+ * @property {string} [expr]  expression — for `eval`
  * @property {string} [note]  free-text intent, surfaced to the judge/log
  */
 
@@ -138,6 +141,12 @@ async function execStep(driver, step, gates) {
       case 'call':        { const r = await driver.call(step.sel, ...(step.args || [])); await visualConfirm(driver, r, gates); return r; }
       case 'snapshot':    return await driver.snapshot(step.opts);
       case 'interactive': return await driver.interactive();
+      // Timing + setup ops so an AI plan can pace a turn-based/animated game (sleep between
+      // presses), pin RNG (patch), or read arbitrary state (eval) — the same vocab the frozen
+      // runner (script.js) has. patch/eval degrade to unsupported-op when the driver lacks them.
+      case 'sleep':       await new Promise((r) => setTimeout(r, step.ms || 0)); return { ok: true };
+      case 'patch':       return typeof driver.patch === 'function' ? await driver.patch(step.sel, step.hooks || {}) : { ok: false, reason: 'unsupported-op', op: step.op };
+      case 'eval':        return typeof driver.eval === 'function' ? await driver.eval(step.expr) : { ok: false, reason: 'unsupported-op', op: step.op };
       default:            return { ok: false, reason: 'unknown-op', op: step.op };
     }
   } catch (e) {

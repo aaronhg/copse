@@ -12,7 +12,7 @@
 // (server.js filters by this tag). They stay callable by name regardless, so tests/power-users
 // aren't blocked.
 
-import { resolveCoirPath, coverageJoin } from '../coverage.js';
+import { resolveCoirPath, coverageJoin, affectedData } from '../coverage.js';
 import { runScript, truncate } from '../script.js';
 
 const needCp = (state) => {
@@ -42,9 +42,9 @@ export const FAMILY = {
   reachable: 'usable', visual_check: 'usable', visual_baseline: 'usable',
   watch: 'observe', logs: 'observe', network: 'observe', screenshot: 'observe', hold: 'observe', release: 'observe', hold_status: 'observe',
   patch: 'fix', patch_clear: 'fix', patch_calls: 'fix', pm_patch: 'fix',
-  coverage: 'coverage', click_surface: 'coverage', resolve: 'coverage',
+  coverage: 'coverage', click_surface: 'coverage', resolve: 'coverage', affected: 'coverage',
   run_script: 'script', dump_script: 'script',
-  orient: 'orient', probe: 'orient', framework: 'orient', register_framework: 'orient',
+  orient: 'orient', doctor: 'orient', framework: 'orient', register_framework: 'orient',
   eval: 'escape', // its own family: the raw escape hatch, NOT a peer of press/call — no ★ (never reach for it first)
   break_at: 'debug', break_in: 'debug', break_exceptions: 'debug', wait_pause: 'debug', eval_frame: 'debug', debug_step: 'debug', clear_breakpoints: 'debug',
 };
@@ -253,10 +253,25 @@ export const TOOLS = [
     run: async (state) => ({ data: await needCp(state).orient() }),
   },
   {
-    name: 'probe',
-    description: "Engine-coupling self-diagnostic — run once on an unfamiliar build to see whether copse's version-sensitive internals resolve on THIS Cocos version, instead of finding out via a silent 'unsure'. Read-only (non-invasive). Returns {version, classes (which cc.* globals present), reach (batcher2D/getFirstRenderCamera/cameraPriority), events (eventProcessor/shouldHandleEventTouch/tableKey/infosKey), touch, framework}. Any 'absent'/'unknown' is a tier that falls back or fails loud here (e.g. getFirstRenderCamera:false → reachable uses the camOf heuristic). `orient` is the higher-level 'where am I'; this is the low-level version-drift check.",
+    name: 'doctor',
+    description: "Health check — 'why won't it even run'. ONE call: environment/boot (WebGL renderer, whether the scene actually populated, the GAME's console/pageerrors) + copse's engine-coupling (Cocos version, which version-sensitive cc.* internals resolve here). `ok:false` when the scene never came up (empty tree — e.g. a headless CI with no software Vulkan device → NULL WebGL context → Cocos builds no scene). The low-level 'is the plumbing healthy' counterpart to `orient` ('where am I', which assumes a booted game). Read-only. Returns {ok, webgl, scene, cc, errors, coupling}.",
     inputSchema: { type: 'object', properties: {} },
-    run: async (state) => ({ data: await needCp(state).probe() }),
+    run: async (state) => {
+      const cp = needCp(state);
+      const v = (r) => (r && typeof r === 'object' && 'value' in r) ? r.value : r;
+      const webgl = v(await cp.eval("(()=>{try{const c=document.createElement('canvas');const g=c.getContext('webgl2')||c.getContext('webgl');const e=g&&g.getExtension('WEBGL_debug_renderer_info');return g?((g instanceof WebGL2RenderingContext?'webgl2 ':'webgl1 ')+(e?g.getParameter(e.UNMASKED_RENDERER_WEBGL):'ctx-ok')):'NULL-CONTEXT'}catch(e){return 'ERR:'+e.message}})()").catch(() => 'eval-failed'));
+      const scene = v(await cp.eval("(()=>{try{const s=window.cc&&window.cc.director&&window.cc.director.getScene&&window.cc.director.getScene();return s?{name:s.name,children:(s.children||[]).length}:'NO-SCENE'}catch(e){return 'ERR:'+e.message}})()").catch(() => 'eval-failed'));
+      const cc = v(await cp.eval("(()=>{try{return{hasCc:!!window.cc,hasDirector:!!(window.cc&&window.cc.director),game:!!(window.cc&&window.cc.game),canvases:document.querySelectorAll('canvas').length}}catch(e){return 'ERR:'+e.message}})()").catch(() => 'eval-failed'));
+      const errors = (cp.logs({ level: ['error', 'pageerror'], tail: 20 }) || []).map((l) => l.text);
+      const coupling = await cp.probe().catch(() => null);
+      return { data: { ok: !!(scene && typeof scene === 'object' && scene.children > 0), webgl, scene, cc, errors, coupling } };
+    },
+  },
+  {
+    name: 'affected',
+    description: "PURE (no game): which frozen flow tests a change affects — the runtime-format sibling of coir's `impact`. Pass `risk` (a coir `impact` result: {impactedButtons:[{nodePath}], impactedScenes:[]}) and `tests` (the flow scripts). A test is affected iff a nodePath it drives (its press refs / get sels / cc.find in evals) tail-matches an impacted button's nodePath — the same key `coverage` joins on, but the live surface is replaced by the test scripts. A scene-level impact keeps all tests (sceneOnly). Returns {affected:[{name,hits}], skipped, sceneOnly}.",
+    inputSchema: { type: 'object', properties: { risk: { type: 'object', description: "a coir impact result" }, tests: { type: 'array', items: { type: 'object' }, description: "[{name, script:{steps:[…]}}] — the flow scripts" } }, required: ['risk', 'tests'] },
+    run: async (state, a) => ({ data: affectedData(a.risk, a.tests || []) }),
   },
   {
     name: 'logs',
