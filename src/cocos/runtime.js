@@ -9,12 +9,14 @@
 //   • cocosRuntimeLite(cc) — base only, NO reachable (the minimal driver a `press`-only caller
 //     needs; inject-lite.js). The reachability code (~half the engine layer) lives in reachable.js
 //     and is imported ONLY by the full runtime, so esbuild tree-shakes it out of the lite bundle.
-import { snapshot, clickSurface, resolve, press, get, call, reachable, node, diff, splitMember } from '../core/index.js';
+import { snapshot, resolve, press, get, call, reachable, node, diff } from '../core/index.js';
+import { makeBridge } from '../core/bridge.js';
 import { makeReachable } from './reachable.js';
 import { makeVisualManifest, frameRectToViewport } from './visual.js';
 import { probe } from './probe.js';
-import { registerInto, describe, stateWith, callWith, patchTargetWith, notifyWith, retrieveWith } from './framework.js';
-import { jsonSafe, parseDur, safeVal, safeBool } from './eval-cond.js';
+import { makeCocosSurface, findAnchors, namedRefs } from './anchors.js';
+import { refOf } from '../core/refpath.js';
+import { safeBool } from '../core/eval-cond.js';
 
 const stripCc = (t) => (typeof t === 'string' && t.startsWith('cc.') ? t.slice(3) : t);
 
@@ -50,6 +52,10 @@ function baseRuntime(cc) {
     getComponent: (n, type) =>
       n.getComponent(type) || (cc[stripCc(type)] && n.getComponent(cc[stripCc(type)])) || n.getComponent(stripCc(type)) || null,
     readProp: (c, p) => c[p],
+    // node intrinsics for the tree recorder: LOCAL position (3.x Vec3 / 2.x x,y) rounded to drop sub-pixel
+    // jitter, and opacity (3.x UIOpacity component / 2.x node.opacity). null when unavailable.
+    position: (n) => { try { const p = n.position || (n.x != null ? { x: n.x, y: n.y } : null); return p ? [Math.round(p.x), Math.round(p.y)] : null; } catch { return null; } },
+    opacity: (n) => { try { const o = cc.UIOpacity ? n.getComponent(cc.UIOpacity) : null; return o ? o.opacity : (typeof n.opacity === 'number' ? n.opacity : null); } catch { return null; } },
     callMethod: (c, m, args) => (typeof c[m] === 'function' ? c[m](...args) : undefined),
     asButton: (n) => (Button ? n.getComponent(Button) : n.getComponent('cc.Button')) || null,
     isInteractable: (b) => b.interactable !== false,
@@ -258,127 +264,12 @@ export function install(cc, target = globalThis) {
   const rt = cocosRuntime(cc);
   const root = () => cc.director.getScene();
 
-  const nap = (ms) => new Promise((r) => setTimeout(r, ms));
-
-  // ---- watch: a diff-only TIMELINE of exprs/selectors over time (state-machine observation) ----
-  // The whole poll loop runs IN-PAGE in one call, so a caller (the puppeteer driver / MCP) makes a
-  // single request instead of N per-tick round-trips. Records ONLY changed keys, with relative
-  // timestamps {t, dt}. Duration parse + in-page condition eval are the shared eval-cond.js helpers
-  // (safeVal/safeBool/parseDur), the same `until` gates through — one condition vocabulary, two tools.
-  /** @param {{exprs?:string[], selectors?:string[], interval?:string|number, until?:string, timeout?:string|number, settle?:string|number}} [o] */
-  async function watchImpl(o = {}) {
-    const { exprs = [], selectors = [], interval, until, timeout, settle } = o;
-    const iv = Math.max(50, parseDur(interval, 1000)), to = parseDur(timeout, 40000), st = parseDur(settle, 0);
-    const sample = () => {
-      const s = {};
-      for (const e of exprs) s['{' + e + '}'] = safeVal(e);
-      for (const sel of selectors) { try { const r = get(root(), rt, sel); s[sel] = r && r.ok ? jsonSafe(r.value) : ('⚠ ' + ((r && r.reason) || 'err')); } catch (err) { s[sel] = '⚠ ' + ((err && err.message) || err); } }
-      return s;
-    };
-    const hit = () => safeBool(until);
-    const t0 = Date.now(); const timeline = []; let last = {}, lastT = t0;
-    const rec = () => {
-      const cur = sample(); const ch = {};
-      for (const k of Object.keys(cur)) if (JSON.stringify(cur[k]) !== JSON.stringify(last[k])) ch[k] = cur[k];
-      if (Object.keys(ch).length) { const now = Date.now(); timeline.push({ t: now - t0, dt: now - lastT, changes: ch }); lastT = now; }
-      last = cur;
-    };
-    rec();                                            // t=0 baseline (everything reads as "changed" from nothing)
-    let stoppedBy = 'timeout';
-    while (true) {
-      if (hit()) { stoppedBy = 'until'; break; }
-      if (Date.now() - t0 >= to) { stoppedBy = 'timeout'; break; }
-      await nap(iv); rec();
-    }
-    if (stoppedBy === 'until' && st > 0) { const end = Date.now() + st; while (Date.now() < end) { await nap(iv); rec(); } }
-    return { timeline, stoppedBy, elapsed: Date.now() - t0, samples: timeline.length };
-  }
-
-  // ---- patch: wrap a live component method to verify a fix WITHOUT rebuilding ----
-  // Wraps the method on the INSTANCE (scoped, restorable), binds `this` correctly, and runs the
-  // before/after hooks under try/catch so a buggy hook can't break the original call — the three
-  // things testers kept getting wrong hand-writing monkey-patches on the running game.
-  const PATCHES = target.__copsePatches || (target.__copsePatches = new Map());
-  const compileHook = (src) => { if (!src) return null; if (typeof src === 'function') return src; return (0, eval)('(' + src + ')'); };
-  // Cheap, cycle-safe truncation for traced args/ret — a live component graph is huge/circular.
-  const traceVal = (v, d = 0) => {
-    if (v === null || typeof v !== 'object') return typeof v === 'string' && v.length > 120 ? v.slice(0, 120) + '…' : v;
-    if (d >= 3) return '…';
-    if (Array.isArray(v)) { const h = v.slice(0, 8).map((x) => traceVal(x, d + 1)); if (v.length > 8) h.push(`…(+${v.length - 8})`); return h; }
-    const o = {}; let i = 0;
-    for (const k of Object.keys(v)) { if (i++ >= 12) { o['…'] = 1; break; } try { o[k] = traceVal(v[k], d + 1); } catch { o[k] = '…'; } }
-    return o;
-  };
-
-  // ---- framework adapters (SUGGESTIONS #4): the per-session registry (core ships none) ----
-  // Populated by registerFramework — the driver auto-injects adapters from copse.frameworks.mjs; probe
-  // reads the same store off globalThis. describe/stateWith/callWith are the generic (framework.js) engine.
-  const FW = target.__copseFrameworks || (target.__copseFrameworks = []);
-  const restore = (sel) => { const p = PATCHES.get(sel); if (!p) return false; try { if (p.hadOwn) p.target[p.member] = p.orig; else delete p.target[p.member]; } catch { /* */ } PATCHES.delete(sel); return true; };
-  // Shared wrap machinery for BOTH patch (a cc component instance) and pm_patch (a PureMVC proxy/mediator
-  // instance, or a command CLASS prototype) — same before/after/replace hooks, trace, and restore.
-  function wrapTarget(sel, tgt, member, hooks) {
-    if (typeof tgt[member] !== 'function') return { ok: false, reason: 'not-a-method', ref: sel };
-    let before, after, replace;
-    try { before = compileHook(hooks.before); after = compileHook(hooks.after); replace = compileHook(hooks.replace); }
-    catch (e) { return { ok: false, reason: 'bad-hook', error: (e && e.message) || String(e) }; }
-    if (PATCHES.has(sel)) restore(sel);              // re-patching the same selector replaces
-    const hadOwn = Object.prototype.hasOwnProperty.call(tgt, member);
-    const orig = tgt[member];
-    const errors = [];
-    // trace:true records each call {t (ms since patch), args, ret[, threw]} into a ring buffer — read
-    // via patch_calls. The runtime companion to coir's STATIC command flow: confirm real order + timing live.
-    const trace = !!hooks.trace; const traceMax = hooks.traceMax || 200; const calls = []; const t0 = Date.now();
-    const wrapper = function (...args) {
-      let a = args; const started = Date.now();
-      if (before) { try { const r = before(a, this); if (Array.isArray(r)) a = r; } catch (e) { errors.push('before: ' + ((e && e.message) || e)); } }
-      let ret, threw = null;
-      try { ret = replace ? replace(a, this) : orig.apply(this, a); } catch (e) { threw = e; }   // orig/replace throw still propagates (below)
-      if (after && !threw) { try { const r = after(a, ret, this); if (r !== undefined) ret = r; } catch (e) { errors.push('after: ' + ((e && e.message) || e)); } }
-      if (trace) { calls.push({ t: started - t0, args: traceVal(a), ...(threw ? { threw: (threw && threw.message) || String(threw) } : { ret: traceVal(ret) }) }); if (calls.length > traceMax) calls.shift(); }
-      if (threw) throw threw;
-      return ret;
-    };
-    try { tgt[member] = wrapper; } catch (e) { return { ok: false, reason: 'unwritable', error: (e && e.message) || String(e) }; }
-    PATCHES.set(sel, { target: tgt, member, hadOwn, orig, errors, calls });
-    return { ok: true, ref: sel, method: member, hooks: ['before', 'after', 'replace'].filter((k) => hooks[k]), ...(trace ? { trace: true } : {}) };
-  }
-  function patchImpl(sel, hooks = {}) {
-    let comp, member;
-    try { const p = splitMember(sel); const n = resolve(root(), rt, p.path); if (!n) return { ok: false, reason: 'not-found', ref: sel }; comp = rt.getComponent(n, p.comp); member = p.member; }
-    catch (e) { return { ok: false, reason: 'bad-selector', error: (e && e.message) || String(e) }; }
-    if (!comp) return { ok: false, reason: 'no-component', ref: sel };
-    return wrapTarget(sel, comp, member, hooks);
-  }
-  // pm_patch: wrap a PureMVC proxy/mediator method (instance) or a command's execute (class prototype),
-  // resolved through the registered adapter — so a game's app-layer flow (the 500 command chain) is
-  // traceable without rebuilding. Same hooks/trace/restore as patch; fail-loud when unresolvable.
-  function pmPatchImpl(sel, hooks = {}) {
-    const pt = patchTargetWith(target, FW, sel);
-    if (!pt.ok) return pt;
-    const r = wrapTarget(sel, pt.target, pt.member, hooks);
-    return r.ok ? { ...r, kind: pt.kind } : r;   // kind: 'instance' (proxy/mediator) | 'command' (class prototype)
-  }
-  // Read a traced patch's recorded calls (empty if the patch wasn't trace:true / doesn't exist).
-  function patchCallsImpl(sel) { const p = PATCHES.get(sel); return { ok: !!p, ref: sel, calls: p && p.calls ? p.calls.slice() : [] }; }
-  function patchClearImpl(sel) {
-    const errsOf = (k) => { const p = PATCHES.get(k); return p && p.errors.length ? p.errors.slice() : null; };
-    if (sel) { const he = errsOf(sel); const ok = restore(sel); return { ok: true, cleared: ok ? [sel] : [], ...(he ? { hookErrors: { [sel]: he } } : {}) }; }
-    const all = [...PATCHES.keys()]; const hookErrors = {};
-    for (const k of all) { const he = errsOf(k); if (he) hookErrors[k] = he; }
-    for (const k of all) restore(k);
-    return { ok: true, cleared: all, ...(Object.keys(hookErrors).length ? { hookErrors } : {}) };
-  }
-
-  // ---- hold: FREEZE the engine loop at a trigger so a transient state can be screenshot/inspected ----
-  // A self-running flow passes through intermediate states too fast to screenshot (an intermediate window
-  // can be ~1s). `hold` arms a ONE-SHOT patch on a trigger method (a component method, or a
-  // framework command/notification via pmMode); when it fires, the engine main loop is paused — the last
-  // frame stays on the canvas (screenshot captures it) and reads (get/pm_get/snapshot) still work, since
-  // they don't need the loop. `release` resumes. Freeze is version-adaptive (cc.game.pause → director.pause),
-  // fails LOUD when neither resolves (copse convention). Boundary: pausing freezes EVERYTHING that runs
-  // through the engine loop (scheduler/tween/animation/engine callbacks); a state driven by a bare
-  // browser setTimeout won't freeze, and a held game can't be driven further until release.
+  // ---- the ENGINE PORT: the only things src/core/bridge.js can't do without knowing it's Cocos ----
+  // Everything else on `__copse` (watch / patch / hold / pm* / orient / the read+drive surface) is
+  // engine-blind and lives in core/bridge.js, shared with any future engine layer (docs/ENGINES.md).
+  //
+  // Freeze is version-adaptive (cc.game.pause → cc.director.pause) and fails LOUD — `canFreeze`
+  // reports false when neither resolves, so `hold` refuses instead of silently no-op'ing.
   const freeze = () => {
     try { if (cc.game && typeof cc.game.pause === 'function') { cc.game.pause(); return 'game'; } } catch { /* */ }
     try { if (cc.director && typeof cc.director.pause === 'function') { cc.director.pause(); return 'director'; } } catch { /* */ }
@@ -386,98 +277,44 @@ export function install(cc, target = globalThis) {
   };
   const unfreeze = () => { let ok = false; try { if (cc.game && cc.game.resume) { cc.game.resume(); ok = true; } } catch { /* */ } try { if (cc.director && cc.director.resume) { cc.director.resume(); ok = true; } } catch { /* */ } return ok; };
   const canFreeze = () => !!((cc.game && cc.game.pause) || (cc.director && cc.director.pause));
-  let HOLD = null; // { sel, at, holdMs, active, via, t, timer } — one hold at a time
-  // the armed trigger hook (a direct closure — holdImpl runs in-page, so no global lookup needed) fires
-  // ONE-SHOT: freeze, record, unpatch the trigger so it can't re-fire.
-  function doHold() {
-    if (!HOLD || HOLD.active) return;                    // already fired, or released
-    const via = freeze();
-    HOLD.active = true; HOLD.via = via; HOLD.t = Date.now();
-    restore(HOLD.sel);                                    // one-shot: the trigger won't re-fire
-    if (HOLD.holdMs) HOLD.timer = setTimeout(() => { try { releaseImpl(); } catch { /* */ } }, HOLD.holdMs); // setTimeout is unaffected by the engine pause
-  }
-  /** @param {string} triggerSel @param {{at?:'before'|'after', holdMs?:number, pmMode?:boolean}} [opts] */
-  function holdImpl(triggerSel, { at = 'after', holdMs, pmMode } = {}) {
-    if (!canFreeze()) return { ok: false, reason: 'no-freeze-api', note: 'neither cc.game.pause nor cc.director.pause resolves on this build — cannot freeze the loop' };
-    if (HOLD) releaseImpl();                              // replace any prior hold (also unfreezes if held)
-    HOLD = { sel: triggerSel, at, holdMs, active: false, via: null, t: 0, timer: null };
-    const arm = (pmMode ? pmPatchImpl : patchImpl)(triggerSel, { [at]: () => doHold() });
-    if (!arm.ok) { HOLD = null; return arm; }
-    const kind = /** @type {any} */ (arm).kind;          // present only for a pmMode (command/instance) trigger
-    return { ok: true, armed: true, sel: triggerSel, at, ...(kind ? { kind } : {}), ...(holdMs ? { holdMs } : {}) };
-  }
-  function releaseImpl() {
-    if (!HOLD) return { ok: true, resumed: false, note: 'nothing held' };
-    const wasHeld = HOLD.active; const heldMs = wasHeld ? Date.now() - HOLD.t : 0;
-    if (HOLD.timer) { try { clearTimeout(HOLD.timer); } catch { /* */ } }
-    restore(HOLD.sel);                                    // clear the trigger if it never fired
-    const resumed = wasHeld ? unfreeze() : false;
-    HOLD = null;
-    return { ok: true, resumed, wasHeld, heldMs };
-  }
-  const holdStatusImpl = () => (HOLD ? { armed: !HOLD.active, held: !!HOLD.active, sel: HOLD.sel, via: HOLD.via, sinceMs: HOLD.active ? Date.now() - HOLD.t : 0 } : { armed: false, held: false });
 
   // node→screen-rect projection is the shared `visualManifest` (viewport CSS px, resolution-policy
   // correct) — `screenshot` reuses its `.rect` for clipping, so there's ONE projection, not two.
   const visualManifest = makeVisualManifestFn(cc, rt);
-  const api = {
-    snapshot: (opts) => snapshot(root(), rt, opts),
-    interactive: (opts) => snapshot(root(), rt, { onlyInteractive: true, reachability: true, ...opts }), // pressable list, with reachability
-    // join-ready click surface: one row per editor-wired clickEvent, keyed (ref, method) — the same
-    // key coir emits statically, so an agent can cross-reference static wiring with what's live now.
-    clickSurface: (opts) => clickSurface(snapshot(root(), rt, { onlyInteractive: true, reachability: (opts && opts.reachability) !== false, includeInactive: opts && opts.includeInactive })),
-    press: (path, opts) => press(root(), rt, path, opts),
-    get: (sel) => get(root(), rt, sel),
-    call: (sel, ...args) => call(root(), rt, sel, args),
-    reachable: (sel) => reachable(root(), rt, sel),       // { reachable, blockedBy }
-    node: (sel) => node(root(), rt, sel),                 // node intrinsics (active/opacity/scale/worldPos/size)
-    diff: (before, after) => diff(before, after),         // snapshot diff → appeared/activated/labelChanged/…
-    listeners: (sel) => { const n = resolve(root(), rt, sel); return n ? rt.codeHandlers(n) : null; },
-    // Node-anchored VISUAL manifest (screen rect + dynamic mask rects in viewport CSS px) — the companion to
-    // `reachable`; the driver screenshots + downsamples + compares (src/sensors/pixel.js). See makeVisualManifestFn.
-    visualManifest,
-    // orient: one-call bearings — scene + engine + framework capabilities + a few pressable entry points,
-    // so a newcomer/agent doesn't stitch probe + framework + interactive by hand after connect.
-    orient: () => {
-      const scene = root();
-      const inter = snapshot(root(), rt, { onlyInteractive: true, reachability: true });
-      const entryPoints = inter.filter((d) => d.reachable !== false && d.interactable !== false).slice(0, 8).map((d) => d.ref);
-      return {
-        scene: (scene && (scene.name || scene._name)) || null,
-        engine: (cc && cc.ENGINE_VERSION) || '?',
-        framework: { ...describe(target, FW), registered: FW.length },
-        buttons: inter.length,
-        entryPoints,
-      };
+
+  const api = makeBridge({
+    rt,
+    root,
+    target,
+    engine: {
+      freeze,
+      unfreeze,
+      canFreeze,
+      visualManifest,
+      probe: () => probe(cc, target),               // reads the framework registry off `target`
+      version: () => (cc && cc.ENGINE_VERSION) || '?',
     },
-    probe: () => probe(cc, target),                       // engine-coupling self-diagnostic (reads the framework registry off `target`)
-    logs: (since = 0) => (target.__copseLogs || []).filter((l) => l.t > since), // console + uncaught errors
-    watch: (opts) => watchImpl(opts),                     // diff-only timeline of exprs/selectors over time
-    patch: (sel, hooks) => patchImpl(sel, hooks),         // wrap a live method to verify a fix pre-rebuild
-    patch_clear: (sel) => patchClearImpl(sel),            // restore patched method(s)
-    patch_calls: (sel) => patchCallsImpl(sel),            // read a trace:true patch's recorded calls (order/timing)
-    hold: (sel, opts) => holdImpl(sel, opts),             // freeze the loop at a trigger → screenshot/inspect a transient state
-    release: () => releaseImpl(),                         // resume the loop (clears the hold/trigger)
-    hold_status: () => holdStatusImpl(),                  // { armed?, held?, sel, via, sinceMs }
-    registerFramework: (a) => registerInto(FW, a),        // install an adapter for this session (auto-loaded from copse.frameworks.mjs, or ad-hoc)
-    framework: () => ({ ...describe(target, FW), registered: FW.length }), // detect via registered adapters + enumerate proxies/mediators
-    pmGet: (sel) => stateWith(target, FW, sel, false),    // READ proxy/mediator state (outside the cc tree)
-    pmSet: (sel, value) => stateWith(target, FW, sel, true, value), // WRITE a proxy/mediator leaf
-    pmCall: (sel, args) => callWith(target, FW, sel, args), // call a proxy/mediator method
-    pmPatch: (sel, hooks) => pmPatchImpl(sel, hooks),     // wrap a proxy/mediator/command method (patch_clear/patch_calls apply)
-    pmNotify: (name, body, type) => notifyWith(target, FW, name, body, type), // fire a framework notification (direct flow entry)
-    rt, // exposed for ad-hoc poking from a console
-  };
-  // pm.* — the framework surface under a stable, discoverable namespace, ergonomic for `eval`: the snake_case
-  // TOOL names (pm_get) don't exist in-page (the members are camelCase), so `__copse.pm_get(...)` throws
-  // "is not a function". `pm.get/set/call/notify/patch` alias the camelCase members (ONE implementation, no
-  // divergence); `pm.proxy(name)`/`pm.mediator(name)` hand back the RAW live object for ad-hoc poking (no JSON
-  // boundary in-page) — what you'd otherwise dig out of puremvc.Facade.instance.retrieveProxy(...) by hand.
-  api.pm = {
-    get: api.pmGet, set: api.pmSet, call: (sel, ...args) => api.pmCall(sel, args),
-    notify: api.pmNotify, patch: api.pmPatch,
-    proxy: (name) => retrieveWith(target, FW, name),
-    mediator: (name) => retrieveWith(target, FW, name),
+  });
+  // anchors(): which nodes carry a GAME-authored component, and what is callable on it. On a dev
+  // build `snapshot({components:true})` already tells you the class names, so this is mostly
+  // redundant — its value is the RELEASE build, where those names are mangled to `e`/`t` while the
+  // methods survive intact. Same tool, same shape as the Pixi lane; different place to look
+  // (components, not the node itself). See docs/ENGINES.md §3 and src/cocos/anchors.js.
+  api.anchors = (opts = {}) => {
+    const scene = root();
+    if (!scene) return [];
+    const surface = makeCocosSurface(cc, scene);
+    return findAnchors(cc, scene, (n) => refOf(n, scene), { ...opts, surface })
+      .map(({ node: n, obj, ref, depth, tier, lifecycle, score, methods }) => {
+        const all = namedRefs(obj, surface, { isDisplay: (v) => !!(v && typeof v === 'object' && Array.isArray(v.children)) });
+        const cap = opts.namedCap ?? 25;
+        return {
+          ref, depth, tier, ...(lifecycle ? { lifecycle } : {}), score,
+          component: (obj && obj.constructor && obj.constructor.name) || 'Unknown',  // mangled on release — that's the point
+          sel: `${ref}:${(obj && obj.constructor && obj.constructor.name) || '?'}`,
+          methods, named: all.slice(0, cap), namedTotal: all.length,
+        };
+      });
   };
   target.__copse = api;
   return api;
@@ -627,6 +464,7 @@ export function installProbe(cc, target = globalThis) {
     until,   // --until HELD conditions (single source for both the CLI and the extension); returns pixelPending for `drawn`
     visualManifest, // node → viewport rect + mask rects, for the driver's `drawn` pixel confirm
     interactive: (opts) => snapshot(root(), rt, { onlyInteractive: true, reachability: true, ...opts }),
+    snapshot: (opts) => snapshot(root(), rt, opts), // full node tree (already bundled — used by find/interactive); the tree-recorder reads it with { motion:true, includeInactive:true }
     reachable: (sel) => reachable(root(), rt, sel),
     press: (path, opts) => press(root(), rt, path, opts),   // drive a node past intros (a `--until` press: action)
     assets: () => assetsPending(cc),

@@ -10,7 +10,7 @@
 // Best-effort geometric reachability (Rung 2+3): replay the engine's input z-order over the live
 // tree. See the returned method's contract below + CLAUDE.md "Capability boundary" for the honest
 // limits (no alpha hit-areas, no event-penetration, single-frame; answers "would a TOUCH reach it").
-import { refOf } from './refpath.js';
+import { refOf } from '../core/refpath.js';
 
 // node → its rendering camera: the active camera whose `visibility` mask includes the node's `layer`,
 // taking the highest `priority`. Falls back to the first camera. (Cross-camera/Layer z-order.)

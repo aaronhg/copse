@@ -1,14 +1,15 @@
 #!/usr/bin/env node
 // @ts-check
 // copse CLI — the official entry (registered as `copse`, runs this file directly; no build).
-//   copse ai   <url> --goal "<what to test>" [--stop ..] [--report ..] [--rounds N] [--model ..]
 //   copse scan <url>                          # one-shot: print snapshot/interactive/labels
 //   copse mcp  [url] [--debug]                # JSON-RPC/stdio MCP server (see docs/MCP.md)
 //   copse get/press/call/node/reachable <url> <sel>   # single-shot primitive → JSON (pipe to jq)
+//   copse run  <url> <script.json|dir>        # replay a frozen flow script → exit 0/1 (CI)
+// (The AI-driver loop is NOT here — that's arbor's layer, built on copse's `execute` primitive.)
 //
-// Heavy/optional bits (puppeteer-core driver, the claude agent, the MCP server) are
-// LAZY-imported per command, so `copse --help` / `copse mcp` don't require puppeteer-core
-// and the common path stays light. Needs a built dist/copse.inject.js (npm run build).
+// Heavy/optional bits (puppeteer-core driver, the MCP server) are LAZY-imported per command, so
+// `copse --help` / `copse mcp` don't require puppeteer-core and the common path stays light.
+// Needs a built dist/copse.inject.js (npm run build).
 import { mkdirSync, createWriteStream, readFileSync, readdirSync, writeFileSync, statSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 
@@ -24,7 +25,7 @@ if (cmd === '--version' || cmd === '-V' || rest.includes('--version')) {
 }
 // value-taking flags — so the positional <url> finder below never grabs a flag's value
 // (e.g. `--browser-url http://…` must NOT be read as the game url, or `copse mcp` pre-opens it).
-const VAL_FLAGS = new Set(['--goal', '--stop', '--report', '--rounds', '--model', '--chrome', '--browser-url', '--fps', '--match', '--framework', '-o', '--output', '--junit']);
+const VAL_FLAGS = new Set(['--model', '--chrome', '--browser-url', '--fps', '--match', '--framework', '--engine', '-o', '--output', '--junit']);
 const url = rest.find((a, i) => /^https?:\/\//.test(a) && !VAL_FLAGS.has(rest[i - 1])); // declared AFTER VAL_FLAGS (no TDZ)
 const verbose = has('--verbose', '-v');
 const J = (x) => JSON.stringify(x, null, 2);
@@ -37,12 +38,11 @@ const connectOpts = {
   attach: has('--attach') || undefined,                     // drive an already-open tab (no navigation)
   match: flag('--match'),                                   // pick that tab by URL substring
   frameworks: flag('--framework') ? flag('--framework').split(',') : undefined, // extra adapter file(s) on top of copse.frameworks.mjs
+  engine: flag('--engine'),                                 // 'cocos' (default) | 'pixi' — see docs/ENGINES.md
 };
 
-const USAGE = `copse — drive & assert a running Cocos game
+const USAGE = `copse — drive & assert a running Cocos/Pixi game
 
-  copse ai   <url> --goal "<what to test>" [--stop "<when to stop>"] [--report "<format>"]
-                   [--rounds N] [--model sonnet|opus|...] [--chrome <path>] [--browser-url <url>]
   copse scan <url> [--chrome <path>]
   copse mcp  [url] [--debug]  start a JSON-RPC/stdio MCP server (any MCP client drives the game;
                     omit url to let the client's 'connect' tool choose — see docs/MCP.md;
@@ -55,8 +55,6 @@ const USAGE = `copse — drive & assert a running Cocos game
   copse node  <url> <ref>                    node intrinsics (active/opacity/scale/worldPos/size)
   copse reachable <url> <ref>                best-effort: is the button covered by an overlay?
   copse doctor <url>                         health check: WebGL/scene/console + engine coupling → why won't it run (exit 0 booted / 1 not)
-  copse coverage <url> <coir-rows.json>      coir×copse join → coverage buckets (rows = coir's static ClickEvent JSON; file or inline)
-  copse affected <risk.json|-> <tests-dir>   PURE (no game): which frozen tests a coir impact risk set touches (→ pick what to replay)
   copse run  <url> <script.json>             replay a frozen test script (docs/SCRIPTS.md) → result JSON; exit 0 pass / 1 fail (CI)
   copse run  <url> <dir> [--junit <file>]    run every *.json in <dir> as a suite (reset between) → JUnit + exit 0/1 (CI)
 
@@ -67,11 +65,12 @@ const USAGE = `copse — drive & assert a running Cocos game
            --attach [--match <substr>]   drive an ALREADY-OPEN tab in that Chrome without navigating
                          (for your game behind a login/staging gate you opened yourself) — needs --browser-url;
                          omit --match (and <url>) to drive the ACTIVE tab (the one you're looking at)
+           --engine <cocos|pixi>         engine layer (default cocos). pixi = PixiJS 8; injected
+                                         pre-boot, so it must be set at connect time. See docs/ENGINES.md
            --framework <file>[,<file>]   extra framework adapter file(s) (config/code) on top of the
                          auto-loaded copse.frameworks.mjs — enables framework/pm_get/pm_set/pm_call
 
-Setup:  npm run build   (produces dist/copse.inject.js)   +   npm i -D puppeteer-core
-The 'ai' command also needs the 'claude' CLI logged in.`;
+Setup:  npm run build   (produces dist/copse.inject.js)   +   npm i -D puppeteer-core`;
 
 if (!cmd || cmd === '-h' || cmd === '--help') { console.log(USAGE); process.exit(cmd ? 0 : 1); }
 
@@ -80,7 +79,7 @@ if (!cmd || cmd === '-h' || cmd === '--help') { console.log(USAGE); process.exit
 if (cmd === 'mcp') {
   const { startMcpServer } = await import('./mcp/server.js');
   await startMcpServer({ url, connectOpts, debug: has('--debug') }); // Debugger tools hidden by default; --debug surfaces them
-} else if (cmd === 'scan' || cmd === 'ai') {
+} else if (cmd === 'scan') {
   const target = url || connectOpts.match;                  // attach mode can use --match instead of a <url>
   if (!target && !connectOpts.attach) { console.error(`${cmd}: a <url> (or --attach [--match <substr>]) is required\n\n${USAGE}`); process.exit(1); } // bare --attach → active tab
   const outDir = flag('-o') || flag('--output');
@@ -103,36 +102,11 @@ if (cmd === 'mcp') {
       out('\ninteractive:\n' + J(inter));
       out('\nlabels:\n' + J(labels));
     } finally { await cp.close(); }
-  } else { // ai
-    const { runHarness } = await import('./index.js');
-    const { makeClaudeAgent } = await import('./agents/claude.js');
-    const goal = flag('--goal');
-    if (!goal) { console.error('ai: --goal is required\n\n' + USAGE); process.exit(1); }
-    out(`# goal: ${goal}`);
-    out('='.repeat(72));
-    const agent = makeClaudeAgent({
-      goal, stopCondition: flag('--stop', ''), reportFormat: flag('--report', ''), model: flag('--model', 'sonnet'),
-      onStage: (stage, info) => {
-        const c = info.cost ? ` ($${(info.cost.cost || 0).toFixed(4)})` : '';
-        if (stage === 'plan') { out(`\n===== ROUND ${info.round} =====\n[plan]${c} ${info.rationale || ''}`); (info.steps || []).forEach((s, i) => out(`  ${i + 1}. ${JSON.stringify(s)}`)); }
-        else if (stage === 'judge') { (info.steps || []).forEach((s) => { const r = JSON.stringify(s.result); out(`   ${JSON.stringify(s.step)} → ${verbose ? r : r.slice(0, 300)}`); }); out(`[judge]${c} ` + JSON.stringify(info.verdict)); }
-        else if (stage === 'next') out(`[next]${c} ` + JSON.stringify(info.decision));
-        else if (stage === 'report') out(`\n===== REPORT${c} =====\n` + info.summary);
-      },
-    });
-    const cp = await connect(target, connectOpts);
-    try {
-      const report = await runHarness(cp, agent, { context: { goal }, maxRounds: Number(flag('--rounds', '1')) });
-      out('\n===== DONE ===== pass: ' + report.pass + ' | rounds: ' + report.rounds.length);
-      const u = agent.usage ? agent.usage() : null;
-      if (u) out(`cost: $${u.cost.toFixed(4)} | ${u.calls} claude -p calls | tokens in/out ${u.inputTokens}/${u.outputTokens}` + (u.cost === 0 ? '  (cost $0 → likely a Claude subscription, not API billing)' : ''));
-      process.exitCode = report.pass ? 0 : 1;
-    } finally { await cp.close(); }
   }
   if (sink) sink.end();
 } else if (['get', 'press', 'call', 'node', 'reachable'].includes(cmd)) {
   // single-shot: connect → run ONE primitive → print the JSON result → close. Fills the gap
-  // between `scan` (read-only discovery) and `ai` (the whole LLM loop) — a quick shell-level
+  // between `scan` (read-only discovery) and `run` (a whole frozen flow) — a quick shell-level
   // press/get/call without writing a script or opening MCP. Prints raw JSON (pipe to jq).
   const target = url || connectOpts.match;
   if (!target && !connectOpts.attach) { console.error(`${cmd}: a <url> (or --attach [--match <substr>]) is required\n\n${USAGE}`); process.exit(1); } // bare --attach → active tab
@@ -163,35 +137,43 @@ if (cmd === 'mcp') {
   // won't drive in headless CI (e.g. no software Vulkan device → NULL WebGL → empty scene).
   const target = url || connectOpts.match;
   if (!target && !connectOpts.attach) { console.error(`doctor: a <url> (or --attach [--match <substr>]) is required\n\n${USAGE}`); process.exit(1); } // bare --attach → active tab
+  // doctor auto-detects the engine unless told: you run it precisely when you DON'T know what's
+  // wrong, so demanding --engine first would defeat the point. Pays a pre-injected Pixi bundle for
+  // the privilege — irrelevant for a one-shot diagnostic (see connect's `auto`).
+  // Only force auto when the caller hasn't pinned a bundle — bundlePath and auto are mutually
+  // exclusive (connect refuses the pair), and doctor must not manufacture that conflict itself.
+  const doctorOpts = { ...connectOpts, engine: connectOpts.engine || (connectOpts.bundlePath ? 'cocos' : 'auto') };
   const { connect } = await import('./drivers/puppeteer.js');
-  const cp = await connect(target, connectOpts);
+  const cp = await connect(target, doctorOpts);
   const val = (r) => (r && typeof r === 'object' && 'value' in r) ? r.value : r;
   try {
     const webgl = val(await cp.eval("(()=>{try{const c=document.createElement('canvas');const g=c.getContext('webgl2')||c.getContext('webgl');const e=g&&g.getExtension('WEBGL_debug_renderer_info');return g?((g instanceof WebGL2RenderingContext?'webgl2 ':'webgl1 ')+(e?g.getParameter(e.UNMASKED_RENDERER_WEBGL):'ctx-ok')):'NULL-CONTEXT'}catch(e){return 'ERR:'+e.message}})()").catch(() => 'eval-failed'));
-    const scene = val(await cp.eval("(()=>{try{const s=window.cc&&window.cc.director&&window.cc.director.getScene&&window.cc.director.getScene();return s?{name:s.name,children:(s.children||[]).length}:'NO-SCENE'}catch(e){return 'ERR:'+e.message}})()").catch(() => 'eval-failed'));
-    const cc = val(await cp.eval("(()=>{try{return{hasCc:!!window.cc,hasDirector:!!(window.cc&&window.cc.director),game:!!(window.cc&&window.cc.game),canvases:document.querySelectorAll('canvas').length}}catch(e){return 'ERR:'+e.message}})()").catch(() => 'eval-failed'));
+    // Probe the PAGE (not just the session) so the report names what is actually running there.
+    const onPage = val(await cp.eval("(()=>{try{const cocos=!!(window.cc&&window.cc.director&&window.cc.director.getScene&&window.cc.director.getScene());const app=(window.__copse&&window.__copse.app)||(window.__copsePixi&&window.__copsePixi.app)||(window.__PIXI_DEVTOOLS__&&window.__PIXI_DEVTOOLS__.app)||window.__PIXI_APP__;return{cocos,pixi:!!(app&&app.stage)}}catch(e){return{cocos:false,pixi:false}}})()").catch(() => ({ cocos: false, pixi: false })));
+    const pageEngine = onPage && onPage.pixi ? 'pixi' : onPage && onPage.cocos ? 'cocos' : null;
+    if (typeof cp.engineReady === 'function') await cp.engineReady();   // never branch on an engine auto hasn't resolved yet
+    const scene = val(await cp.eval((cp.engine === 'pixi'
+        ? "(()=>{try{const s=window.__copse&&window.__copse.app&&window.__copse.app.stage;return s?{name:(window.__copse.orient().scene||'stage'),children:(s.children||[]).length}:'NO-SCENE'}catch(e){return 'ERR:'+e.message}})()"
+        : "(()=>{try{const s=window.cc&&window.cc.director&&window.cc.director.getScene&&window.cc.director.getScene();return s?{name:s.name,children:(s.children||[]).length}:'NO-SCENE'}catch(e){return 'ERR:'+e.message}})()")).catch(() => 'eval-failed'));
+    const cc = val(await cp.eval((cp.engine === 'pixi'
+        ? "(()=>{try{const a=window.__copse&&window.__copse.app;return{hasPixi:!!a,hasStage:!!(a&&a.stage),hasTicker:!!(a&&a.ticker),canvases:document.querySelectorAll('canvas').length}}catch(e){return 'ERR:'+e.message}})()"
+        : "(()=>{try{return{hasCc:!!window.cc,hasDirector:!!(window.cc&&window.cc.director),game:!!(window.cc&&window.cc.game),canvases:document.querySelectorAll('canvas').length}}catch(e){return 'ERR:'+e.message}})()")).catch(() => 'eval-failed'));
     const errors = (cp.logs({ level: ['error', 'pageerror'], tail: 20 }) || []).map((l) => l.text);
     const coupling = await cp.probe().catch(() => null);
     const booted = scene && typeof scene === 'object' && scene.children > 0;
-    console.log(J({ ok: booted, webgl, scene, cc, errors, coupling }));
+    console.log(J({
+      ok: booted, webgl,
+      engine: pageEngine,
+      injected: cp.installed,
+      ...(pageEngine ? {} : { engineNote: 'no engine identified itself on this page — copse looked for a live cc.director scene and a Pixi Application (init hook / __PIXI_APP__ / devtools globals). A Pixi game is INVISIBLE here unless copse was injected pre-boot, because its init hook fires once during Application.init: re-run with --engine pixi to rule that in or out. Otherwise the page may be a release Cocos build whose `cc` was tree-shaken away (docs/INJECT.md), or simply not a canvas game.' }),
+      scene, [cp.engine === 'pixi' ? 'pixi' : 'cc']: cc, errors, coupling,
+    }));
     process.exitCode = booted ? 0 : 1;
   } finally { await cp.close(); }
-} else if (cmd === 'affected') {
-  // Pure (NO game): which frozen flow tests a change affects — the runtime-format sibling of coir's
-  // `impact`. <risk> = coir's `impact -o json` (file path or '-' for stdin); <dir> = the test scripts.
-  // A CI picks which tests to replay for a diff without launching Chrome. -> {affected, skipped, sceneOnly}.
-  const pos = rest.filter((a, i) => (a === '-' || !/^-/.test(a)) && !VAL_FLAGS.has(rest[i - 1]));
-  const riskSrc = pos[0], testsDir = pos[1];
-  if (!riskSrc || !testsDir) { console.error(`affected: a risk JSON (coir impact -o json; file path or '-' for stdin) and a tests dir are required, e.g. coir impact --patch d -o json | copse affected - tests/\n\n${USAGE}`); process.exit(1); }
-  let risk; try { risk = JSON.parse(riskSrc === '-' ? readFileSync(0, 'utf8') : readFileSync(riskSrc, 'utf8')); } catch (e) { console.error(`affected: couldn't read/parse risk from "${riskSrc}": ${e.message}`); process.exit(1); }
-  let files; try { files = readdirSync(testsDir).filter((f) => f.endsWith('.json')).sort(); } catch (e) { console.error(`affected: couldn't read tests dir "${testsDir}": ${e.message}`); process.exit(1); }
-  const tests = files.map((f) => ({ name: f, script: JSON.parse(readFileSync(join(testsDir, f), 'utf8')) }));
-  const { affectedData } = await import('./coverage.js');
-  console.log(J(affectedData(risk, tests)));
 } else if (cmd === 'run') {
   // Deterministic replay: connect → runScript(script.json) → result JSON → exit code for CI.
   // The zero-LLM half of the test loop (docs/SCRIPTS.md) — scripts come from a dumped MCP
-  // session / a frozen `copse ai` run / by hand.
+  // session / an arbor-frozen tripwire / by hand.
   const target = url || connectOpts.match;
   if (!target && !connectOpts.attach) { console.error(`run: a <url> (or --attach [--match <substr>]) is required\n\n${USAGE}`); process.exit(1); } // bare --attach → active tab
   const positionals = rest.filter((a, i) => !/^-/.test(a) && !VAL_FLAGS.has(rest[i - 1]) && a !== url);
@@ -232,25 +214,6 @@ if (cmd === 'mcp') {
       console.log(`\n${agg.total - agg.failed}/${agg.total} scripts passed${junitPath ? `  ·  ${junitPath}` : ''}`);
       process.exitCode = agg.pass ? 0 : 1;
     }
-  } finally { await cp.close(); }
-} else if (cmd === 'coverage') {
-  // The combined coir×copse capability at the shell: connect → clickSurface(live) → coverageJoin(coir's
-  // static rows) → the coverage buckets as JSON. <rows> is coir's ClickEvent JSON ([{nodePath, method}]) —
-  // a file path or inline; get it from coir's CLI/MCP. --no-reachable skips the reachable pass.
-  const target = url || connectOpts.match;
-  if (!target && !connectOpts.attach) { console.error(`coverage: a <url> (or --attach [--match <substr>]) is required\n\n${USAGE}`); process.exit(1); } // bare --attach → active tab
-  const positionals = rest.filter((a, i) => !/^-/.test(a) && !VAL_FLAGS.has(rest[i - 1]) && a !== url);
-  const src = positionals[0];
-  if (!src) { console.error(`coverage: a coir static-rows JSON (file path or inline) is required, e.g. copse coverage ${target || '<url>'} coir-rows.json\n\n${USAGE}`); process.exit(1); }
-  let raw = src; try { raw = readFileSync(src, 'utf8'); } catch { /* not a file → treat the arg as inline JSON */ }
-  let staticRows; try { staticRows = JSON.parse(raw); } catch (e) { console.error(`coverage: couldn't parse static rows from "${src}" — need a JSON file path or inline JSON array ([{nodePath, method}]): ${e.message}`); process.exit(1); }
-  if (!Array.isArray(staticRows)) { console.error('coverage: static rows must be a JSON ARRAY of {nodePath, method} (coir\'s ClickEvent edges)'); process.exit(1); }
-  const { coverageJoin } = await import('./coverage.js');
-  const { connect } = await import('./drivers/puppeteer.js');
-  const cp = await connect(target, connectOpts);
-  try {
-    const surface = await cp.clickSurface({ reachability: !has('--no-reachable') });
-    console.log(J(coverageJoin(staticRows, surface)));
   } finally { await cp.close(); }
 } else {
   console.error(`unknown command: ${cmd}\n\n` + USAGE); process.exit(1);

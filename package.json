@@ -7,12 +7,15 @@
     ".": "./src/index.js",
     "./sensors": "./src/sensors/pixel.js",
     "./driver-puppeteer": "./src/drivers/puppeteer.js",
-    "./agent-claude": "./src/agents/claude.js",
+    "./harness": "./src/harness.js",
     "./debug": "./src/debug.js",
     "./mcp": "./src/mcp/server.js",
     "./inject": "./dist/copse.inject.js",
     "./inject-lite": "./dist/copse.inject.lite.js",
-    "./inject-probe": "./dist/copse.inject.probe.js"
+    "./inject-probe": "./dist/copse.inject.probe.js",
+    "./inject-pixi": "./dist/copse.inject.pixi.js",
+    "./pixi": "./src/pixi/runtime.js",
+    "./package.json": "./package.json"
   },
   "bin": {
     "copse": "src/cli.js"
@@ -25,10 +28,11 @@
     "test": "node --test test/*.test.js",
     "typecheck": "tsc --noEmit",
     "prepare": "npm run build",
-    "build": "npm run build:full && npm run build:lite && npm run build:probe",
+    "build": "npm run build:full && npm run build:lite && npm run build:probe && npm run build:pixi",
     "build:full": "esbuild src/cocos/inject.js --bundle --format=iife --outfile=dist/copse.inject.js --banner:js='/* copse inject bundle (full) — exposes globalThis.copse + auto-installs window.__copse once cc is live. Rebuild: npm run build */'",
     "build:lite": "esbuild src/cocos/inject-lite.js --bundle --format=iife --outfile=dist/copse.inject.lite.js --banner:js='/* copse inject bundle (lite) — snapshot/press/get/call/node/diff only, NO reachability. Auto-installs window.__copse once cc is live. Rebuild: npm run build */'",
-    "build:probe": "esbuild src/cocos/inject-probe.js --bundle --format=iife --outfile=dist/copse.inject.probe.js --banner:js='/* copse inject bundle (probe) — load-metrics + drive surface (probe/firstClickable/find/interactive/reachable/press) for a --until driver; keeps reachability, drops snapshot-extras/get/call/diff/logs. Auto-installs window.__copse once cc is live. Rebuild: npm run build */'"
+    "build:probe": "esbuild src/cocos/inject-probe.js --bundle --format=iife --outfile=dist/copse.inject.probe.js --banner:js='/* copse inject bundle (probe) — load-metrics + drive surface (probe/firstClickable/find/interactive/reachable/press) for a --until driver; keeps reachability, drops snapshot-extras/get/call/diff/logs. Auto-installs window.__copse once cc is live. Rebuild: npm run build */'",
+    "build:pixi": "esbuild src/pixi/inject.js --bundle --format=iife --outfile=dist/copse.inject.pixi.js --banner:js='/* copse inject bundle (pixi) — PixiJS 8. Arms globalThis.__PIXI_APP_INIT__ FIRST (pre-boot capture, zero game cooperation), then auto-installs window.__copse. See docs/ENGINES.md. Rebuild: npm run build */'"
   },
   "keywords": [
     "cocos",
@@ -37,7 +41,9 @@
     "game-testing",
     "qa",
     "integration-test",
-    "ai"
+    "ai",
+    "pixi",
+    "pixijs"
   ],
   "license": "MIT",
   "devDependencies": {

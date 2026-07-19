@@ -13,7 +13,7 @@
 // kept in lockstep with reachable.js so both emit the same ref grammar. Imported ONLY by the full inject
 // bundle, so esbuild drops it from the lite/probe bundles exactly as it drops reachable.js. `via:'geometric'`
 // — this layer never claims pixel truth on its own; only the driver's pixel pass upgrades to 'pixel-confirmed'.
-import { refOf } from './refpath.js';
+import { refOf } from '../core/refpath.js';
 
 // Descendant component types whose pixels change frame-to-frame — masked out of the anchor so animation/
 // particle/text jitter never trips a signature compare. Overridable via makeVisualManifest opts.dynamicTypes.

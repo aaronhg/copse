@@ -1,21 +1,27 @@
 # copse
 
-Drive and assert a **running Cocos canvas game** through its **live node tree** —
+Drive and assert a **running Cocos or PixiJS canvas game** through its **live node tree** —
 no pixels, no input simulation. You walk the live scene (`cc.director.getScene()`),
 find the buttons / registered events, and **call their handlers directly**, then
 read component state back to check what happened.
 
 It's the **runtime sibling to [coir](https://github.com/aaronhg/coir)**: coir reads
 a project's *static* asset/dependency graph; copse reads the *running* scene's live
-UI tree. Both turn an opaque Cocos internal into structured data an AI (or a test)
-can query — and both speak the **same selector grammar** (`Parent/Child:Comp.prop`,
+UI tree. Both turn an opaque engine internal (Cocos, or PixiJS 8) into structured data an AI
+(or a test) can query — and both speak the **same selector grammar** (`Parent/Child:Comp.prop`,
 `[i]` to disambiguate same-name siblings).
 
-> Status: **working.** Pure core + Cocos adapter + AI-driver harness + CLI/library/**MCP**
-> entry, verified end-to-end on a **dev/preview build**: snapshot, `press → get` state
-> round-trips (a state-delta mutation), reachability, panel open/close detection, and an AI
-> loop driving a panel open+close to a PASS — plus driving the running game natively from
-> Claude Code over MCP.
+And copse is the deterministic layer **under arbor**: copse is the runtime driver + primitives +
+`execute` — it reports **facts**, with no LLM, no loop, no verdict. **arbor** is the AI-QA
+framework on top that owns the plan→execute→judge loop, the pass/fail verdict + veto, the
+coir×copse coverage join, test selection, and capability-based branching — and it drives copse's
+`execute`.
+
+> Status: **working.** Pure engine-blind core + Cocos/PixiJS adapters + a deterministic flow
+> executor (`execute`) + CLI/library/**MCP** entry, verified end-to-end on a **dev/preview build**:
+> snapshot, `press → get` state round-trips (a state-delta mutation), reachability, panel
+> open/close detection, and `execute` driving a panel open+close and reporting the facts — plus
+> driving the running game natively from Claude Code over MCP.
 
 ## Why this shape
 
@@ -63,8 +69,10 @@ copse trades away the whole visual/spatial/timing dimension:
   exposed on a component (closures, locals).
 - **What a button does** is opaque at runtime (you press and observe a state delta) —
   coir's *static* ClickEvent map (`click→method()`) is the complement if you want that.
-  Cross-reference the two on the shared key `(nodePath, method)` via `clickSurface()` /
-  the `click_surface` MCP tool — see [`docs/COVERAGE.md`](docs/COVERAGE.md).
+  copse exposes its side of the shared key `(nodePath, method)` — `clickSurface()` (runtime
+  click surface, Cocos-only) / the `click_surface` MCP tool, plus `tailMatch` and
+  `resolveCoirPath`/`resolveCopseRef` to line up the two grammars; the coir×copse coverage
+  **join** that consumes them lives in **arbor**.
 
 → Use copse for **logic/flow integration testing**, not visual or playtest QA.
 
@@ -99,12 +107,15 @@ unsupported (no stable index in a live tree).
 
 ## Test scripts — freeze a flow, replay in CI
 
-A **script** is a frozen test flow: JSON steps (the same `{op, ref/sel, …}` shape the
-harness plans) plus `expect` subset-match assertions — replayed deterministically, **zero
-LLM**. Explore once (a Claude Code MCP session, or `copse ai`), freeze, replay forever:
+A **script** is a frozen test flow: JSON steps (the same `{op, ref/sel, …}` shape `execute`
+runs) plus `expect` subset-match assertions — replayed deterministically, **zero LLM**.
+Explore once (a Claude Code MCP session, or arbor's AI loop over `execute`), freeze, replay
+forever — the exploration loop lives in arbor; the deterministic frozen-script replay is
+copse's own `copse run`:
 
 ```bash
 copse run <url> tests/shop-open-close.json     # exit 0 pass / 1 fail — CI-ready
+copse run <url> tests/                         # a directory: every *.json as a suite → JUnit + exit 0/1
 # over MCP: run_script({script}); the session auto-records — dump_script() exports
 # every press/get/call made so far as a script skeleton to trim into expects
 ```
@@ -113,37 +124,35 @@ Steps with no `expect` still fail on facts: `ok:false`, a handler that threw/log
 error, a press that actuated nothing. Format, match semantics, and the
 explore→dump→trim→replay workflow: [`docs/SCRIPTS.md`](docs/SCRIPTS.md).
 
-## AI-driver harness
+## Flow executor — `execute` (facts, no verdict)
 
-`runHarness(driver, agent, opts)` is the autonomous loop on top of those
-primitives — `snapshot → plan → press/get/call → judge → maybe iterate → report`.
-With scripts covering known-flow regression and Claude Code over MCP covering
-interactive exploration, the harness's lane is the **headless edge**: unattended CI
-smoke over flows nobody scripted yet (`copse ai --goal …`), fact gates (unreachable /
-errored / undriven hard-fail even a passing LLM verdict) — and a **script factory**:
-its `rounds[].steps` are already script steps, ready to freeze (docs/SCRIPTS.md).
-It's **pure and zero-dep**, decoupled through a `Driver` adapter (copse proxied
-into the page) and an `Agent` adapter whose methods are the points where the AI
-intervenes: `plan` (decide *what to test* + the expected outcome — the oracle),
-`judge` (*pass/fail* from the state delta), `next` (*when to stop*, optional), and
-`report` (shape the final summary *in your format*, optional). Everything between
-is the deterministic copse rail.
+`execute(driver, steps, opts?) → { steps, facts }` is the deterministic layer on top of the
+primitives: it runs a step list against the live-page driver and reports **facts** —
+`facts.unreachable / errored / undriven / uncertain / visual` (`extractFacts(steps)` is that same
+bucketing as a pure function over a step list). **No agent, no loop, no pass/fail verdict** — a
+press to a covered button, a handler that threw, a press that drove nothing are all reported as
+*facts*; whether any of them *fails* a run is the consumer's call. `opts` are fact-gathering
+toggles only — `{ reachableGate, visualGate, visualMax }` — never a verdict.
 
-You steer each stage with your own prompts — the harness passes `opts.context`
-(e.g. `{ diff, goal, stopCondition, reportFormat }`) verbatim to every stage, or
-bake guidance into the agent with a factory. `runHarness` always returns the
-structured `{ pass, rounds, snapshot }` (raw material to reshape in code) plus
-`summary` when you supply `agent.report`. The AI sees the node tree, not pixels,
-so its verdict is scoped to **logic/flow**, not visual/reachability. Real
-Playwright + Anthropic (`claude-opus-4-8`) wiring, the steering knobs, and the
-report shape are in [`docs/AI-DRIVER.md`](docs/AI-DRIVER.md);
-[`scripts/ai-driver-demo.js`](scripts/ai-driver-demo.js) is a runnable demo and
-`localDriver()` builds an in-process driver for testing the loop without a browser.
+```js
+import { execute } from 'copse';                       // also exported from 'copse/harness'
+const { steps, facts } = await execute(driver, [
+  { op: 'press', ref: 'Canvas/ShopBtn' },
+  { op: 'get',   sel: 'Canvas/Gold:Label.string' },
+]);
+if (facts.unreachable.length || facts.errored.length) { /* your policy decides */ }
+```
+
+The **plan→execute→judge loop, the pass/fail verdict + veto, capability-based branching, and the
+coir×copse coverage join + test selection all live in arbor** — the AI-QA framework that sits on
+top and *drives* `execute`. copse stays deterministic and LLM-free. `localDriver()` builds an
+in-process driver to exercise `execute` against a fake tree with no browser, and each run's
+`steps` are already the `{op, ref/sel, …}` a script freezes (docs/SCRIPTS.md).
 
 ## Run it on your game
 
-Point copse at **your own** running Cocos game — a dev/preview build (where `cc` is always
-reachable) or a release build of your own where it still is. Four on-ramps below; the debugger
+Point copse at **your own** running Cocos (or PixiJS 8) game — a dev/preview build (where the
+engine is always reachable) or a release build of your own where it still is. Four on-ramps below; the debugger
 edge is separate — see [**Beyond testing**](#beyond-testing--one-cdp-attach-another-lens).
 
 ### 1. CLI — quickest
@@ -153,16 +162,13 @@ npm i copse                 # the bundle ships built (from source: npm run build
 npm i -D puppeteer-core     # browser driver — peer dep, uses your system Chrome
 
 npx copse scan <url>                                  # read-only: print buttons / labels / reachability
-npx copse ai   <url> --goal "verify the buy flow clamps gold at 0" \
-               [--stop "..."] [--report "..."] [--rounds 3] [--model sonnet] \
-               [--verbose] [-o <folder>] [--headed] [--fps 30]
+npx copse scan <url> --engine pixi                    # same on a PixiJS 8 build (default engine cocos; docs/ENGINES.md)
 
 # one-shot primitives — connect, run one op, print JSON, close (pipe to jq, use in shell scripts):
 npx copse get   <url> Canvas/Score:Label.string       # read a member  → {ok,value}
 npx copse press <url> Canvas/ShopBtn [--force] [--reachable-gate]  # press a button → {ok,fired,changed?}; --reachable-gate refuses a covered one
 npx copse call  <url> Canvas/Mgr:Shop.buy 30           # invoke a method (arg JSON-parsed) → {ok,value,changed?}; missing method → {ok:false,reason:'no-method'}
 npx copse node  <url> Canvas/Panel                     # node intrinsics; copse reachable <url> <ref> for reachability
-npx copse coverage <url> coir-rows.json                # coir×copse join → coverage buckets (coir's static ClickEvent JSON: file or inline)
 npx copse run   <url> tests/shop.json                  # replay a frozen test script → JSON; exit 0/1 (docs/SCRIPTS.md)
 ```
 
@@ -175,11 +181,10 @@ see the game *react* (panels open, sprites move, numbers change) — not a movin
 button-press animation. Or `--browser-url http://127.0.0.1:9222` to drive **your own** Chrome
 (launched with `--remote-debugging-port=9222`) and watch it there.
 
-`ai` runs the AI loop (plan → press/get → judge → report) via the `claude -p` CLI
-(needs it logged in); `scan` is one-shot discovery. `--verbose` prints untruncated step
-results; `-o <folder>` appends the run log to `<folder>/<cmd>.log`; the run ends with a
-`cost: $… | N claude -p calls` line (from each call's `total_cost_usd`). (Local dev:
-`node src/cli.js …`.)
+`scan` is one-shot discovery; the one-shot primitives connect, run a single op, and print JSON.
+`--verbose` prints untruncated step results; `-o <folder>` appends the run log to
+`<folder>/<cmd>.log`. (Local dev: `node src/cli.js …`.) The AI loop that plans and judges these
+ops is arbor's — it's not a copse CLI verb.
 
 ### 2. MCP — drive the canvas from any agent
 
@@ -206,28 +211,31 @@ open the game in **your own** Chrome (`--remote-debugging-port=9222`), sign in /
 yourself, then register a plain `copse mcp` and **attach** to that tab without navigating: the agent
 calls `connect({attach:true, browserURL:"http://127.0.0.1:9222", match:"<url-substr>"})` (CLI:
 `--attach --browser-url --match`). copse drives the already-open tab as-is; it never touches how you
-got there. (It still only drives **Cocos** games.)
+got there. (It drives **Cocos**, or a **PixiJS 8** build with `engine:'pixi'` — see docs/ENGINES.md.)
 
 ### 3. Library — programmatic / CI
 
-The core is zero-dep; the browser + LLM edges are optional subpaths:
+The core is zero-dep; the browser edge is an optional subpath:
 
 ```js
-import { runHarness } from 'copse';
-import { connect } from 'copse/driver-puppeteer';     // peer dep: puppeteer-core
-import { makeClaudeAgent } from 'copse/agent-claude';  // needs the `claude` CLI
+import { execute } from 'copse';                        // deterministic flow executor (facts, no verdict)
+import { connect } from 'copse/driver-puppeteer';       // peer dep: puppeteer-core
 
-const cp = await connect('http://localhost:7456/');     // launch browser + inject → Driver
-const agent = makeClaudeAgent({ goal: 'open the shop and confirm gold decrements on buy' });
-const report = await runHarness(cp, agent, { context: { goal: '…' }, maxRounds: 3 });
-console.log(report.pass, report.summary);
+const cp = await connect('http://localhost:7456/', { engine: 'auto' });  // launch browser + inject → Driver
+const { facts } = await execute(cp, [
+  { op: 'press', ref: 'Canvas/ShopBtn' },
+  { op: 'get',   sel: 'Canvas/Gold:Label.string' },
+]);
+console.log(facts.unreachable, facts.errored, facts.undriven);  // FACTS — your policy decides pass/fail
 await cp.close();
 ```
 
-Both `cp` and `agent` are just adapters — swap `connect` for a Playwright driver, or
-`makeClaudeAgent` for an Anthropic-SDK / deterministic agent. For a **deterministic**
-(no-LLM) test, skip the agent and assert against `cp` directly (`cp.press`/`cp.get`/
-`cp.diff`/`cp.reachable`). See [`docs/AI-DRIVER.md`](docs/AI-DRIVER.md).
+`cp` is a driver adapter — swap `connect` for a Playwright driver. For a **deterministic**
+(no-LLM) test, read `facts` (or assert against `cp` directly: `cp.press`/`cp.get`/`cp.diff`/
+`cp.reachable`). The full plan→judge loop, the verdict + veto, and capability-based branching
+live in **arbor**, which drives this `execute`. The driver session also exposes a `.capabilities`
+getter (`{engine, clickSurface, stableRefs, reachability, visualManifest}`; `engineCapabilities(engine)`
+is the same as a pure call) so a consumer can branch on what the current engine supports.
 
 ### 4. Manual — no install
 
@@ -260,7 +268,7 @@ enough that it only makes sense on a build you own and control. See [`docs/DEBUG
 ```bash
 npm test          # node:test over fake trees — no engine, no install (+ an opt-in real-engine L2 test that skips unless reference/cocos/<ver> is cloned)
 npm run typecheck # tsc --noEmit (needs `npm install` for the dev deps)
-npm run build     # → dist/copse.inject.js (full) + .lite.js (press-only, no reachability) + .probe.js (load-metrics); all self-contained IIFEs
+npm run build     # → dist/copse.inject.js (full) + .lite.js (press-only, no reachability) + .probe.js (load-metrics) + .pixi.js (PixiJS 8); all self-contained IIFEs
 ```
 
 How the design got here — decisions, pitfalls, real-game findings — is in

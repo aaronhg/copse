@@ -3,7 +3,7 @@
 // plus a code-adapter string. Pure over win + adapters: no browser, no cc.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { normalizeAdapter, registerInto, detectWith, describe, stateWith, callWith, patchTargetWith, notifyWith, retrieveWith } from '../src/cocos/framework.js';
+import { normalizeAdapter, registerInto, detectWith, describe, stateWith, callWith, patchTargetWith, notifyWith, retrieveWith } from '../src/core/framework.js';
 
 // The PureMVC config adapter (the shape shipped as copse.frameworks.example.mjs).
 const PUREMVC = {

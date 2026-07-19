@@ -1,35 +1,13 @@
 // @ts-check
 import { snapshot as snap, press, get, call, reachable as coreReachable } from './core/index.js';
-// AI-driver harness — the autonomous test loop that sits ON TOP of copse's
-// primitives. Like the core (pure over a `Runtime`), this is pure over two
-// adapters, so the whole loop is testable in Node against fakes; the real
-// Playwright wiring and the real LLM call live only at the adapter edges
-// (see examples/ai-driver.md), keeping the package zero-dep.
+// The deterministic FLOW EXECUTOR — `execute(driver, steps)` runs a step list against copse's live-page
+// driver and reports the FACTS (extractFacts): unreachable/errored/undriven presses, uncertain actions,
+// shown-but-not-drawn nodes. NO agent, NO loop, NO pass/fail verdict — that's policy, and policy is the
+// consumer's (arbor drives this with its own plan→execute→judge loop + veto). Pure over the Driver
+// adapter, so it's testable in Node against a fake tree; the real Playwright wiring lives at the edge.
 //
-// The decoupling makes the AI intervention points LITERAL code seams —
-// everything else is the deterministic rail copse provides:
-//
-//   agent.plan(ctx)   → AI ①  judge diff+snapshot, decide what to test +
-//                              the EXPECTED outcome (the oracle), emit steps
-//   driver.<op>(...)  → 機械   execute press/get/call against the live page
-//   agent.judge(ctx)  → AI ②  state delta vs expectation → pass/fail
-//   agent.next(ctx)   → AI ③  coverage/iterate decision (optional; default: stop)
-//   agent.report(ctx) → AI ④  shape the final report (optional; absent ⇒ no summary)
-//
-// Per-stage guidance is the AGENT's job, not the harness's — the harness stays
-// prompt-agnostic. Every stage receives `ctx.context` verbatim (whatever you put
-// in `opts.context`), so per-run direction — test goal, stop condition, report
-// format — flows through there; static direction is baked into the agent (e.g. a
-// `makeAgent({goal, stopCondition, reportFormat})` factory, see examples).
-//
-// The AI's verdict is scoped to LOGIC/FLOW only — it is fed the node tree, not
-// pixels, so it must not claim rendering/reachability correctness (a covered or
-// off-screen button passes here but fails for a real player). Surface that in
-// the judge's `scope` field. Those two dimensions the agent MUST NOT claim are
-// instead supplied as HARNESS-level facts by optional Driver capabilities:
-// `reachable` → the reachability hard-fail gate, and `visualCheck` → a "did the
-// subtree this action SHOWED actually render on screen" SOFT signal (surfaced as
-// out.visual, never a hard fail — see the visualGate below).
+// The verdict is intentionally NOT decided here — a press to a covered button, a handler that threw, a
+// press that drove nothing are reported as FACTS; whether any of them fails a run is the consumer's call.
 
 /**
  * One copse command the plan wants to run.
@@ -42,49 +20,21 @@ import { snapshot as snap, press, get, call, reachable as coreReachable } from '
  * @property {number} [ms]    duration — for `sleep`
  * @property {any} [hooks]    {before?,after?,replace?} — for `patch`
  * @property {string} [expr]  expression — for `eval`
- * @property {string} [note]  free-text intent, surfaced to the judge/log
+ * @property {string} [note]  free-text intent, surfaced to the log
  */
 
 /**
  * The DETERMINISTIC rails — copse proxied into the live page. In production each
  * method is a `page.evaluate(... __copse.X ...)`; in tests it's the fake tree.
- * Methods may be sync or async — the harness awaits either.
+ * Methods may be sync or async — `execute` awaits either.
  * @typedef {Object} Driver
  * @property {(opts?:any)=>any} snapshot
  * @property {()=>any} interactive
  * @property {(ref:string,opts?:any)=>any} press
  * @property {(sel:string)=>any} get
  * @property {(sel:string,...args:any[])=>any} call
- * @property {(sel:string)=>any} [reachable]   OPTIONAL: drives the harness's reachability hard-fail gate
- * @property {(ref:string)=>any} [visualCheck] OPTIONAL: drives the harness's visual "did it actually render" soft signal
- */
-
-/**
- * @typedef {Object} Plan
- * @property {string} [rationale]   why these steps, given the diff + snapshot
- * @property {Step[]} steps
- */
-
-/**
- * @typedef {Object} Verdict
- * @property {boolean} pass
- * @property {string} [reason]
- * @property {string} [scope]   e.g. 'logic' — must NOT claim visual/reachability
- */
-
-/**
- * The AI seams. Each wraps an LLM call in production (see examples). Every method
- * receives `ctx.context` (your `opts.context`) so you can steer it per run — test
- * goal, stop condition, report format.
- * @typedef {Object} Agent
- * @property {(ctx:any)=>(Plan|Promise<Plan>)} plan         AI ① judge + plan (oracle)
- * @property {(ctx:any)=>(Verdict|Promise<Verdict>)} judge  AI ② pass/fail
- * @property {(ctx:any)=>({continue:boolean,reason?:string}|Promise<{continue:boolean,reason?:string}>)} [next]
- *           AI ③ coverage/iterate decision — optional; absent ⇒ stop after one round.
- * @property {(ctx:any)=>any} [report]  AI ④ final report. Receives `{ context, rounds, pass,
- *           snapshot }`. Return `{ pass, summary }` to set the OVERALL verdict + summary (it
- *           alone sees every round / the whole goal); any other return value is the summary
- *           (overall pass stays the per-round AND). Optional; absent ⇒ no `summary`.
+ * @property {(sel:string)=>any} [reachable]   OPTIONAL: surfaces the `unreachable` fact for a covered button
+ * @property {(ref:string)=>any} [visualCheck] OPTIONAL: surfaces the `visual` fact (shown-but-not-drawn)
  */
 
 /**
@@ -155,89 +105,46 @@ async function execStep(driver, step, gates) {
 }
 
 /**
- * Run the AI-driver loop: discover → (plan → execute → judge) → maybe iterate.
- * Policy-free by design — the agent decides what/whether; the harness only
- * sequences, captures results, and bounds the rounds.
- * @param {Driver} driver
- * @param {Agent} agent
- * @param {Object} [opts]
- * @param {any} [opts.context]     anything the agent needs + per-run guidance
- *        (e.g. `{ diff, goal, stopCondition, reportFormat }`) — passed verbatim to every stage.
- * @param {number} [opts.maxRounds]  hard cap on iterations (default 1)
- * @param {boolean} [opts.reachableGate]  hard-fail a press to a covered/unreachable button (default true)
- * @param {boolean} [opts.errorGate]  hard-fail a step whose handler threw / logged an error (default true)
- * @param {boolean} [opts.driveGate]  hard-fail a press that drove NOTHING (drove:'nothing') (default true)
- * @param {boolean} [opts.visualGate]  SOFT-surface (out.visual) a subtree an action showed in the logic diff
- *        but that didn't render on screen — needs a driver with `visualCheck` (default true; no-op without it)
- * @param {number} [opts.visualMax]  max nodes to visual-check per action (default 4; each is a screenshot, so
- *        this bounds the added latency — overflow is recorded in result.visualCapped, never silently dropped)
- * @returns {Promise<{pass:boolean, rounds:Array<{round:number, rationale?:string, steps:Array<{step:Step, result:any}>, verdict:Verdict}>, snapshot:any, summary?:any, unreachable?:Array<{ref:string, blockedBy:any}>, errored?:Array<{ref:string, error:string}>, undriven?:Array<{ref:string}>, uncertain?:Array<{ref:string, why:string}>, visual?:Array<{press:string, node:string, reason:string}>}>}
+ * Extract the harness-level FACTS from a flat list of executed steps — the observations copse can state
+ * as fact (not opinion): a press to an unreachable button, a step that threw / logged an error, a press
+ * that drove nothing, an unconfirmable (uncertain) press, and a shown-but-not-drawn (visual) node. A
+ * consumer applies its OWN veto/verdict over these; copse never decides pass/fail here.
+ * @param {Array<{step:Step, result:any}>} steps
+ * @returns {{unreachable:Array<{ref:string, blockedBy:any}>, errored:Array<{ref:string, error:string}>, undriven:Array<{ref:string}>, uncertain:Array<{ref:string, why:string}>, visual:Array<{press:string, node:string, reason:string}>}}
  */
-export async function runHarness(driver, agent, opts = {}) {
-  const { context = null, maxRounds = 1, reachableGate = true, errorGate = true, driveGate = true, visualGate = true, visualMax = 4 } = opts;
-  const gates = { reachableGate, visualGate, visualMax };
-  const rounds = [];
-  let snapshot = await driver.snapshot();
-
-  for (let round = 0; round < maxRounds; round++) {
-    const plan = (await agent.plan({ context, snapshot, rounds, round })) || { steps: [] };
-
-    const steps = [];
-    for (const step of plan.steps || []) steps.push({ step, result: await execStep(driver, step, gates) });
-
-    const verdict = await agent.judge({ context, snapshot, plan, steps, rounds, round });
-    rounds.push({ round, rationale: plan.rationale, steps, verdict });
-
-    if (!agent.next) break;                       // default policy: one round
-    const cont = await agent.next({ context, snapshot, rounds, round });
-    if (!cont || !cont.continue) break;
-    if (round < maxRounds - 1) snapshot = await driver.snapshot(); // re-discover only if another round will run
-  }
-
-  // Per-round AND is a weak overall verdict: a multi-round goal's early rounds legitimately
-  // judge "not complete yet". So this is only the FALLBACK — the report (which alone sees
-  // every round / the whole goal) is the authoritative verdict when it provides one.
-  const pass = rounds.length > 0 && rounds.every((r) => r.verdict && r.verdict.pass !== false);
-  // A press that hit a covered/unreachable button is a HARD fail — a real player couldn't have done it, so
-  // the flow isn't actually exercisable. This overrides even a passing judge/report (it's a fact, not an
-  // opinion). The offending refs are surfaced so the report can explain it. Disable with reachableGate:false.
-  const unreachablePresses = rounds.flatMap((r) => (r.steps || []).filter((s) => s.result && s.result.unreachable).map((s) => ({ ref: s.step.ref, blockedBy: s.result.unreachable })));
-  // A step whose handler THREW (execStep caught it → reason:'threw') or whose action logged an error / uncaught
-  // pageerror (the driver's log-diff → result.errors, catching an engine-swallowed throw a passing ok:true hides)
-  // is a HARD fail — "doesn't-crash" must be a fact, not the judge's opinion. Override with errorGate:false.
-  const erroredSteps = rounds.flatMap((r) => (r.steps || [])
-    .filter((s) => s.result && ((s.result.errors && s.result.errors.length) || s.result.reason === 'threw'))
-    .map((s) => ({ ref: s.step.ref || s.step.sel || s.step.op, error: s.result.reason === 'threw' ? s.result.error : s.result.errors[0].text })));
-  // A press that actuated NOTHING (drove:'nothing' — no clickEvent fired, no on('click'), no synthetic tap)
-  // can't be a passing test: nothing was exercised. Surfaced + hard-failed (a misread `fired:0` as pass is the
-  // exact trap this closes). The richer per-step `drove`/`wired` lets the agent reason about the touch-into-void
-  // case (drove:['touch'], wired:false). Override with driveGate:false.
-  const undrivenPresses = rounds.flatMap((r) => (r.steps || []).filter((s) => s.result && s.result.drove === 'nothing').map((s) => ({ ref: s.step.ref })));
-  // SURFACED but NOT hard-failed: a press copse couldn't confirm a player reaches/sees (reachable:'unsure' / occludedBy)
-  // or a synthetic tap into a no-visible-handler button. Fail-loud uncertainty reaches the report instead of a silent pass.
-  const uncertainSteps = rounds.flatMap((r) => (r.steps || []).filter((s) => s.result && s.result.uncertain).map((s) => ({ ref: s.step.ref, why: s.result.uncertain })));
-  // SOFT (surfaced, never a hard fail — like uncertain): a node the action's logic diff showed (appeared/
-  // activated) that did NOT render on screen (drawn:false / offscreen). "Tree says the panel opened, screen is
-  // blank." Left for the judge/report to weigh — no baseline here, so we don't auto-fail (see visualConfirm).
-  const blankVisuals = rounds.flatMap((r) => (r.steps || []).filter((s) => s.result && s.result.blankVisual).flatMap((s) => s.result.blankVisual.map((b) => ({ press: s.step.ref || s.step.sel || s.step.op, node: b.ref, reason: b.reason }))));
-  const out = { pass: pass && unreachablePresses.length === 0 && (!errorGate || erroredSteps.length === 0) && (!driveGate || undrivenPresses.length === 0), rounds, snapshot };
-  if (unreachablePresses.length) out.unreachable = unreachablePresses;
-  if (erroredSteps.length) out.errored = erroredSteps;
-  if (undrivenPresses.length) out.undriven = undrivenPresses;
-  if (uncertainSteps.length) out.uncertain = uncertainSteps;
-  if (blankVisuals.length) out.visual = blankVisuals;
-  // AI ④ (optional). Returning `{ pass, summary }` sets the OVERALL verdict + summary
-  // (overrides the per-round AND); any other return value is treated as the summary.
-  if (agent.report) {
-    const rep = await agent.report({ context, rounds, pass: out.pass, snapshot, unreachable: unreachablePresses });
-    if (rep && typeof rep === 'object' && 'pass' in rep) { out.pass = rep.pass; out.summary = rep.summary; }
-    else out.summary = rep;
-  }
-  if (unreachablePresses.length) out.pass = false; // hard gate: not even the report can pass over an unreachable press
-  if (errorGate && erroredSteps.length) out.pass = false; // hard gate: a handler that threw / logged an error is never a pass
-  if (driveGate && undrivenPresses.length) out.pass = false; // hard gate: a press that drove nothing isn't a pass
-  return out;
+export function extractFacts(steps) {
+  const S = steps || [];
+  return {
+    unreachable: S.filter((s) => s.result && s.result.unreachable).map((s) => ({ ref: s.step.ref, blockedBy: s.result.unreachable })),
+    errored: S.filter((s) => s.result && ((s.result.errors && s.result.errors.length) || s.result.reason === 'threw')).map((s) => ({ ref: s.step.ref || s.step.sel || s.step.op, error: s.result.reason === 'threw' ? s.result.error : s.result.errors[0].text })),
+    undriven: S.filter((s) => s.result && s.result.drove === 'nothing').map((s) => ({ ref: s.step.ref })),
+    uncertain: S.filter((s) => s.result && s.result.uncertain).map((s) => ({ ref: s.step.ref, why: s.result.uncertain })),
+    visual: S.filter((s) => s.result && s.result.blankVisual).flatMap((s) => s.result.blankVisual.map((b) => ({ press: s.step.ref || s.step.sel || s.step.op, node: b.ref, reason: b.reason }))),
+  };
 }
+
+/**
+ * The DETERMINISTIC executor (the FlowTrace rail): run a step list against the driver and report the
+ * per-step results + the harness FACTS — NO agent, NO loop, NO verdict. This is copse's whole AI-testing
+ * surface now: a consumer (arbor) builds its own plan→execute→judge loop and its own veto over these
+ * facts. `reachableGate`/`visualGate` only toggle whether the reachability / pixel FACTS are gathered.
+ * @param {Driver} driver @param {Step[]} steps
+ * @param {{reachableGate?:boolean, visualGate?:boolean, visualMax?:number}} [opts] fact-gathering toggles (NOT a verdict)
+ * @returns {Promise<{steps:Array<{step:Step, result:any}>, facts:ReturnType<typeof extractFacts>}>}
+ */
+export async function execute(driver, steps, opts = {}) {
+  const { reachableGate = true, visualGate = true, visualMax = 4 } = opts;
+  const gates = { reachableGate, visualGate, visualMax };
+  const executed = [];
+  for (const step of steps || []) executed.push({ step, result: await execStep(driver, step, gates) });
+  return { steps: executed, facts: extractFacts(executed) };
+}
+
+// NOTE: the AI-driver LOOP (runHarness: plan → execute → judge → iterate + a batteries-included gate
+// verdict) + the `claude -p` agent moved to arbor — the loop shape and the pass/fail verdict are policy,
+// which is arbor's layer. copse stays deterministic: `execute` (above) runs a step list and reports the
+// FACTS; arbor owns the loop (its runLoop) and decides what the facts mean. The `copse ai` CLI verb +
+// src/agents/claude.js went with it.
 
 /**
  * Build a copse Driver over an in-process scene + Runtime — the same shape the

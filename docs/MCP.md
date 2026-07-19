@@ -27,7 +27,7 @@ point **both at the same Chrome** — this shared-attach setup is the recommende
 # 2) the generic browser lens: navigate, screenshot, network, performance, DOM input
 claude mcp add chrome-devtools -- npx chrome-devtools-mcp@latest --browser-url http://127.0.0.1:9222
 
-# 3) the Cocos scene lens (this server): snapshot/press/get/call/reachable/diff/coverage
+# 3) the Cocos scene lens (this server): snapshot/press/get/call/reachable/diff/click_surface
 claude mcp add copse -- npx copse mcp
 ```
 
@@ -40,7 +40,7 @@ with copse: `connect({ attach: true, browserURL: "http://127.0.0.1:9222" })` att
 |---|---|---|
 | sees | DOM / pixels / network — the canvas is one opaque element | the live Cocos node tree **inside** the canvas |
 | acts | real input events, navigation, emulation | the wired handler, any component method |
-| asserts | screenshot, console, network, perf trace | component state, `changed` diff, reachability, coir coverage |
+| asserts | screenshot, console, network, perf trace | component state, `changed` diff, reachability, `click_surface` (the copse side of the coir join) |
 
 Use both when one action needs rendering evidence (screenshot) **and** logic evidence (state
 delta). copse's own launch mode (`connect(url)` below) still works standalone — it's the
@@ -63,7 +63,7 @@ surface over stdio.
 rest are variants / lower-level"), and prefixes every description with its tag — `[drive ★]`, `[drive]`,
 `[see]`, … — so the flat list reads as a guided map. Nothing is hidden. The families (★ = headline):
 **session** (`connect`★) · **see** (`snapshot`★) · **read** (`get`★) · **drive** (`press`★) ·
-**usable** (`reachable`★) · **observe** (`watch`★) · **fix** (`patch`★) · **coverage** (`coverage`★) ·
+**usable** (`reachable`★) · **observe** (`watch`★) · **fix** (`patch`★) · **coverage** (`click_surface`★) ·
 **script** (`run_script`★) · **orient** (`orient`★) · **escape** (`eval`, no ★ — the raw hatch, a last resort).
 The core loop is the ★s of session/see/drive/read.
 
@@ -78,7 +78,6 @@ The core loop is the ★s of session/see/drive/read.
 | `press(ref, {force?, reachableGate?, captureNetwork?})` | fire the wired handler (NOT a coordinate click) → `{ok, fired, changed}`; `reachableGate:true` refuses a covered button; `captureNetwork:true` attaches the requests it fired |
 | `get(sel)` / `call(sel, args)` | read a member / invoke any method (`call` on a missing method → `{ok:false, reason:'no-method'}`, not a silent `value:undefined`) |
 | `reachable(ref, {visual?, baseline?})` / `node(ref)` | best-effort reachability (`visual:true` adds the pixel pass → a three-state `usable`) / node intrinsics |
-| `coverage(staticRows)` | join coir's static ClickEvent rows against the live click surface → buckets `{covered, blocked, uncertain, unreached, ambiguous, codeRegistered, codeOnly}` (see [`COVERAGE.md`](COVERAGE.md)) |
 | `diff(before, after)` | diff two snapshots → `appeared/disappeared/activated/deactivated/labelChanged` (`press`/`call` already attach this as `changed`) |
 | `listeners(ref)` | user `node.on()` handlers `[{type, fn?, target?}]` (minified builds strip names) |
 | `orient()` | **one-call bearings** after connect → `{url, scene, engine, framework:{kind, registered, capabilities}, buttons, entryPoints:[refs pressable now], hint}` — instead of stitching probe + framework + interactive by hand |

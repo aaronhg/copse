@@ -12,7 +12,7 @@
 // (server.js filters by this tag). They stay callable by name regardless, so tests/power-users
 // aren't blocked.
 
-import { resolveCoirPath, coverageJoin, affectedData } from '../coverage.js';
+import { resolveCoirPath } from '../coverage.js';
 import { runScript, truncate } from '../script.js';
 
 const needCp = (state) => {
@@ -42,14 +42,14 @@ export const FAMILY = {
   reachable: 'usable', visual_check: 'usable', visual_baseline: 'usable',
   watch: 'observe', logs: 'observe', network: 'observe', screenshot: 'observe', hold: 'observe', release: 'observe', hold_status: 'observe',
   patch: 'fix', patch_clear: 'fix', patch_calls: 'fix', pm_patch: 'fix',
-  coverage: 'coverage', click_surface: 'coverage', resolve: 'coverage', affected: 'coverage',
+  click_surface: 'coverage', resolve: 'coverage',
   run_script: 'script', dump_script: 'script',
-  orient: 'orient', doctor: 'orient', framework: 'orient', register_framework: 'orient',
+  orient: 'orient', anchors: 'orient', doctor: 'orient', framework: 'orient', register_framework: 'orient',
   eval: 'escape', // its own family: the raw escape hatch, NOT a peer of press/call — no ★ (never reach for it first)
   break_at: 'debug', break_in: 'debug', break_exceptions: 'debug', wait_pause: 'debug', eval_frame: 'debug', debug_step: 'debug', clear_breakpoints: 'debug',
 };
 // one ★ headline per family (the go-to); the `escape` family deliberately has NONE (eval is a last resort).
-export const HEADLINE = new Set(['connect', 'snapshot', 'get', 'press', 'reachable', 'watch', 'patch', 'coverage', 'run_script', 'orient', 'break_in']);
+export const HEADLINE = new Set(['connect', 'snapshot', 'get', 'press', 'reachable', 'watch', 'patch', 'click_surface', 'run_script', 'orient', 'break_in']);
 export const familyTag = (name) => { const f = FAMILY[name]; return f ? `[${f}${HEADLINE.has(name) ? ' ★' : ''}] ` : ''; };
 
 // ---- session recording (docs/SCRIPTS.md) ----------------------------------------------
@@ -108,7 +108,7 @@ const ensureDbg = async (state) => {
 export const TOOLS = [
   {
     name: 'connect',
-    description: 'Launch a browser at <url> (or ATTACH to an already-open tab), load a running Cocos game, inject copse, wait until ready. Call this FIRST (same operation as the library connect()). headed:true shows a window; browserURL points at your own Chrome (started with --remote-debugging-port). attach:true + match drives an ALREADY-OPEN tab without navigating — use this for your own game behind a login/staging gate you opened yourself; omit match AND url to attach the ACTIVE tab (e.g. one chrome-devtools-mcp brought to front). Returns a readiness summary.',
+    description: 'Launch a browser at <url> (or ATTACH to an already-open tab), load a running canvas game, inject copse, wait until ready. `engine` picks the layer: "cocos" (default) or "pixi" (PixiJS 8) — on pixi, clickSurface/coverage are unavailable (nothing is serialized) and `anchors` replaces them as the way to see what is addressable. Call this FIRST (same operation as the library connect()). headed:true shows a window; browserURL points at your own Chrome (started with --remote-debugging-port). attach:true + match drives an ALREADY-OPEN tab without navigating — use this for your own game behind a login/staging gate you opened yourself; omit match AND url to attach the ACTIVE tab (e.g. one chrome-devtools-mcp brought to front). Returns a readiness summary.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -120,6 +120,7 @@ export const TOOLS = [
         match: { description: 'when attach:true, pick the open tab to drive: a URL substring, a LIST of substrings (ALL must be present — ANDed, to tell apart two builds sharing a fragment), or {url?,title?} (title is matchable too). >1 tab matches → an error listing them (use `list_tabs` first, or `pick`). Omit match AND url → the ACTIVE tab.' },
         pick: { type: 'number', description: 'when several tabs match, attach to this index (from the ambiguity list / list_tabs) instead of erroring' },
         frameworks: { type: 'array', items: {}, description: 'extra framework adapters (config objects / code-adapter source strings / file paths) on top of the auto-loaded copse.frameworks.mjs — enables framework/pm_get/pm_set/pm_call' },
+        engine: { type: 'string', enum: ['cocos', 'pixi'], description: 'which engine layer to drive (default cocos). "pixi" = PixiJS 8: the bundle is injected pre-boot to catch Pixi\'s one-shot init hook, so it must be set at connect time — you cannot switch later without reconnecting.' },
       },
     },
     run: async (state, a) => {
@@ -132,6 +133,7 @@ export const TOOLS = [
       if (a.browserURL) opts.browserURL = a.browserURL;
       if (a.attach) { opts.attach = true; opts.match = a.match || a.url; if (a.pick != null) opts.pick = a.pick; }
       if (a.frameworks) opts.frameworks = a.frameworks;
+      if (a.engine) opts.engine = a.engine;
       const target = a.url || opts.match || '';
       state.cp = await connect(target, opts);
       // Report the URL of the tab actually attached (page.url() is CDP-cached, safe even while paused);
@@ -143,9 +145,19 @@ export const TOOLS = [
       // stalled = init didn't settle in time — almost always the game is on a loading/intro screen (no
       // interactive buttons yet), NOT a debugger pause. __copse is usually already installed, so a read works.
       if (state.cp.stalled) return { data: { ok: true, url: at(), attached: true, injecting: true, note: 'inject still settling — the game looks like it is on a loading/intro screen (no interactive buttons yet). __copse is likely already installed: call snapshot/interactive again in a moment, or reload.' } };
+      // A page with no engine leaves __copse uninstalled, so these reads throw by design. That's the
+      // FINDING, not a failure of connect — report it (and point at doctor) instead of surfacing a
+      // raw error, which is what a caller sees when the thing they attached to isn't a game at all.
+      if (!state.cp.installed) {
+        return { data: {
+          ok: false, url: at(), attached: !!opts.attach, installed: false,
+          engine: state.cp.engineDetected ? state.cp.engine : null,
+          note: 'copse could not install: no engine was found on this page. Looked for a live cc.director scene and a Pixi Application (init hook / __PIXI_APP__ / devtools globals). If this is a Pixi game you ATTACHED to after load, reconnect with engine:"pixi" so the pre-boot hook can arm; if it is a release Cocos build, `cc` may be tree-shaken away. Call `doctor` for the full report.',
+        } };
+      }
       const snap = await state.cp.snapshot({ relevant: true });
       const inter = await state.cp.interactive();
-      return { data: { ok: true, url: at(), attached: !!opts.attach, ...(state.cp.attachedTab ? { attachedTab: state.cp.attachedTab } : {}), relevantNodes: snap.length, buttons: inter.length } };
+      return { data: { ok: true, url: at(), attached: !!opts.attach, engine: typeof state.cp.engineReady === 'function' ? await state.cp.engineReady() : (state.cp.engine ?? null), ...(state.cp.attachedTab ? { attachedTab: state.cp.attachedTab } : {}), relevantNodes: snap.length, buttons: inter.length } };
     },
   },
   {
@@ -187,10 +199,10 @@ export const TOOLS = [
     run: async (state, a) => ({ data: resolveCoirPath(a.path, await needCp(state).snapshot({ includeInactive: true })) }),
   },
   {
-    name: 'coverage',
-    description: "THE coir×copse coverage join in one call: pass coir's static ClickEvent rows `staticRows` ([{nodePath, method, component?}], from coir's MCP/CLI); copse joins them against its live click surface on (nodePath, method) (symmetric tail match — absorbs coir's root prefix + a prefab mount). Returns buckets: covered (wired+live+reachable&interactable), blocked (live but reachable:false/disabled), uncertain (reachable:'unsure'/occluded — verify, not a pass), unreached (coir-only, not live here — navigate there), ambiguous (can't attribute 1:1 — reason 'fan-out'/'fan-in', resolve by hand), codeRegistered (method:null but has a code handler), codeOnly (no detectable handler). reachability:false skips the reachable pass. Full recipe: docs/COVERAGE.md.",
-    inputSchema: { type: 'object', properties: { staticRows: { type: 'array', description: "coir's static ClickEvent rows: [{nodePath, method, component?}]", items: { type: 'object' } }, reachability: { type: 'boolean', description: 'compute reachable on the live surface (default true)' }, includeInactive: { type: 'boolean', description: 'also walk hidden subtrees when building the live surface' } }, required: ['staticRows'] },
-    run: async (state, a) => ({ data: coverageJoin(a.staticRows, await needCp(state).clickSurface({ reachability: a.reachability, includeInactive: a.includeInactive })) }),
+    name: 'anchors',
+    description: "Which objects in the live scene were written by the GAME (not the engine), and what is callable on each — detected STRUCTURALLY (owns methods the engine doesn't define, and/or holds children by name), with `tier` reporting the confidence: lifecycle > api > refs. Minify-proof: method and field names survive what mangles class names. ON PIXI this is the addressing ENTRY POINT — refs there are positional gibberish (`Container[0]/Container[3]`), so start here, not with snapshot, and feed a `named` path back as `<ref>:Node.<path>` to get/call/patch. ON COCOS refs are already readable, so its value is the RELEASE build: it names the callable methods of a script component whose class name has been mangled to `e`/`t` (use the returned `sel`). Tree order, shallowest first. `named` is capped (25) with `namedTotal` reported — never silently truncated.",
+    inputSchema: { type: 'object', properties: {} },
+    run: async (state) => ({ data: await needCp(state).anchors() }),
   },
   {
     name: 'press',
@@ -254,24 +266,39 @@ export const TOOLS = [
   },
   {
     name: 'doctor',
-    description: "Health check — 'why won't it even run'. ONE call: environment/boot (WebGL renderer, whether the scene actually populated, the GAME's console/pageerrors) + copse's engine-coupling (Cocos version, which version-sensitive cc.* internals resolve here). `ok:false` when the scene never came up (empty tree — e.g. a headless CI with no software Vulkan device → NULL WebGL context → Cocos builds no scene). The low-level 'is the plumbing healthy' counterpart to `orient` ('where am I', which assumes a booted game). Read-only. Returns {ok, webgl, scene, cc, errors, coupling}.",
+    description: "Health check — 'why won't it even run'. ONE call: environment/boot (WebGL renderer, whether the scene actually populated, the GAME's console/pageerrors) + copse's engine-coupling (engine version, which version-sensitive internals resolve here). `ok:false` when the scene never came up (empty tree — e.g. a headless CI with no software Vulkan device → NULL WebGL context → Cocos builds no scene). The low-level 'is the plumbing healthy' counterpart to `orient` ('where am I', which assumes a booted game). Read-only. It probes the PAGE for the engine rather than trusting the session, and reports `connectedAs` alongside — so a session connected as the wrong engine is visible. LIMIT, stated plainly: a Pixi app can only be identified positively if copse's bundle was injected PRE-BOOT (engine:'pixi' or 'auto' at connect) or the game volunteers `__PIXI_APP__`/`__PIXI_DEVTOOLS__`; Pixi's init hook fires once during Application.init, so a session that connected as cocos to a Pixi game gets `engine:null` plus a note telling you to reconnect — never a false 'cocos'. Returns {ok, webgl, engine, scene, cc|pixi, errors, coupling}.",
     inputSchema: { type: 'object', properties: {} },
     run: async (state) => {
       const cp = needCp(state);
       const v = (r) => (r && typeof r === 'object' && 'value' in r) ? r.value : r;
       const webgl = v(await cp.eval("(()=>{try{const c=document.createElement('canvas');const g=c.getContext('webgl2')||c.getContext('webgl');const e=g&&g.getExtension('WEBGL_debug_renderer_info');return g?((g instanceof WebGL2RenderingContext?'webgl2 ':'webgl1 ')+(e?g.getParameter(e.UNMASKED_RENDERER_WEBGL):'ctx-ok')):'NULL-CONTEXT'}catch(e){return 'ERR:'+e.message}})()").catch(() => 'eval-failed'));
-      const scene = v(await cp.eval("(()=>{try{const s=window.cc&&window.cc.director&&window.cc.director.getScene&&window.cc.director.getScene();return s?{name:s.name,children:(s.children||[]).length}:'NO-SCENE'}catch(e){return 'ERR:'+e.message}})()").catch(() => 'eval-failed'));
-      const cc = v(await cp.eval("(()=>{try{return{hasCc:!!window.cc,hasDirector:!!(window.cc&&window.cc.director),game:!!(window.cc&&window.cc.game),canvases:document.querySelectorAll('canvas').length}}catch(e){return 'ERR:'+e.message}})()").catch(() => 'eval-failed'));
+      // PROBE THE PAGE, not the session. The session's engine was fixed at connect time (default
+      // cocos), so an agent that connected without engine:'pixi' to a Pixi game would otherwise get a
+      // cc-shaped report saying "NO-SCENE" with no hint why — the exact dead end doctor exists to
+      // break. This costs one eval and makes the tool's own description true.
+      const onPage = v(await cp.eval("(()=>{try{const cocos=!!(window.cc&&window.cc.director&&window.cc.director.getScene&&window.cc.director.getScene());const app=(window.__copse&&window.__copse.app)||(window.__copsePixi&&window.__copsePixi.app)||(window.__PIXI_DEVTOOLS__&&window.__PIXI_DEVTOOLS__.app)||window.__PIXI_APP__;return{cocos,pixi:!!(app&&app.stage)}}catch(e){return{cocos:false,pixi:false}}})()").catch(() => ({ cocos: false, pixi: false })));
+      const pageEngine = onPage && onPage.pixi ? 'pixi' : onPage && onPage.cocos ? 'cocos' : null;
+      // tolerate a driver without engineReady (test fakes, and any older driver build)
+      const sessionEngine = typeof cp.engineReady === 'function' ? await cp.engineReady() : (cp.engine ?? null);
+      const mismatch = pageEngine && sessionEngine && pageEngine !== sessionEngine;
+      const scene = v(await cp.eval((cp.engine === 'pixi'
+        ? "(()=>{try{const s=window.__copse&&window.__copse.app&&window.__copse.app.stage;return s?{name:(window.__copse.orient().scene||'stage'),children:(s.children||[]).length}:'NO-SCENE'}catch(e){return 'ERR:'+e.message}})()"
+        : "(()=>{try{const s=window.cc&&window.cc.director&&window.cc.director.getScene&&window.cc.director.getScene();return s?{name:s.name,children:(s.children||[]).length}:'NO-SCENE'}catch(e){return 'ERR:'+e.message}})()")).catch(() => 'eval-failed'));
+      const cc = v(await cp.eval((cp.engine === 'pixi'
+        ? "(()=>{try{const a=window.__copse&&window.__copse.app;return{hasPixi:!!a,hasStage:!!(a&&a.stage),hasTicker:!!(a&&a.ticker),canvases:document.querySelectorAll('canvas').length}}catch(e){return 'ERR:'+e.message}})()"
+        : "(()=>{try{return{hasCc:!!window.cc,hasDirector:!!(window.cc&&window.cc.director),game:!!(window.cc&&window.cc.game),canvases:document.querySelectorAll('canvas').length}}catch(e){return 'ERR:'+e.message}})()")).catch(() => 'eval-failed'));
       const errors = (cp.logs({ level: ['error', 'pageerror'], tail: 20 }) || []).map((l) => l.text);
       const coupling = await cp.probe().catch(() => null);
-      return { data: { ok: !!(scene && typeof scene === 'object' && scene.children > 0), webgl, scene, cc, errors, coupling } };
+      return { data: {
+        ok: !!(scene && typeof scene === 'object' && scene.children > 0), webgl,
+        engine: pageEngine,
+        connectedAs: sessionEngine,
+        injected: cp.installed,
+        ...(mismatch ? { engineMismatch: `this page is running ${pageEngine}, but the session connected as ${sessionEngine} — reconnect with engine:"${pageEngine}" (the pixi layer must be injected PRE-BOOT, so it cannot be switched on an open session).` } : {}),
+        ...(pageEngine ? {} : { engineNote: 'no engine identified itself on this page — copse looked for a live cc.director scene and a Pixi Application (init hook / __PIXI_APP__ / devtools globals). A Pixi game is INVISIBLE here unless copse was injected pre-boot, because its init hook fires once during Application.init: reconnect with engine:"pixi" (or "auto") to rule that in or out. Otherwise the page may be a release Cocos build whose `cc` was tree-shaken away, or simply not a canvas game.' }),
+        scene, [cp.engine === 'pixi' ? 'pixi' : 'cc']: cc, errors, coupling,
+      } };
     },
-  },
-  {
-    name: 'affected',
-    description: "PURE (no game): which frozen flow tests a change affects — the runtime-format sibling of coir's `impact`. Pass `risk` (a coir `impact` result: {impactedButtons:[{nodePath}], impactedScenes:[]}) and `tests` (the flow scripts). A test is affected iff a nodePath it drives (its press refs / get sels / cc.find in evals) tail-matches an impacted button's nodePath — the same key `coverage` joins on, but the live surface is replaced by the test scripts. A scene-level impact keeps all tests (sceneOnly). Returns {affected:[{name,hits}], skipped, sceneOnly}.",
-    inputSchema: { type: 'object', properties: { risk: { type: 'object', description: "a coir impact result" }, tests: { type: 'array', items: { type: 'object' }, description: "[{name, script:{steps:[…]}}] — the flow scripts" } }, required: ['risk', 'tests'] },
-    run: async (state, a) => ({ data: affectedData(a.risk, a.tests || []) }),
   },
   {
     name: 'logs',

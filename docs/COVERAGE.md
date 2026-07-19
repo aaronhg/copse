@@ -9,8 +9,9 @@ copse and coir are siblings that read the **same** Cocos UI from two sides:
   best-effort `reachable`/`interactable`/`visible`.
 
 Neither one alone answers *"is every wired button actually reachable and working?"* Joined, they
-do. This doc is the recipe. There is **no code coupling** between the two tools — the join lives in
-the agent (or a small script); both just have to speak the same key.
+do. This doc is the recipe. There is **no code coupling** between the two tools — copse supplies the
+runtime half (`clickSurface`) and the join itself lives in **arbor** (`coverageJoin`); the two tools
+just have to speak the same key.
 
 ## The join key: `(nodePath, method)`
 
@@ -59,13 +60,13 @@ coir's ClickEvent wiring shows up as edges of kind `script` whose location `prop
   `click → method()` and point at the handler script (→ the real class name).
 
 The exact calls don't matter to the join — only that you end up with `(nodePath, method)` + the
-real class name. `scripts/coverage-demo.js` uses a fixture standing in for this assembled result.
+real class name. (arbor's `test/join.test.mjs` uses a fixture standing in for this assembled result.)
 
 ## The buckets
 
 Join copse's `click_surface` against coir's static map on `(nodePath, method)`. The pure helper
-**`coverageJoin(staticRows, runtimeRows)`** (`copse/src/coverage.js`, exported from the barrel)
-does it — no engine, no deps — bucketing every wired button into **seven** buckets:
+**`coverageJoin(staticRows, runtimeRows)`** — which lives in **arbor** (`arbor/src/join.mjs`), not
+copse — does it — no engine, no deps — bucketing every wired button into **seven** buckets:
 
 | Bucket | Condition | What it means / do next |
 | --- | --- | --- |
@@ -78,7 +79,8 @@ does it — no engine, no deps — bucketing every wired button into **seven** b
 | 👻 **codeOnly** | copse only — `method:null`, no detectable code handler | live but bare/unknown (touch-wired or possibly dead) |
 
 `coverageJoin` matches in two tiers: **exact** (`runtimeRef === nodePath`), then a **symmetric tail** match
-(the shorter path is a segment-suffix of the longer, `[i]` ignored) with a **min-overlap floor** — a lone
+via copse's public `tailMatch` primitive (the shorter path is a segment-suffix of the longer, `[i]` ignored)
+with a **min-overlap floor** — a lone
 generic leaf (`btn`/`close`) won't fuzzy-match an unrelated deep ref; only a tail ≥2 segments, or a full
 exact-length 1-segment alignment, passes. It absorbs the two tools' different rootings: coir's path can be
 *longer* (it includes the scene/prefab-file root copse omits → reported as `dropped`) or *shorter* (a prefab
@@ -88,24 +90,19 @@ row tail-matches one static row → `ambiguous` (`fan-out`); one live button cla
 
 ## Run it
 
-**One call, live** — the whole join is a first-class entry (no barrel-wiring by hand):
+**The join runs in arbor**, which pulls both halves and buckets them:
 
 ```bash
-copse coverage <url> coir-rows.json     # connect → clickSurface(live) → coverageJoin → buckets JSON
+arbor coverage <url> coir-rows.json     # copse clickSurface(live) + coir static rows → coverageJoin → buckets JSON
 ```
 
 `coir-rows.json` is coir's static ClickEvent rows (`[{nodePath, method}]`, a file path or inline JSON — get
-it from coir's CLI/MCP). The MCP edge exposes the same op as the **`coverage`** tool (`{staticRows}` →
-buckets), so an MCP client runs the cross-reference in one step. `--no-reachable` skips the reachable pass.
+it from coir's CLI/MCP). copse's own shell-level surface is just the runtime half: `copse scan <url>` (or the
+**`click_surface`** MCP tool / `cp.clickSurface()`) emits the join-ready runtime rows; arbor joins them against
+coir's static map. There is no `copse coverage` CLI and no `coverage` MCP tool anymore — the join is arbor's.
 
-**Offline demo** (no browser/coir/deps — proves the join end-to-end):
-
-```bash
-node scripts/coverage-demo.js
-```
-
-It builds a fake live scene (real copse `snapshot` + `clickSurface`) + a coir static fixture, joins them,
-and prints the buckets — the same logic the `coverage` tool/CLI run against a real game.
+The join itself (`coverageJoin` + the bucket logic) lives in **arbor** now (`arbor/src/join.mjs`), with the
+offline, browser-free demo of it in arbor's `test/join.test.mjs`.
 
 ## Caveats (be honest)
 

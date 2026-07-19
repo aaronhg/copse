@@ -14,7 +14,7 @@
 // (reference/cocos/3.8.6): NodeEventProcessor.{capturingTarget,bubblingTarget,shouldHandleEventTouch},
 // CallbacksInvoker._callbackTable → CallbackList.callbackInfos — the primaries in copse's `||` ladders.
 
-import { describe } from './framework.js';
+import { describe } from '../core/framework.js';
 
 const present = (v) => v !== undefined && v !== null;
 

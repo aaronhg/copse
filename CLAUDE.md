@@ -37,8 +37,9 @@ scene. copse's own launch mode is the standalone fallback. See `docs/MCP.md`.
 - **Live verification**: snapshot / `press → get` round-trips through real handler logic (a
   state-delta mutation read back off a component), reachability flagging a covered button
   (`blockedBy`), and panel open/close via `changed`.
-- **AI-driver** (`copse ai`): multi-round flows on a running game — panel open+close, a
-  setting toggle, a one-action state delta — all PASS (report-driven verdict).
+- **Executor** (`execute`): runs a step list on a running game and reports the FACTS
+  (`unreachable`/`errored`/`undriven`/`uncertain`/`visual`) — no agent, no loop, no verdict.
+  The plan→execute→judge LOOP + verdict moved to the sibling **arbor**, which drives `execute`.
 - **MCP** (`copse mcp`): the bridge as MCP tools; verified driving a running game **natively
   from Claude Code** (open → dismiss → press → panel via `changed.appeared` → press
   close → `changed.disappeared`), no browser-use, adaptive (waited for a toggle to enable).
@@ -54,12 +55,12 @@ scene. copse's own launch mode is the standalone fallback. See `docs/MCP.md`.
 ```bash
 npm test           # node:test over FAKE trees (no engine, no install) — test/*.test.js (core + harness + mcp)
 npm run typecheck  # tsc --noEmit (JSDoc); needs `npm install` for the dev deps only
-npm run build      # build:full + build:lite + build:probe → dist/copse.inject{,.lite,.probe}.js (IIFEs, gitignored)
+npm run build      # build:full + :lite + :probe + :pixi → dist/copse.inject{,.lite,.probe,.pixi}.js (IIFEs, gitignored)
 ```
 
-Run it: `copse ai <url> --goal "…"` / `copse scan <url>` / `copse mcp [url]` / single-shot
-`copse get|press|call|node|reachable <url> <sel>` / `copse coverage <url> <coir-rows.json>` (the coir×copse join)
-/ `copse run <url> <script.json>` (deterministic script replay → exit 0/1, `docs/SCRIPTS.md`)
+Run it: `copse scan <url>` / `copse mcp [url]` / single-shot
+`copse get|press|call|node|reachable <url> <sel>` / `copse run <url> <script.json>`
+(deterministic script replay → exit 0/1, `docs/SCRIPTS.md`)
 (the CLI is `src/cli.js`, runs directly; only `dist/copse.inject{,.lite,.probe}.js` are ever built). MCP: `claude mcp add copse -- node <abs>/src/cli.js mcp`
 or a project `.mcp.json` — then any MCP client (Claude Code / browser-use) drives the canvas (see `docs/MCP.md`).
 
@@ -81,6 +82,18 @@ The one load-bearing decision mirrors coir's `FileProvider`: **the logic is deco
 from the engine through a minimal `Runtime` adapter**, so the pure core is testable in
 Node against plain-object trees.
 
+**Boundary (the `coir` · `copse` · `arbor` family).** Three tools, one rule:
+**needs project files → coir** (static analyzer) · **needs a running game → copse** (this repo) ·
+**has judgment/policy → arbor** (the AI-QA framework).
+
+copse OWNS the **deterministic runtime driver**: the primitives (`snapshot`/`press`/`get`/`call`/
+`reachable`/…), `clickSurface` (the runtime click surface — the copse half of the coir join), `execute`
+(run a step list → report FACTS), `run` (frozen-script replay → exit code), and the MCP server.
+**No LLM, no loop, no verdict.** copse does NOT read project files (→ **coir**), and does NOT decide
+*what to test* or *whether it passed* — the plan→execute→judge LOOP, the pass/fail verdict + veto, the
+coir×copse coverage JOIN (`coverageJoin`), test selection (`affected`), and capability branching all live
+in **arbor**, which *drives* copse's `execute`. copse only drives a live game and reports facts.
+
 Layout (grouped by concern; `src/index.js` is the public barrel):
 
 - `src/core/index.js` — **pure core**, engine-free. `snapshot` / `clickSurface` / `resolve` /
@@ -90,19 +103,58 @@ Layout (grouped by concern; `src/index.js` is the public barrel):
   for a member. `#N` absolute indices are intentionally unsupported (no stable index). The full
   grammar copse implements (a subset of coir's) + divergences are in `docs/SELECTORS.md`, pinned
   by `test/selectors.test.js`.
-- `src/coverage.js` — **pure** coir × copse bridge: `coverageJoin(staticRows, runtimeRows)` buckets
-  every wired button into covered / blocked / unreached / ambiguous / code-only on the shared key
-  `(nodePath, method)`. Two-tier match: exact + **symmetric tail** (shorter path is a segment-suffix of the
-  longer, `[i]` fuzzy) — absorbs the two rootings: coir's scene/prefab-file root (`dropped`) and a prefab's
-  instantiation `mount`; >1 tail candidate → ambiguous. `clickSurface` produces its copse side. Verified
-  live (the symmetric case is what a real scene needs — coir paths carry the scene-root prefix). See `docs/COVERAGE.md`.
+- `src/core/bridge.js` — the **engine-neutral half of the in-page `__copse` surface**, hoisted out of
+  `install()` so a second engine layer reuses ONE implementation instead of forking it (`docs/ENGINES.md`).
+  `makeBridge({rt, root, target, engine})` returns the whole API — read+drive (`snapshot`/`press`/`get`/`call`/…),
+  `watch`, `patch`/`patch_clear`/`patch_calls`, `hold`/`release`, `orient`, and the `pm*`/`pm.*` framework
+  surface. The `engine` **port** is the only engine-aware seam: `freeze`/`unfreeze`/`canFreeze` (hold),
+  `visualManifest` (node→screen px), `probe` (coupling self-diagnostic), `version`. The engine layer's
+  `install()` supplies those four and assigns the result to `target.__copse`.
+- `src/core/framework.js` + `src/core/eval-cond.js` — engine-free helpers (they live in `core/` because
+  `bridge.js` needs them and core must never import from an engine dir). `framework.js` is the generic
+  framework-adapter engine (pure over a `win` + adapters array); `eval-cond.js` is the shared
+  `safeVal`/`safeBool`/`parseDur`/`jsonSafe` used by both `watch`'s `until:` and the probe bundle's `--until`.
+- `src/coverage.js` — the **pure** coir↔copse ref-matching layer: `tailMatch(staticPath, runtimeRef)`
+  (the shared vocabulary — now a **PUBLIC** export via the barrel) + the interop adapters
+  `resolveCoirPath`/`resolveCopseRef` that translate a coir STATIC nodePath ↔ a copse RUNTIME `ref`
+  against a live view (a `clickSurface`/`snapshot` result). Two-tier match: exact + **symmetric tail**
+  (shorter path is a segment-suffix of the longer, `[i]` fuzzy) — absorbs the two rootings: coir's
+  scene/prefab-file root (`dropped`) and a prefab's instantiation `mount`; >1 tail candidate → ambiguous.
+  These stay in copse because they resolve against a live tree. The coverage JOIN itself (`coverageJoin` —
+  the bucketing/verdict) + `affected` (test selection) **moved to arbor** — pure control-layer
+  reconciliation, needing neither files nor a live game. `clickSurface` (core) still produces copse's
+  runtime side. See `docs/COVERAGE.md`.
+- `src/capabilities.js` — **NEW**: `engineCapabilities(engine)` → the per-engine capability profile
+  `{engine, clickSurface, stableRefs, reachability, visualManifest}`, so a consumer (arbor, or any
+  harness) BRANCHES on facts instead of silently assuming Cocos (`clickSurface`/`stableRefs` are
+  Cocos-only; `reachability`/`visualManifest` are on both engines; `engine:null` zeroes everything).
+  Exported from the barrel; the driver's `.capabilities` getter returns it for the resolved engine.
+- `src/pixi/` — the **PixiJS 8 engine layer** (the second engine; `docs/ENGINES.md` is the rationale and
+  the measured evidence). Same shape as `src/cocos/`: a `Runtime` + the engine port, everything else shared
+  from `src/core/bridge.js`. Verified end-to-end against a MINIFIED production build of `pixijs/open-games`.
+  - `pixitype.js` — node identity. `constructor.name` is mangled in prod AND polluted in dev (Vite renames
+    Pixi's own classes), and `label` is a DECOY (Pixi's constructors set `label:"Sprite"`/`"Graphics"`
+    themselves), so type comes from `renderPipeId` duck-typing and a name is `gameLabel(n) ?? pixiType(n)`.
+  - `anchors.js` — the semantic skeleton. Pixi has no components, so addressing anchors on the game's own
+    screen classes (`show`/`hide`/`resize`, the measured stable intersection) and then uses THEIR named
+    fields (`_game`, `match3`, `pauseButton`) — minify-proof, unlike any path. Holds the three
+    silent-failure traps (Pixi-surface subtraction, instance fields, back-reference cycles).
+  - `reachable.js` — `hitTest` IS the oracle, so this is ~60 lines vs Cocos's ~230 z-order replay. Primes
+    `rootBoundary.rootTarget` first: `hitTest` THROWS cold, which nothing documents.
+  - `press.js` — real DOM PointerEvents at the canvas (all three phases, same pointerId,
+    `pointerType:'mouse'` — each measured, each load-bearing). ASYNC. Inherently reachability-gated,
+    the opposite of Cocos's default; `force:true` falls back to `emit` and says so (`drove:'emit-unsafe'`).
+  - `visual.js` / `probe.js` / `runtime.js` (`pixiRuntime`/`install`/`findPixi`/`installInitHook`) /
+    `inject.js` (the build entry — arms `__PIXI_APP_INIT__` FIRST, since that only works pre-boot).
 - `src/cocos/` — the **engine-coupled** layer (the only place that touches `cc.*`):
   - `runtime.js` — the `Runtime` adapter over ONE shared `baseRuntime(cc)` (`press`/`get`/`call` driving +
     `codeHandlers` via `_eventProcessor` + `nodeInfo` intrinsics), in two shapes: `cocosRuntime(cc)` =
     base **+ `reachable`**, `cocosRuntimeLite(cc)` = base ONLY. Plus `findCC()` (walk same-origin
     (i)frames → the game's `cc`), `startLogCapture()` (patch `console.*` + errors), and the two installers:
-    `install(cc)` (full `window.__copse`: `snapshot`/`interactive`/`press`/`get`/`call`/`reachable`/`node`/`diff`/
-    `listeners`/`probe`/`logs`), `installLite(cc)` (minimal: `snapshot`/`press`/`get`/`call`/`node`/`diff`/`listeners`),
+    `install(cc)` — now a **thin wrapper**: it builds the runtime + the four-member ENGINE PORT
+    (`freeze`/`unfreeze`/`canFreeze` over `cc.game.pause`→`cc.director.pause`, `visualManifest`, `probe`,
+    `ENGINE_VERSION`) and hands them to `makeBridge` (`src/core/bridge.js`), which supplies the whole
+    `window.__copse` surface — `installLite(cc)` (minimal: `snapshot`/`press`/`get`/`call`/`node`/`diff`/`listeners`),
     and `installProbe(cc)` (read+drive metrics surface: `probe`/`firstClickable`/`find`/`interactive`/`reachable`/`press`
     + `assetsPending` — keeps reachability, drops snapshot-extras/get/call/diff/logs; for a load-metrics driver).
     All verified on a dev/preview build.
@@ -122,16 +174,17 @@ Layout (grouped by concern; `src/index.js` is the public barrel):
     (`probe`/`firstClickable`/`find`/`reachable`/`press` + `assetsPending`). Keeps reachable.js but drops
     snapshot-extras/get/call/diff/logs → `dist/copse.inject.probe.js` (`copse/inject-probe` export). Consumed by
     mast's **extension** to time a Cocos game's load (first-interactive / assets-idle) and drive past the intro.
-- `src/harness.js` — **pure AI-driver loop** (`runHarness`), decoupled like the core: over a
-  `Driver` adapter (`localDriver(scene, rt)` builds one over an in-process tree) and an
-  `Agent` adapter whose `plan`/`judge`/`next`/`report` are the AI seams (`next`/`report`
-  optional). Loop `snapshot → (plan → execute → judge) → maybe iterate → report`, `maxRounds`-
-  bounded, policy-free, throwing steps captured not fatal. Prompt-agnostic: `opts.context` is
-  passed verbatim to every stage. No engine/LLM dep — those live at the adapter edges below.
-  **Lane (post-scripts):** the headless edge — unattended CI smoke over un-scripted flows
-  (`copse ai --goal`), fact gates over LLM opinion, and a **script factory** (`rounds[].steps`
-  freeze 1:1 into scripts). Interactive exploration belongs to Claude Code over MCP; known-flow
-  regression belongs to `src/script.js`. Don't invest in making the harness's agent smarter.
+- `src/harness.js` — the **deterministic flow executor** (`execute`/`extractFacts`/`localDriver`),
+  decoupled like the core: over a `Driver` adapter (`localDriver(root, rt)` builds one over an
+  in-process tree). `execute(driver, steps, opts?)` runs a step list and returns `{ steps, facts }` —
+  per-step results + the five FACT buckets `extractFacts` derives (`unreachable`/`errored`/`undriven`/
+  `uncertain`/`visual`). **NO agent, NO loop, NO pass/fail verdict** — a covered-button press, a
+  handler that threw, a press that drove nothing are reported as FACTS; whether any of them fails a
+  run is the consumer's call. `reachableGate`/`visualGate` only toggle whether those facts are
+  gathered (not a verdict). No engine/LLM dep. The plan→execute→judge LOOP + the verdict/veto + the
+  `claude -p` agent moved to the sibling **arbor** (its `runLoop`) — copse stays deterministic; arbor
+  drives `execute`. Exported from the barrel + `copse/harness`. Interactive exploration belongs to
+  Claude Code over MCP; known-flow regression belongs to `src/script.js`.
 - `src/script.js` — **pure deterministic script runner** (`runScript` + `subsetMatch`): replays a
   FROZEN flow (JSON steps + subset-match `expect`s, `docs/SCRIPTS.md`) over the same `Driver`
   adapter — the zero-LLM regression half. Step = the harness `Step` shape (+`expr`/`ms`/`since`) +
@@ -141,15 +194,26 @@ Layout (grouped by concern; `src/index.js` is the public barrel):
   overrides its gate). Stops at the first fail (`continueOnFail` runs all); empty steps →
   `pass:false`; per-step `{step, ok, ms, mismatch?/gate?, result?}`.
 - `src/drivers/puppeteer.js` — **optional** driver (`copse/driver-puppeteer`): `connect(url)`
-  launches system Chrome (puppeteer-core peerDep), injects the bundle → a `Driver` for runHarness.
+  launches system Chrome (puppeteer-core peerDep), injects the bundle → a `Driver` (the shape `execute` consumes).
+  **`connect({engine:'pixi'})`** drives PixiJS 8 instead (`docs/ENGINES.md`): it picks
+  `dist/copse.inject.pixi.js` and injects it via `evaluateOnNewDocument` **before** `goto` — Pixi's
+  `__PIXI_APP_INIT__` hook fires once during `Application.init`, so a post-load evaluate misses it
+  entirely (that ordering is the whole reason the option must be set at connect time). The same
+  registration survives navigation, so `reload()`/auto-reconnect re-arm for free; attach mode can't
+  pre-inject and falls back to a direct evaluate + `findPixi`. On pixi, `clickSurface`
+  REFUSEs with an explanation (§5 — an empty join would read as "nothing is wired"), `anchors()`
+  replaces it, and `cp.engine`/`cp.capabilities` are surfaced so callers branch without sniffing the page.
+  **`engine:'auto'`** resolves by probing the live page (pre-injecting the Pixi bundle as cheap
+  insurance, since the hook must be armed before detection is possible). `copse doctor` DEFAULTS to
+  auto — it's the "why won't it even run" command, so requiring you to already know the engine would
+  defeat it; it reports `engine` (null when nothing identified itself), `injected`, and what it looked
+  for. A page with no engine no longer throws: `cp.installed` is false and reads degrade.
   Attach mode (`{attach:true, browserURL, match?}`) drives an already-open tab; **no `match`/url →
   the ACTIVE tab** (visibilityState/hasFocus probes, race-bounded so a paused tab can't hang the
   scan — a paused game must be attached via `match`). `cp.reload()` (factored `bootInPage`)
   re-navigates the tab + re-injects — picks up the editor's CURRENT
   scene after `scene_open_scene`, and recovers a wedged/empty preview (attach-found-`getScene()===null`).
   Browser-glue, so deliberately not `@ts-check`ed.
-- `src/agents/claude.js` — **optional** agent (`copse/agent-claude`): `makeClaudeAgent({goal,
-  stopCondition,reportFormat})` → an `Agent` backed by the `claude -p` CLI (no npm dep).
 - `src/debug.js` — **optional** edge (`copse/debug`): `attachDebugger(cp.page)` → breakpoints + call
   stack over the CDP **Debugger** domain. iframe-aware (attaches to page + iframe/OOPIF targets; resolves
   across all contexts). `breakAt(urlRegex,line)` + `breakIn('path:Comp.method')`
@@ -164,7 +228,7 @@ Layout (grouped by concern; `src/index.js` is the public barrel):
   `HEADLINE` per family — each description prefixed `[family ★]`/`[family]` so the flat surface reads as a
   guided map (signposting, not gating; families: session/see/read/drive/usable/observe/fix/coverage/script/orient/escape,
   `eval` alone in `escape` — the raw hatch, no ★); `tools.js` = the tool registry — 40 testing primitives
-  (`connect`/`list_tabs`/`reload`/`snapshot`/`interactive`/`click_surface`/`resolve`/`coverage`/`press`/`get`/`call`/`eval`/`reachable`/`node`/`diff`/
+  (`connect`/`list_tabs`/`reload`/`snapshot`/`interactive`/`click_surface`/`resolve`/`press`/`get`/`call`/`eval`/`reachable`/`node`/`diff`/
   `listeners`/`orient`/`probe`/`logs`/`watch`/`hold`/`release`/`hold_status`/`patch`/`patch_clear`/`patch_calls`/`framework`/`register_framework`/`pm_get`/`pm_set`/`pm_call`/`pm_patch`/`pm_notify`/`network`/`screenshot`/`visual_check`/`visual_baseline`/`run_script`/`dump_script`/`close`)
   + 7 `debug:true`-tagged Debugger tools (`break_*`/`wait_pause`/
   `eval_frame`/`debug_step`/`clear_breakpoints`, family `debug`), **hidden from `tools/list` by default**
@@ -174,51 +238,59 @@ Layout (grouped by concern; `src/index.js` is the public barrel):
   tools (press/get/call/node/reachable/eval/snapshot/interactive) are wrapped at the bottom of tools.js to
   push `{…step, observed}` onto `state.history` on success — `dump_script` exports that recording as a
   script skeleton (`docs/SCRIPTS.md`); `connect` resets it. The valuable part of copse is this bridge; the
-  agent loop is replaceable.
-- `src/cli.js` — the **CLI** (registered as `copse`; runs directly, no build): `copse ai <url> --goal …`
-  / `copse scan <url>` / `copse mcp [url] [--no-debug]` / single-shot `copse get|press|call|node|reachable
-  <url> <sel>` (connect → one primitive → JSON → close, for shell/jq) / `copse coverage <url> <coir-rows.json>`
-  (connect → clickSurface + coverageJoin → buckets — the coir×copse capability at the shell) / `--version`.
-  Thin wrapper over `connect` + `makeClaudeAgent` + `runHarness`;
-  heavy/optional bits (puppeteer driver, claude agent, MCP server) are **lazy-imported** per command so
-  `copse --help` / `copse mcp` don't require puppeteer-core. (Layout matches coir: no `bin/` dir.)
+  plan→judge loop sits above it (arbor's layer).
+- `src/cli.js` — the **CLI** (registered as `copse`; runs directly, no build): `copse scan <url>`
+  / `copse mcp [url]` / single-shot `copse get|press|call|node|reachable <url> <sel>` (connect → one
+  primitive → JSON → close, for shell/jq) / `copse run <url> <script.json>` (deterministic script
+  replay → exit 0/1) / `--version`. Thin wrapper over `connect` + the primitives + `runScript`;
+  heavy/optional bits (puppeteer driver, MCP server) are **lazy-imported** per command so
+  `copse --help` / `copse mcp` don't require puppeteer-core. (The AI-driver loop is NOT here — that's
+  arbor's layer, built on copse's `execute`.) (Layout matches coir: no `bin/` dir.)
 - `test/core.test.js` — `node:test` over a fake tree (the place to add core tests; incl. `clickSurface`).
 - `test/selectors.test.js` — selector-grammar conformance: copse's `[i]`/member/divergence semantics +
   an interop corpus (coir-emitted paths must resolve in copse). Pins the contract in `docs/SELECTORS.md`.
-- `test/coverage.test.js` — the `coverageJoin` buckets incl. the prefab-internal prefix match + ambiguity.
-- `test/harness.test.js` — the harness loop over a fake driver + deterministic agent.
+- `test/coverage.test.js` — the coir↔copse selector resolvers (`resolveCoirPath`/`resolveCopseRef`) incl. the prefab-internal tail match + ambiguity (the `coverageJoin` buckets moved to arbor).
+- `test/harness.test.js` — `execute` + `extractFacts` over a fake driver: step order, throw capture, and the five FACT buckets (no verdict, no agent).
 - `test/script.test.js` — the script runner over a fake driver: subset/contains + mismatch paths,
   the default ok/errors/drove judgment, expect-overrides-gate, sleep, stop-on-fail vs continueOnFail.
 - `test/mcp.test.js` — the MCP JSON-RPC dispatcher (`createDispatcher`) over a fake driver.
 - `test/reachable.test.js` — `cocosRuntime(cc).reachable` over a geometric fake `cc` (the only place the engine-coupled reachable runs in CI).
+- `test/pixi.test.js` — the Pixi layer over a fake Pixi tree. Pins what was MEASURED on a real minified
+  build, because each of these regresses SILENTLY: decoy labels vs identity, a listener-less background
+  not being a button, the three anchor traps, `alwaysIndex` ref stability, and refOf/snapshot ref agreement.
 - `test/runtime-lite.test.js` — the base/lite split contract (lite omits `reachable`; `press` works over lite).
 - `test/probe.test.js` — `probe(cc)` over a 3.8.6-shaped fake (which internals resolve; tree-shaken/no-scene degrade).
 - `test/real-engine.l2.test.js` (+ `test/helpers/real-engine.js`) — **L2**: copse's reads against a REAL Cocos engine.
   esbuild-bundles the event source from `reference/cocos/<ver>` (gitignored local checkout; virtual/deep-leaf modules
   stubbed) → a real `CallbacksInvoker`, and asserts `codeHandlers` parses the real `_callbackTable`. SKIPS when no
   engine is checked out. Add a version: `git clone --depth 1 -b v3.8.6 https://github.com/cocos/cocos-engine reference/cocos/3.8.6`.
-- `docs/COVERAGE.md` — the **coir × copse** join recipe: `clickSurface`/`click_surface` → `coverageJoin`
-  cross-references copse's runtime click surface with coir's static ClickEvent map on `(nodePath, method)`
-  → buckets (covered / blocked / unreached / ambiguous / code-only). Runnable proof: `scripts/coverage-demo.js`.
+- `docs/COVERAGE.md` — the **coir × copse** join recipe: `clickSurface`/`click_surface` emits copse's
+  runtime click surface (`(ref, method)` rows); the JOIN itself (`coverageJoin` → buckets covered /
+  blocked / unreached / ambiguous / code-only) now lives in **arbor**. copse keeps the interop resolvers
+  (`resolveCoirPath`/`resolveCopseRef`).
 - `docs/SELECTORS.md` — copse's selector grammar as a **subset of coir's** (canonical: coir/docs/EDITING.md §3):
   the shared core, copse's divergences (no `#N`/component-`[i]`/array-`[i]`, always index-parses `[i]`,
   minified comp names) + its `Node` pseudo-component. Pinned by `test/selectors.test.js`.
+- `docs/ENGINES.md` — the **second-runtime verdict (Pixi 8)**: whether the `Runtime` seam holds for a
+  non-Cocos engine, empirically verified against `pixijs/open-games` (pixi 8.14.1, dev + **minified prod**).
+  Attach via the unconditional `__PIXI_APP_INIT__` core hook (zero game cooperation); `:Comp.member`
+  transfers INTACT (minifiers spare property/method names — `…:Node.startPlaying()` works on a prod build)
+  while name-based **paths** do not (`label` is a Pixi constructor default, `constructor.name` is mangled),
+  so the Pixi lane is `find`-first; `press`+`reachable` FUSE (real DOM PointerEvents through the engine's
+  own pipeline); `clickSurface` does NOT apply (no serialized handlers); `watch`/`diff` survive
+  with no core change and should land first. Lists the two required core changes (bridge.js hoist,
+  nested member paths) and the traps that fail silently. **Researched, not implemented.**
 - `docs/MCP.md` — drive copse from any MCP client (Claude Code / browser-use); incl. **attach** mode
   for your own game behind a login/staging gate (attach to your own browser over CDP, no navigation).
 - `docs/SCRIPTS.md` — test scripts: format + subset-match semantics + the
   explore→`dump_script`→trim→`run_script`/`copse run` workflow (freeze an explored flow into a
-  deterministic replay; also freezes 1:1 from `runHarness` rounds).
+  deterministic replay; also freezes 1:1 from an `execute` run's step list).
 - `docs/DEBUG.md` — `copse/debug` (CDP Debugger): breakpoints (incl. `break_in path:Comp.method`) +
   call stack / `eval_frame` / step, as MCP tools — for your own dev build.
 - `docs/INJECT.md` — the three ways to inject + the AI test loop.
-- `docs/AI-DRIVER.md` — the harness wired to real Playwright + an LLM agent, two
-  backends: the Anthropic SDK (`claude-opus-4-8`) or the `claude -p` CLI (no SDK, no API key).
-- `scripts/ai-driver-demo.js` — **runnable** end-to-end demo: `localDriver` over a fake
-  shop scene + the `claude -p` agent. `node scripts/ai-driver-demo.js` runs the whole AI
-  loop with no browser/game/npm-deps (needs the `claude` CLI). Throwaway-free smoke.
-- `scripts/coverage-demo.js` — **runnable** proof of the coir × copse join: real `snapshot`+`clickSurface`
-  over a fake scene + a coir static fixture → the four-quadrant coverage report. `node scripts/coverage-demo.js`,
-  zero deps, no browser, **no CLI** (unlike ai-driver-demo). See `docs/COVERAGE.md`.
+- `docs/AI-DRIVER.md` — copse's one AI-testing rail, `execute(driver, steps, opts?)`: runs a step
+  list, reports the FACTS — no plan/loop/judge. The autonomous LOOP + verdict/veto live in **arbor**,
+  which drives `execute`.
 
 `window.__copse` API once installed:
 ```js
@@ -250,7 +322,7 @@ __copse.pmPatch('StartCommand.execute', {trace?})  // patch a proxy/mediator INS
 __copse.pmNotify('StartFlow', body?, type?)   // fire a framework notification — the direct flow entry → { ok, via, value }
 __copse.pm.get(sel) / pm.set(sel,v) / pm.call(sel,...args) / pm.notify(name,body?,type?) / pm.patch(sel,hooks)  // `pm.*` = a stable, eval-ergonomic namespace over the camelCase members above (the snake_case TOOL names like `pm_get` DON'T exist in-page → `__copse.pm_get` throws). pm.proxy('GameDataProxy') / pm.mediator('XxxViewMediator') hand back the RAW live object to poke.
 ```
-**Framework-aware access is a PLUGIN, not core knowledge** (`src/cocos/framework.js` is a generic adapter
+**Framework-aware access is a PLUGIN, not core knowledge** (`src/core/framework.js` is a generic adapter
 engine — no PureMVC baked in; not every game has a framework and those that do wire it differently). The
 driver auto-loads adapters from `copse.frameworks.mjs` (this machine's, next to the package, **git-ignored**;
 then a per-project one in cwd) + `connect({frameworks})` / `--framework <file>` / the `register_framework`
@@ -322,8 +394,8 @@ or playtest QA.
 ## Conventions
 
 - **Zero runtime deps.** DOM-free / engine-free pure core (`src/core/`); the `cc.*`
-  coupling lives only in `src/cocos/`. The browser driver (`src/drivers/`, puppeteer-core)
-  and LLM agent (`src/agents/`) are optional **peer**-dep edges, never runtime deps.
+  coupling lives only in `src/cocos/` (Pixi in `src/pixi/`). The browser driver (`src/drivers/`,
+  puppeteer-core) is an optional **peer**-dep edge, never a runtime dep.
 - **Types** via JSDoc + `// @ts-check` (no `.ts` files); `npm run typecheck` is
   `tsc --noEmit` with `allowJs`/`checkJs:false`/`strict:false` — same posture as coir.
   (`src/drivers/puppeteer.js` opts out — its `page.evaluate` callbacks are browser code.)
@@ -342,8 +414,8 @@ or playtest QA.
 
 Done so far: build step → `dist/copse.inject.js`; `press → get` incl. a **state-delta**
 mutation (read back off a component); code-registered handlers
-(`codeHandlers`/`listeners`); AI-driver harness (`runHarness` + `copse ai`, report-driven
-verdict, evidence-fed `next`); best-effort reachability (`reachable`/`blockedBy`); slim snapshot +
+(`codeHandlers`/`listeners`); the deterministic executor (`execute`/`extractFacts` — FACTS, no
+verdict; the plan→judge LOOP moved to arbor); best-effort reachability (`reachable`/`blockedBy`); slim snapshot +
 settle + descriptor-rich `changed`; **MCP** (`copse mcp`, hand-rolled stdio, verified driving a
 running game natively from Claude Code); **test scripts** (`runScript` + `run_script`/`dump_script`
 session recording + `copse run` — freeze an explored flow into a deterministic zero-LLM replay,
@@ -363,8 +435,9 @@ Remaining:
    fail-loud `'unsure'`+`reason`; `visible` (opacity/scale). Remaining: alpha hit-areas, opaque-sprite visual
    occlusion (`occludedBy` is bbox best-effort), and `preventSwallow`/event-penetration (decided in-handler →
    statically unknowable).
-3. ✅ **Wire `reachable` into the harness** — a press to a covered/unreachable button is now a HARD fail in
-   `runHarness` (overrides judge+report; surfaced as `out.unreachable`; `force`/`reachableGate:false` opt out).
+3. ✅ **Surface `reachable` as a FACT** — a press to a covered/unreachable button is reported in
+   `execute`'s `facts.unreachable` (`force`/`reachableGate:false` opt out); whether it fails a run is the
+   consumer's verdict (arbor's).
 4. **MCP v2** — ✅ `diff`/`listeners`/`probe` tools added (hijack/captured dropped with the probe refactor);
    debug tools advertised by default
    (`--no-debug` hides them — flipped once chrome-devtools-mcp made the Debugger surface the copse-unique part);
@@ -374,6 +447,6 @@ Remaining:
    silent wrong-tab attach); ✅ **`hold`/`release`** — freeze the engine loop at a trigger to screenshot/inspect
    a transient state (the ~1s intermediate window a self-running flow blows past).
    Remaining: multi-session, a browser-use custom-actions example.
-5. ~~**Adaptive re-planning within a round**~~ — DEPRIORITIZED: that's "make the harness's agent
-   smarter", and interactive/adaptive exploration is Claude Code over MCP's lane now (the harness's
-   value is the deterministic shell + gates + script factory, not a smarter brain).
+5. ~~**Adaptive re-planning within a round**~~ — MOVED TO ARBOR: the plan→execute→judge loop (and any
+   smarter re-planning) is arbor's layer now. copse's value is the deterministic `execute` + facts +
+   gates + script factory; interactive/adaptive exploration is Claude Code over MCP's lane.

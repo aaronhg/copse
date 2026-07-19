@@ -41,12 +41,11 @@ a minimal `Runtime` adapter**, so the pure core is testable in Node against plai
 
 ```
 src/core/index.js   snapshot / resolve / press / get / call / reachable / node / diff   ← pure, no engine
-src/cocos/          runtime.js (base+lite cc.* adapter + install/installLite) · reachable.js (z-order, full-only → tree-shaken from lite) · probe.js (self-diagnostic) · inject.js/inject-lite.js (build entries)  ← the ONLY engine layer
-src/harness.js      runHarness — the AI loop, pure over a Driver + Agent adapter
+src/cocos/          runtime.js (base+lite cc.* adapter + install/installLite) · reachable.js (z-order, full-only → tree-shaken from lite) · probe.js (self-diagnostic) · inject.js/inject-lite.js (build entries)  ← the Cocos engine port
+src/harness.js      execute / extractFacts / localDriver — the deterministic FLOW EXECUTOR (facts, no loop/verdict), pure over a Driver adapter
 src/drivers/        puppeteer.js — optional browser driver (peer dep)
-src/agents/         claude.js   — optional claude -p agent (no npm dep)
 src/mcp/            server.js + tools.js — optional MCP edge (copse as tools for any agent)
-src/cli.js          the CLI (ai / scan / mcp; no bin/ dir, matches coir)
+src/cli.js          the CLI (scan / mcp / run; no bin/ dir, matches coir)
 ```
 
 The `Runtime` contract is the whole engine surface copse needs (`name`/`children`/`isActive`/
@@ -85,7 +84,7 @@ are byte-identical across the two.
 | Decision | Rationale |
 |---|---|
 | esbuild as a **devDep**, output an IIFE | One self-contained blob; runtime stays zero-dep |
-| Inject entry imports only the **in-page** surface (not the barrel) | `runHarness`/drivers run Node-side; no reason to ship them in the page blob |
+| Inject entry imports only the **in-page** surface (not the barrel) | `execute`/drivers run Node-side; no reason to ship them in the page blob |
 | Auto-install on a `cc` poll (~10s) | Works for console paste *and* pre-boot `addInitScript` |
 
 Verified by eval-ing the built bundle against a real-`cc`-shaped fake: `__copse` auto-installs,
@@ -96,33 +95,42 @@ Verified by eval-ing the built bundle against a real-`cc`-shaped fake: `__copse`
 
 ---
 
-## 5. The AI-Driver Harness (`runHarness`)
+## 5. The Deterministic Executor (`execute`)
 
-The autonomous loop, **pure and zero-dep**, decoupled through two adapters so the whole thing is
-testable in Node against fakes; the real Playwright wiring and the real LLM call live only at the
-adapter edges. The AI intervention points are literal adapter methods:
+copse ships exactly one AI-testing rail: **`execute(driver, steps, opts?)`** — it runs a step list
+against the live page and reports the **FACTS**, and nothing else. **Pure and zero-dep**, decoupled
+through a single `Driver` adapter, so the whole thing is testable in Node against fakes; the real
+Playwright wiring lives only at the adapter edge.
 
 ```
-agent.plan(ctx)   → AI ①  read diff + live snapshot → what to test + the EXPECTED outcome (oracle) → steps
-driver.<op>(...)  → 機械   press / get / call against the live page (deterministic copse rail)
-agent.judge(ctx)  → AI ②  state delta vs expectation → pass / fail
-agent.next(ctx)   → AI ③  coverage / iterate decision (optional; absent ⇒ stop after one round)
-agent.report(ctx) → AI ④  shape the final report in your format (optional; → report.summary)
+execute(driver, steps)  → runs each step (press / get / call / snapshot / sleep / patch / eval) in order
+                          → { steps: [{step, result}], facts }
+extractFacts(steps)     → five buckets over the results: unreachable · errored · undriven · uncertain · visual
 ```
 
-One round = **one plan → execute its steps → judge** (+ a `next` decision). A plan can hold many
-steps. `report` runs once after all rounds. Key design points:
+`execute` does **not** plan, loop, or judge, and it never decides pass/fail — a press to a covered
+button, a handler that threw, a press that drove nothing are reported as FACTS; whether any of them
+fails a run is the **consumer's** call. `reachableGate`/`visualGate` only toggle whether the
+reachability / pixel facts are gathered (not a verdict). Key design points:
 
-- **Policy-free**: the agent decides *what* and *whether*; the harness only sequences, captures
-  every result, bounds the rounds. A throwing step is captured `{ok:false, reason:'threw'}`, not fatal.
-- **Prompt-agnostic**: `opts.context` is passed verbatim to every stage, so per-run guidance (goal
-  / stop condition / report format) rides there; static guidance is baked into the agent via a factory.
-- `localDriver(scene, rt)` builds a Driver over an in-process tree — the same shape `runHarness`
-  wants — so the loop is unit-tested with a fake driver + a deterministic agent.
+- **Policy-free**: `execute` only sequences the steps, captures every result (a throwing step is
+  captured `{ok:false, reason:'threw'}`, not fatal), and extracts the facts. *What* to test and
+  *whether it passed* are the consumer's.
+- `localDriver(root, rt)` builds a Driver over an in-process tree — the same shape `execute`
+  wants — so it's unit-tested with a fake driver, no engine.
+
+**The boundary.** The autonomous **LOOP** (plan → execute → judge → iterate), the pass/fail
+**VERDICT / veto**, and the `claude -p` agent moved to the sibling AI-QA framework **arbor** (its
+`runLoop`): arbor plans copse steps, hands them to `execute`, reads back the facts, applies its own
+veto, and iterates. copse stays deterministic — driver + primitives + `execute`; arbor is the brain
+on top. (§6 below records the two agent backends as they were built, before they moved to arbor.)
 
 ---
 
 ## 6. Two Agent Backends (SDK + `claude -p`)
+
+> **Moved to arbor.** The agent + both backends below moved to **arbor** with the LOOP (§5); copse no
+> longer ships an agent or a `copse/agent-claude` subpath. Kept here as the record of how it was built.
 
 The agent is an adapter, so it has two backends: the **Anthropic SDK** (`claude-opus-4-8`,
 adaptive thinking, `output_config.format` schema), and the **`claude -p` CLI** — which needs **no
@@ -288,14 +296,15 @@ effect* became the delta.
 
 To make it a usable tool for outside users without polluting the zero-dep core:
 
-- **Core `copse`**: zero runtime deps; exports `runHarness`/`snapshot`/… + ships `dist/copse.inject.js` (full) and `dist/copse.inject.lite.js` (lite).
+- **Core `copse`**: zero runtime deps; exports `execute`/`snapshot`/… + ships `dist/copse.inject.js` (full) and `dist/copse.inject.lite.js` (lite).
 - **Optional subpaths**: `copse/driver-puppeteer` (`connect(url)` → a Driver; **peerDep** puppeteer-
-  core, system Chrome) and `copse/agent-claude` (`makeClaudeAgent({goal,stopCondition,reportFormat})`
-  → an Agent over the `claude -p` CLI, **no npm dep**).
-- **Thin CLI** `src/cli.js` (registered as `copse`; see §14a): `copse ai <url> --goal "…"` /
-  `copse scan <url>` / `copse mcp [url]`, plus `--verbose` and `-o <folder>` (**append** the run log).
-  Later grew **single-shot** verbs — `copse get|press|call|node|reachable <url> <sel>` (connect → one
-  primitive → JSON → close, for shell/jq), and `--version`.
+  core, system Chrome) and `copse/harness` (`execute`/`extractFacts`/`localDriver` — the deterministic
+  executor). (The old `copse/agent-claude` moved to arbor with the loop.)
+- **Thin CLI** `src/cli.js` (registered as `copse`; see §14a): `copse scan <url>` / `copse mcp [url]`,
+  plus `--verbose` and `-o <folder>` (**append** the run log). Grew **single-shot** verbs —
+  `copse get|press|call|node|reachable <url> <sel>` (connect → one primitive → JSON → close, for
+  shell/jq) — plus `copse run <url> <script.json>` (frozen-script replay) and `--version`. (The
+  AI-driver loop is arbor's, not a `copse` verb.)
 - `puppeteer-core` is a **peerDependency (optional)** + devDep; a `prepare` script builds the bundle;
   `files` ships `src`/`dist`.
 
@@ -307,10 +316,11 @@ a UI scene (some interactive buttons present) before returning, fps-capped (§7/
 ## 14. Directory Layout
 
 Reorganised by concern: the pure core under `src/core/` (file = `index.js`, not the redundant
-`core/core.js`); the engine layer under `src/cocos/`; optional edges under `src/drivers/`,
-`src/agents/` and `src/mcp/`; `src/harness.js`, `src/index.js` (the public barrel) and `src/cli.js`
-(the CLI) at the top. Public import paths are unchanged (the `exports` map preserves `copse` /
-`copse/driver-puppeteer` / `copse/agent-claude`); only internal file locations moved.
+`core/core.js`); the engine layer under `src/cocos/`; optional edges under `src/drivers/`
+and `src/mcp/`; `src/harness.js`, `src/index.js` (the public barrel) and `src/cli.js`
+(the CLI) at the top. Public import paths were preserved through the reorg (the `exports` map:
+`copse` / `copse/driver-puppeteer` / `copse/harness` / `copse/mcp` / …); only internal file locations
+moved. (`copse/agent-claude` later moved to arbor with the loop.)
 
 ## 14a. copse-MCP — the bridge as tools for any agent
 
@@ -326,9 +336,10 @@ plain tool-use loop) the harness — no need to grow copse's own loop.
   **stderr** (stdout is the protocol channel — puppeteer / the inject bundle / a chatty page must not
   corrupt it), a **serialized** handler chain (two browser ops never overlap), and `createDispatcher(state)`
   split out so the protocol is unit-testable without a browser. `src/mcp/tools.js` is the registry — the
-  **17 testing primitives** (`connect`/`reload`/`snapshot`/`interactive`/`click_surface`/`resolve`/`coverage`/
+  **testing primitives** (`connect`/`reload`/`snapshot`/`interactive`/`click_surface`/`resolve`/
   `press`/`get`/`call`/`reachable`/`node`/`diff`/`listeners`/`probe`/`logs`/`close`) over a live `connect()` session in `state.cp`
-  (`press`/`call` carry the auto-`changed` delta straight through), plus **7 `debug:true`-tagged Debugger
+  (`press`/`call` carry the auto-`changed` delta straight through; the `coverage` tool has since moved to
+  arbor with the coir×copse join), plus **7 `debug:true`-tagged Debugger
   tools** (`break_*`/`wait_pause`/`eval_frame`/`debug_step`/`clear_breakpoints`, §18) that are **hidden
   from `tools/list` unless `copse mcp --debug`** (dev-build-only; pausing the runtime is intrusive). `connect`
   also takes **`attach`/`match`** to drive an already-open tab (your own game behind a login/staging gate you
@@ -436,9 +447,9 @@ end. (The Network edge — a passive asset/RPC tap — was split out into the se
 - **Headless tests** (`node:test`, zero deps): **90 cases** over fakes — core (addressing/`[i]`, press
   fire+emit+disabled/force **+ the touch fallback**, get/call, the `Node` pseudo-component, slim shape +
   `relevant`, `reachable`/`node`/`diff` plumbing), the geometric `reachable` over a fake `cc`, the base/lite
-  runtime split (`test/runtime-lite.test.js`), the `probe()` self-diagnostic, the harness loop (plan/execute/
-  judge, throwing-step capture, the reachability hard-fail gate, iteration bound, the `report` stage), the MCP
-  JSON-RPC dispatcher (`createDispatcher`), and the claude-agent factory shape (no LLM call).
+  runtime split (`test/runtime-lite.test.js`), the `probe()` self-diagnostic, the deterministic executor
+  (`execute`/`extractFacts`: step order, throwing-step capture, the five FACT buckets — no verdict, no
+  agent), and the MCP JSON-RPC dispatcher (`createDispatcher`).
 - **L2 — real engine**: `test/real-engine.l2.test.js` esbuild-bundles the event source from a local
   `reference/cocos/<ver>` checkout (gitignored) and asserts copse's `codeHandlers` parses a **real**
   `CallbacksInvoker._callbackTable` — the fragile internal read, validated against real engine code, not a
@@ -456,8 +467,8 @@ end. (The Network edge — a passive asset/RPC tap — was split out into the se
 ## 23. Conventions
 
 - **Zero runtime deps.** Engine-free pure core (`src/core/`); the `cc.*` coupling lives only in
-  `src/cocos/`. The browser driver (`src/drivers/`, puppeteer-core) and LLM agent (`src/agents/`) are
-  optional **peer**-dep edges, never runtime deps.
+  `src/cocos/` (Pixi in `src/pixi/`). The browser driver (`src/drivers/`, puppeteer-core) is an
+  optional **peer**-dep edge, never a runtime dep.
 - **Types** via JSDoc + `// @ts-check` (no `.ts`); `tsc --noEmit` with `allowJs`/`checkJs:false`/
   `strict:false` — same posture as coir.
 - **Selector grammar shared with coir** — `Parent/Child:Comp.prop` + `[i]`, so the two interoperate.

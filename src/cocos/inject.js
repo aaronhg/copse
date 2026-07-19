@@ -8,7 +8,7 @@
 // the in-page surface on `globalThis.copse` immediately and poll for `cc` in the
 // background, calling `install(cc)` (→ `window.__copse`) as soon as it appears.
 //
-// We import the IN-PAGE pieces only (not the barrel) — `runHarness`/`localDriver`
+// We import the IN-PAGE pieces only (not the barrel) — `execute`/`localDriver`
 // run driver-side (Node/Playwright), so they have no business in the injected blob.
 import { snapshot, resolve, press, get, call } from '../core/index.js';
 import { cocosRuntime, install, findCC, startLogCapture } from './runtime.js';

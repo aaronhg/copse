@@ -1,14 +1,14 @@
 // @ts-check
 // Deterministic script runner — replay a FROZEN test flow (JSON steps + subset-match
-// assertions, see docs/SCRIPTS.md) over the same Driver adapter runHarness uses.
-// The zero-LLM half of the test loop: an agent explores once (an MCP session, or
-// runHarness), the flow is frozen into a script, and this replays it forever — CI-grade,
-// no opinions. Pure + zero-dep like harness.js: testable in Node against a fake driver.
+// assertions, see docs/SCRIPTS.md) over the same Driver adapter `execute` uses.
+// The zero-LLM half of the test loop: an agent explores once (an MCP session, or arbor's
+// AI loop over `execute`), the flow is frozen into a script, and this replays it forever —
+// CI-grade, no opinions. Pure + zero-dep like harness.js: testable in Node against a fake driver.
 //
 // Judgment per step:
 //   • `expect` present → subsetMatch(expect, result) decides (assert ok:false flows too).
 //   • `expect` absent  → result.ok !== false.
-//   plus the same FACT gates runHarness applies over the judge's opinion:
+//   plus the same FACT gates arbor applies over the judge's opinion (the facts `execute` reports):
 //   • errors gate — result.errors (a handler that threw / logged a console error) fails
 //     the step even when `expect` matched, unless `allowErrors:true` OR the expect
 //     explicitly asserts `errors` (an explicit assertion overrides the gate).
@@ -16,8 +16,8 @@
 //     expect explicitly asserts `drove`.
 
 /**
- * A script step — the harness's `Step` shape plus assertion fields, so steps freeze 1:1
- * out of runHarness rounds and recorded MCP tool calls.
+ * A script step — the executor's `Step` shape plus assertion fields, so steps freeze 1:1
+ * out of an `execute` run and recorded MCP tool calls.
  * @typedef {Object} ScriptStep
  * @property {'press'|'get'|'call'|'snapshot'|'interactive'|'node'|'reachable'|'eval'|'logs'|'sleep'|'pmGet'|'pmSet'|'pmState'|'pmCall'|'pmPatch'|'pmNotify'|'framework'|'registerFramework'|'patch'|'patchClear'|'watch'|'network'|'diff'|'listeners'|'orient'|'probe'|'patchCalls'|'clickSurface'|'screenshot'|'visualCheck'|'captureBaseline'|'hold'|'release'|'holdStatus'} op
  * @property {string} [ref]    node ref — press / node / reachable / listeners / visualCheck
@@ -163,10 +163,10 @@ async function execStep(driver, step) {
 /**
  * Replay a script. Linear, deterministic; a failed step stops the run (later steps
  * depend on earlier state) unless `script.continueOnFail`.
- * @param {any} driver  the same Driver adapter runHarness consumes
+ * @param {any} driver  the same Driver adapter `execute` consumes
  * @param {Script} script
  * @returns {Promise<{pass:boolean, name?:string, failedAt?:number, steps:Array<{step:ScriptStep, ok:boolean, ms:number, result?:any, mismatch?:{path:string,expected:any,actual:any}, gate?:'errors'|'drove'}>}>}
- *          per-step `{step, result}` mirrors runHarness's rounds[].steps. A passing step carries a TRUNCATED
+ *          per-step `{step, result}` mirrors `execute`'s returned steps. A passing step carries a TRUNCATED
  *          `result` when it's a READ op (auto) or step.capture/script.capture is set (and not capture:false);
  *          other passing steps omit it; failing steps carry the full result whole.
  */
@@ -190,7 +190,7 @@ export async function runScript(driver, script) {
     } else if (result && result.ok === false) {
       rec.ok = false;
     }
-    // fact gates (mirror runHarness's errorGate/driveGate) — an explicit expect on the
+    // fact gates (over the facts `execute` reports — errors / drove:'nothing') — an explicit expect on the
     // gated field overrides the gate; `allowErrors` opts out of the errors gate.
     const asserts = (k) => expected !== null && typeof expected === 'object' && !Array.isArray(expected) && k in expected;
     if (rec.ok && !step.allowErrors && !asserts('errors') && result && Array.isArray(result.errors) && result.errors.length) {

@@ -1,9 +1,10 @@
 // @ts-check
-// The coir × copse coverage JOIN — pure, engine-free, dependency-free. Given coir's
-// STATIC ClickEvent map and copse's RUNTIME click surface (clickSurface()), bucket every
-// wired button into covered / blocked / unreached / code-only (+ ambiguous), on the shared
-// key `(nodePath, method)`. See docs/COVERAGE.md for the recipe and docs/SELECTORS.md for
-// the grammar both sides share.
+// The coir↔copse ref-matching VOCABULARY (`tailMatch`) + the interop ADAPTERS that translate between a
+// coir STATIC nodePath and a copse RUNTIME `ref` (resolveCoirPath / resolveCopseRef). These need copse
+// because they resolve against a LIVE runtime view (a clickSurface/snapshot result). The coir × copse
+// coverage JOIN itself (`coverageJoin` — the bucketing/verdict) MOVED to arbor (src/join.mjs): it's pure
+// control-layer reconciliation over the two surfaces, needing neither files nor a live game. See
+// docs/SELECTORS.md for the grammar both sides share.
 //
 // Matching is two-tier so prefab-internal buttons join too:
 //   1. EXACT  — runtime `ref` === static `nodePath` (and same method). Scene-level buttons.
@@ -25,8 +26,8 @@ const nameOf = (seg) => seg.replace(/\[\d+\]$/, ''); // drop a trailing [i] for 
 // Minimum shared-tail length for a FUZZY (suffix) match. A single generic leaf segment (`btn`,
 // `close`, `add`) is too weak to claim a match against an unrelated deep ref — so a 1-segment
 // tail is allowed ONLY as a full, exact-length alignment (`Btn` ~ `Btn`), never as a partial
-// suffix of a longer path (`btn` ~ `Canvas/SomeUnrelatedPanel/btn`). EXACT (byte-equal) matches
-// in coverageJoin bypass this entirely, so a genuinely unique short path still joins.
+// suffix of a longer path (`btn` ~ `Canvas/SomeUnrelatedPanel/btn`). EXACT (byte-equal) matches in the
+// join (arbor's coverageJoin) bypass this entirely, so a genuinely unique short path still joins.
 const MIN_FUZZY_TAIL = 2;
 
 /**
@@ -38,10 +39,12 @@ const MIN_FUZZY_TAIL = 2;
  * button reads `dropped:'home'`/`mount:''`; a prefab-internal one `mount:'Canvas/…'`/`dropped:''`.
  * Returns null when the shorter isn't a clean suffix of the longer, or when the shared tail is a
  * weak 1-segment PARTIAL (below {@link MIN_FUZZY_TAIL}; see the constant for why).
+ * PUBLIC (copse's index): this is the single declared coir↔copse ref contract. arbor keeps a vendored
+ * mirror (match.mjs) because it resolves copse dynamically — its match.test.mjs cross-checks against this.
  * @param {string} staticPath @param {string} runtimeRef
  * @returns {{mount:string, dropped:string}|null}
  */
-function tailMatch(staticPath, runtimeRef) {
+export function tailMatch(staticPath, runtimeRef) {
   const s = segs(staticPath), r = segs(runtimeRef);
   const n = Math.min(s.length, r.length);
   if (!n) return null;
@@ -52,84 +55,16 @@ function tailMatch(staticPath, runtimeRef) {
   return { mount: r.slice(0, r.length - n).join('/'), dropped: s.slice(0, s.length - n).join('/') };
 }
 
-/**
- * Join coir's static ClickEvent map to copse's runtime click surface.
- * @param {Array<{nodePath:string, method:string|null, [k:string]:any}>} staticRows
- *        coir side — one per editor-wired button: `{nodePath, method, ...}` (e.g. handlerClass).
- *        Rows with `method:null` are skipped (no key to join on).
- * @param {Array<{ref:string, method:string|null, interactable?:boolean, reachable?:boolean|'unsure', blockedBy?:string, occludedBy?:string, codeHandlers?:any[], [k:string]:any}>} runtimeRows
- *        copse side — a `clickSurface()` result (its rows carry `codeHandlers` when the node has live node.on() listeners).
- * @returns {{covered:any[], blocked:any[], unreached:any[], ambiguous:any[], uncertain:any[], codeRegistered:any[], codeOnly:any[]}}
- *   covered        = wired + live + reachable/interactable (press & assert) — each `{...static, runtime, via:'exact'|'prefix', mount?}`
- *   blocked        = wired + live but `reachable:false`/`interactable:false` (dead/blocked wiring)
- *   unreached      = wired but not live in this scene (navigate to it) — the raw static row
- *   ambiguous      = can't attribute 1:1 — `{...static, candidates:[ref,…], reason}`. `reason:'fan-out'`
- *                    = one static row tail-matched >1 live row; `reason:'fan-in'` = one live button was
- *                    claimed by >1 static row (e.g. same-named across scenes). Resolve by hand; never guessed.
- *   uncertain      = wired + live but reachable:'unsure' (can't judge) or `occludedBy` set — verify, NOT a confident covered
- *   codeRegistered = no editor clickEvent BUT has live `codeHandlers` (node.on listeners) — a downgraded level: it IS wired
- *                    in code, but registration alone doesn't prove the handler is an action vs a decorator, so NOT `covered`
- *   codeOnly       = live, no editor clickEvent AND no detectable code handler — a bare/unknown button (possibly dead)
- */
-export function coverageJoin(staticRows, runtimeRows) {
-  const covered = [], blocked = [], unreached = [], ambiguous = [], uncertain = [], codeRegistered = [], codeOnly = [];
-  const live = (runtimeRows || []).filter(Boolean);
-  const exact = new Map(live.filter((r) => r.method != null).map((r) => [`${r.ref} ${r.method}`, r]));
-  const consumed = new Set();
-
-  // Pass 1 — resolve each static row to AT MOST ONE runtime row (exact, else a UNIQUE fuzzy tail).
-  // >1 fuzzy candidate is `fan-out` ambiguity (one static → many live), reported, never guessed.
-  // No live match → `unreached`. Bucketing is DEFERRED to pass 2: a single live button can be
-  // claimed by >1 static row (fan-in), which has to be reconciled before anything is `covered`.
-  /** @type {Map<any, Array<{s:any, via:string, tail:any}>>} */
-  const claims = new Map();
-  for (const s of staticRows || []) {
-    if (!s || s.method == null) continue; // can't join without a method key
-    let hit = exact.get(`${s.nodePath} ${s.method}`);
-    let via = 'exact', tail;
-    if (!hit) {
-      const cands = live.filter((r) => r.method === s.method && tailMatch(s.nodePath, r.ref));
-      // >1 tail candidate → ambiguous (never guessed). Mark the candidates consumed so they don't
-      // ALSO leak into codeOnly at the end — they have a (ambiguous) static match, they're not code-wired.
-      if (cands.length > 1) { ambiguous.push({ ...s, candidates: cands.map((c) => c.ref), reason: 'fan-out' }); cands.forEach((c) => consumed.add(c)); continue; }
-      if (cands.length === 1) { hit = cands[0]; via = 'prefix'; tail = tailMatch(s.nodePath, hit.ref); }
-    }
-    if (!hit) { unreached.push(s); continue; }
-    const arr = claims.get(hit); if (arr) arr.push({ s, via, tail }); else claims.set(hit, [{ s, via, tail }]);
-  }
-
-  // Pass 2 — reconcile fan-in, then bucket. A live row claimed by exactly ONE static row buckets
-  // normally. Claimed by >1 (same-named buttons across scenes/prefabs — only one is actually live,
-  // but the dropped scene-root prefix means we can't say WHICH) → all those static rows are `fan-in`
-  // ambiguous, never silently double-counted as `covered`. Either way the live row is `consumed`
-  // (so it can't leak into codeOnly), which also kills the old exact+prefix double-count.
-  for (const [hit, rows] of claims) {
-    consumed.add(hit);
-    if (rows.length > 1) { for (const { s } of rows) ambiguous.push({ ...s, candidates: [hit.ref], reason: 'fan-in' }); continue; }
-    const { s, via, tail } = rows[0];
-    const row = via === 'prefix' ? { ...s, runtime: hit, via, mount: tail.mount, dropped: tail.dropped } : { ...s, runtime: hit, via };
-    if (hit.reachable === false || hit.interactable === false) blocked.push(row);
-    // wired + live but copse can't CONFIRM a player reaches/sees it: reachable:'unsure' (can't judge) or
-    // occludedBy (an opaque sprite over it). NOT a confident `covered` — fail-loud uncertainty survives the join.
-    else if (hit.reachable === 'unsure' || hit.occludedBy) uncertain.push(row);
-    else covered.push(row);
-  }
-
-  // The runtime rows with no editor-clickEvent match. A row that carries `codeHandlers` (live node.on()
-  // listeners) is CODE-REGISTERED — a downgraded coverage level: it HAS a wired-in-code handler, but copse
-  // can't tell from registration alone whether that handler is a real action or just a decorator (e.g. a
-  // per-button scaler), so it's NOT promoted to `covered`. A row with none is truly bare `codeOnly`.
-  for (const r of live) {
-    if (consumed.has(r)) continue;
-    if (r.codeHandlers && r.codeHandlers.length) codeRegistered.push(r); else codeOnly.push(r);
-  }
-  return { covered, blocked, unreached, ambiguous, uncertain, codeRegistered, codeOnly };
-}
+// NOTE: `coverageJoin` (the coir × copse bucketing/verdict) moved to arbor (src/join.mjs) — it's pure
+// control-layer reconciliation over the two surfaces, needing neither project files nor a live game.
+// copse keeps `tailMatch` (above) + the resolveCoirPath/resolveCopseRef adapters (below), which resolve
+// against a LIVE runtime view. The `copse coverage` CLI verb + MCP tool moved out with the join; copse's
+// runtime half stays as `clickSurface` (core) / the `click_surface` MCP tool.
 
 /**
  * Translate a coir STATIC nodePath → the live copse `ref`, by matching it against a runtime
  * view (a `clickSurface()` or `snapshot()` result — rows must carry `ref`). Reuses the same
- * symmetric tail match as `coverageJoin`, so it absorbs coir's scene/prefab-file root prefix
+ * symmetric `tailMatch` (above), so it absorbs coir's scene/prefab-file root prefix
  * (`dropped`) and a prefab's instantiation `mount` — i.e. a raw coir path that wouldn't resolve
  * in `press`/`get` becomes the exact runtime `ref` that does. Path-only (ignores method), so it
  * works for any node, not just buttons.
@@ -160,39 +95,7 @@ export function resolveCopseRef(copseRef, staticRows) {
   return { nodePath: cands[0].nodePath, mount: m.mount, dropped: m.dropped };
 }
 
-// The nodePaths a frozen flow script statically DRIVES: press `ref`, get/call/patch `sel` (the path
-// before `:Comp.member`), and each `cc.find('path')` inside an `eval` expression. Pure string work.
-function drivenPaths(script) {
-  const out = new Set();
-  for (const st of (script && script.steps) || []) {
-    if (st.ref) out.add(st.ref);
-    if (st.sel) out.add(String(st.sel).split(':')[0]);
-    if (st.expr) for (const m of String(st.expr).matchAll(/cc\.find\(\s*['"]([^'"]+)['"]/g)) out.add(m[1]);
-  }
-  return [...out];
-}
-
-/**
- * Which frozen flow tests are AFFECTED by a change — the runtime-format sibling of coir's `impact`.
- * Same key `coverage` joins on (tailMatch: a coir static nodePath ~ a copse runtime ref), but the
- * LIVE surface is replaced by the TEST SCRIPTS: a test is affected iff a nodePath it drives
- * tail-matches an impacted button's nodePath. Pure — runs no game — so a CI can pick which frozen
- * tests to replay for a diff without launching Chrome. A scene/prefab-level impact (no specific
- * buttons) can't be narrowed, so every test is kept (`sceneOnly`).
- * @param {{impactedButtons?:Array<{nodePath:string}>, impactedScenes?:Array<any>}} risk  a `coir impact` result
- * @param {Array<{name?:string, script:any}>} tests
- * @returns {{affected:Array<{name:string, hits:string[]}>, skipped:string[], sceneOnly:boolean}}
- */
-export function affectedData(risk, tests) {
-  const riskPaths = ((risk && risk.impactedButtons) || []).map((b) => b.nodePath);
-  const sceneOnly = riskPaths.length === 0 && (((risk && risk.impactedScenes) || []).length > 0);
-  const affected = [], skipped = [];
-  for (const t of tests || []) {
-    const name = t.name || '?';
-    const hits = sceneOnly
-      ? ['(scene changed — all kept)']
-      : [...new Set(drivenPaths(t.script).filter((d) => riskPaths.some((rp) => tailMatch(rp, d))))];
-    if (hits.length) affected.push({ name, hits }); else skipped.push(name);
-  }
-  return { affected, skipped, sceneOnly };
-}
+// NOTE: `affectedData` (which frozen flow tests a change touches) + its `drivenPaths` helper moved to
+// arbor (src/select.mjs). That selection needs neither a live game nor project files, so by the boundary
+// rule it's control-layer work, not copse's. copse keeps `tailMatch` above for resolveCoirPath /
+// resolveCopseRef (which DO need a live tree). The `copse affected` CLI verb + MCP tool moved with it.

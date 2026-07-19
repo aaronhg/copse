@@ -15,6 +15,8 @@ const fakeRuntime = () => ({
   readProp: (c, p) => c[p],
   callMethod: (c, m, args) => c[m](...args),
   asButton: (n) => (n.comps || []).find((c) => c.type === 'Button') || null,
+  position: (n) => (n.pos ? [n.pos[0], n.pos[1]] : null),
+  opacity: (n) => { const o = (n.comps || []).find((c) => c.type === 'UIOpacity'); return o ? o.opacity : (typeof n.opacity === 'number' ? n.opacity : null); },
   isInteractable: (b) => b.interactable !== false,
   clickHandlers: (b) => b.clickEvents || [],
   fireClickHandlers: (b) => { (b.clickEvents || []).forEach((h) => h.fire()); return (b.clickEvents || []).length; },
@@ -42,6 +44,22 @@ test('snapshot: every node gets a paste-able ref; same-name siblings get [i]', (
   assert.ok(refs.includes('Canvas/ShopBtn'));
   assert.ok(refs.includes('Canvas/Item[0]'));
   assert.ok(refs.includes('Canvas/Item[1]'));   // disambiguated
+});
+
+test('snapshot({ motion:true, includeInactive:true }): active always + position + opacity (recorder fields)', () => {
+  const bg = node('Bg'); bg.pos = [0, 0];
+  const play = node('Play', [], [{ type: 'UIOpacity', opacity: 128 }]); play.pos = [100, 200]; play.active = false;
+  const scene = node('Scene', [node('Canvas', [bg, play])]);
+  const rt = fakeRuntime();
+  const m = new Map(snapshot(scene, rt, { motion: true, includeInactive: true }).map((d) => [d.ref, d]));
+  assert.equal(m.get('Canvas/Bg').active, true);            // active ALWAYS present under motion (not omit-when-true)
+  assert.deepEqual(m.get('Canvas/Bg').position, [0, 0]);
+  assert.equal(m.get('Canvas/Play').active, false);         // inactive node kept (includeInactive)
+  assert.equal(m.get('Canvas/Play').opacity, 128);
+  assert.deepEqual(m.get('Canvas/Play').position, [100, 200]);
+  // without motion: active omitted when true, no position/opacity (existing consumers unaffected)
+  const plain = new Map(snapshot(scene, rt, { includeInactive: true }).map((d) => [d.ref, d]));
+  assert.ok(!('active' in plain.get('Canvas/Bg')) && !('position' in plain.get('Canvas/Bg')));
 });
 
 test('snapshot: buttons carry interactable + click handlers; Labels carry string', () => {

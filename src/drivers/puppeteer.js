@@ -1,14 +1,15 @@
 // NOTE: intentionally NOT `// @ts-check` — this file is browser-driver glue; its
 // `page.evaluate` callbacks run in the GAME's window (where `window.__copse`/`cc` live),
 // so type-checking them against Node's lib produces only false positives.
-// OPTIONAL driver (subpath `copse/driver-puppeteer`). Drives a running Cocos game in a
-// real browser (system Chrome via puppeteer-core), injects copse, and returns a Driver
-// for runHarness. NOT loaded by `import 'copse'` — keeps the core zero-dep. Needs the
-// peer dep `puppeteer-core` and a built `dist/copse.inject.js`.
+// OPTIONAL driver (subpath `copse/driver-puppeteer`). Drives a running Cocos/Pixi game in a
+// real browser (system Chrome via puppeteer-core), injects copse, and returns a Driver for
+// `execute` (or a consumer's own loop, e.g. arbor). NOT loaded by `import 'copse'` — keeps the
+// core zero-dep. Needs the peer dep `puppeteer-core` and a built `dist/copse.inject.js`.
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { resolve as resolvePath, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { diff as coreDiff } from '../core/index.js';
+import { engineCapabilities } from '../capabilities.js';
 import { signature, visualVerdict } from '../sensors/pixel.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -126,29 +127,65 @@ export async function browseTabs({ browserURL, browserWSEndpoint } = {}) {
 }
 
 /**
- * Launch (or connect to) a browser, load the game, inject copse → a Driver for
- * runHarness. The returned object is the Driver (snapshot/interactive/press/get/call/eval/
+ * Launch (or connect to) a browser, load the game, inject copse → a Driver for `execute`
+ * (or a consumer's loop). The returned object is the Driver (snapshot/interactive/press/get/call/eval/
  * reachable/node/diff/listeners/probe/logs/watch/patch/patchClear/framework/pmGet/pmSet/pmCall/network/
  * screenshot) plus `page`, `frame` (the frame cc was found in — may be a
  * nested/cross-origin iframe), `browser`, and `close()`.
  * @param {string} url
- * @param {{bundlePath?:string|URL, executablePath?:string, browserURL?:string, browserWSEndpoint?:string, attach?:boolean, match?:string, attachTries?:number, headless?:any, viewport?:any, fpsCap?:number, timeout?:number, bootTries?:number, readyTries?:number, maxLogs?:number, settle?:boolean|{maxMs?:number,interval?:number}}} [opts]
+ * @param {{engine?:'cocos'|'pixi', bundlePath?:string|URL, executablePath?:string, browserURL?:string, browserWSEndpoint?:string, attach?:boolean, match?:string, attachTries?:number, headless?:any, viewport?:any, fpsCap?:number, timeout?:number, bootTries?:number, readyTries?:number, maxLogs?:number, settle?:boolean|{maxMs?:number,interval?:number}}} [opts]
  *        attach: drive an ALREADY-OPEN tab in `browserURL`'s Chrome (find it by `match` URL
  *        substring; omit match+url to attach the ACTIVE tab; no navigation — for your own game
  *        behind a login/staging gate you opened yourself, so a fresh goto won't bounce you back to
  *        it). `close()` then just disconnects, leaving your browser open.
  *        settle: after a mutating press/call, wait until the tree stabilises (tweens) then
  *        attach a `changed` auto-diff to the result. Default on; `settle:false` to disable.
+ *        engine: 'cocos' (default) or 'pixi' (PixiJS 8 — docs/ENGINES.md). Picks the bundle and the
+ *        boot probes. For 'pixi' the bundle is injected PRE-BOOT (evaluateOnNewDocument) because
+ *        Pixi's `__PIXI_APP_INIT__` hook fires once during Application.init and is otherwise missed;
+ *        `press` is async there, and `clickSurface`/coverage are unavailable (§5) while `anchors()` is.
  */
 export async function connect(url, opts = {}) {
   const puppeteer = await loadPuppeteer();
-  const bundlePath = opts.bundlePath || new URL('../../dist/copse.inject.js', import.meta.url);
-  let bundle;
-  try { bundle = readFileSync(bundlePath, 'utf8'); }
-  catch (e) {
-    if (e && e.code === 'ENOENT') throw new Error("copse inject bundle not found at dist/copse.inject.js — run `npm run build` first (or pass bundlePath)");
-    throw e;
+  // WHICH ENGINE. copse drives Cocos (default) or PixiJS 8 (docs/ENGINES.md). The engine decides the
+  // bundle, how the page is probed for a live engine, how fps is capped, and — for Pixi — WHEN the
+  // bundle is injected (see the pre-boot injection below, which is a structural difference, not a flag).
+  const engineOpt = opts.engine || 'cocos';
+  if (!['cocos', 'pixi', 'auto'].includes(engineOpt)) throw new Error(`unknown engine ${JSON.stringify(engineOpt)} — expected 'cocos', 'pixi' or 'auto'`);
+  // 'auto' resolves DURING boot by probing the live page, so `engine` starts null and the rest of the
+  // driver reads it through isPixi(). Everything that branches on the engine runs after bootInPage.
+  const auto = engineOpt === 'auto';
+  let engine = auto ? null : engineOpt;
+  let engineDetected = !auto;
+  let engineResolved = !auto;   // has bootInPage actually decided yet? (auto + attach can return first)
+  const isPixi = () => engine === 'pixi';
+  let installed = false;   // did `__copse` actually come up? false = no engine on the page (doctor's finding)
+  const BUNDLE_FILE = { cocos: 'copse.inject.js', pixi: 'copse.inject.pixi.js' };
+  const bundleCache = {};
+  // `bundlePath` names ONE bundle; `auto` may need EITHER. Rather than silently guessing which engine
+  // the caller's bundle is for (and then failing deep inside boot), refuse the combination up front.
+  // `doctor` correspondingly only forces auto when no bundlePath was given — the earlier version
+  // forced it unconditionally, so `doctor --bundlePath …` always died with "run `npm run build` first
+  // (or pass bundlePath)", contradicting the invocation the user had just typed.
+  if (opts.bundlePath && auto) {
+    throw new Error("bundlePath pins a single inject bundle, so it can't be combined with engine:'auto' — pass engine:'cocos' or engine:'pixi' alongside it.");
   }
+  const bundleFor = (e) => {
+    if (bundleCache[e]) return bundleCache[e];
+    const file = BUNDLE_FILE[e];
+    const path = opts.bundlePath || new URL(`../../dist/${file}`, import.meta.url);
+    try { return (bundleCache[e] = readFileSync(path, 'utf8')); }
+    catch (err) {
+      if (err && err.code === 'ENOENT') throw new Error(`copse inject bundle not found at ${opts.bundlePath ? String(path) : `dist/${file}`} — run \`npm run build\` first (or pass bundlePath)`);
+      throw err;
+    }
+  };
+  // READ EVERY BUNDLE THIS RUN MIGHT NEED, NOW — before a browser exists. The read used to be the
+  // first statement of connect() precisely so a missing dist/ fails before a process is spawned;
+  // moving it into bundleFor put it after puppeteer.launch(), where the throw unwinds past the only
+  // reference to `browser` and leaves an orphaned headless Chrome behind on every failed run. Under
+  // auto that means BOTH bundles: the pixi one is pre-injected, and either may be chosen at boot.
+  if (auto) { bundleFor('pixi'); bundleFor('cocos'); } else bundleFor(engine);
   const remote = opts.browserURL || opts.browserWSEndpoint;
   // guard BEFORE creating a browser, so a misconfigured attach never leaks a launched one.
   if (opts.attach && !remote) throw new Error('attach mode needs browserURL/browserWSEndpoint — start Chrome with --remote-debugging-port=9222');
@@ -229,6 +266,18 @@ export async function connect(url, opts = {}) {
   });
   page.on('requestfailed', (req) => { try { capNet({ t: Date.now(), method: req.method(), url: req.url(), status: 'failed', type: req.resourceType(), error: (req.failure() && req.failure().errorText) || 'failed' }); } catch {} });
 
+  // PIXI: inject BEFORE the page's own scripts run. The reliable attach is Pixi core's
+  // `__PIXI_APP_INIT__` hook, which fires once during Application.init and is simply MISSED if the
+  // bundle lands afterwards — so unlike Cocos (where we poll for `cc` post-load) the Pixi bundle must
+  // go in via evaluateOnNewDocument. Bonus: that registration survives navigations, so `reload()` and
+  // the auto-reconnect path re-arm the hook for free. In ATTACH mode the page is already loaded and
+  // this can't have run, so bootInPage falls back to injecting directly + findPixi's ladder.
+  // In AUTO we arm it unconditionally: detection can only happen after load, but the hook must be in
+  // place before it — so the cheap insurance is to pre-inject the Pixi bundle either way. On a Cocos
+  // page it finds no Application, its bounded poll expires, and the Cocos bundle installs `__copse`
+  // over it. That ~57kb of dead weight is why 'auto' is opt-in rather than the default for connect().
+  if (isPixi() || auto) { try { await page.evaluateOnNewDocument(bundleFor('pixi')); } catch { /* attach-mode targets may refuse */ } }
+
   if (!opts.attach) await page.goto(url, { waitUntil: 'load', timeout: opts.timeout ?? 60000 });
 
   // Find the frame that has cc — the game is often inside a (possibly nested, possibly
@@ -240,6 +289,19 @@ export async function connect(url, opts = {}) {
     if (!(cc && cc.director && cc.director.getScene)) return false;
     window.cc = cc; const s = cc.director.getScene(); return !!(s && (s.children || []).length);
   }).catch(() => false);
+  // Pixi's equivalent: an Application with a populated stage, from the init-hook capture or any of the
+  // devtools globals (the bundle's own findPixi ladder covers the same ground once it's installed).
+  const hasPixi = (f) => f.evaluate(() => {
+    const app = (window.__copse && window.__copse.app)
+      || (window.__copsePixi && window.__copsePixi.app)
+      || (window.__PIXI_DEVTOOLS__ && window.__PIXI_DEVTOOLS__.app)
+      || window.__PIXI_APP__;
+    return !!(app && app.stage && (app.stage.children || []).length);
+  }).catch(() => false);
+  // In AUTO, probe both and let the page decide. Cocos is tried first only because it's the primary
+  // lane; the two are mutually exclusive in practice (a Pixi page has no `window.cc`).
+  const detectEngine = async (f) => (await hasCc(f)) ? 'cocos' : (await hasPixi(f)) ? 'pixi' : null;
+  const hasEngine = (f) => (auto ? detectEngine(f).then(Boolean) : (isPixi() ? hasPixi(f) : hasCc(f)));
 
   let frame = page.mainFrame();
   const rawEv = (fn, ...a) => frame.evaluate(fn, ...a); // used DURING init (must NOT await `ready`)
@@ -261,16 +323,44 @@ export async function connect(url, opts = {}) {
   const bootInPage = async () => {
     for (let i = 0, n = opts.bootTries ?? 40; i < n; i++) {
       let found = null;
-      for (const f of page.frames()) { if (await hasCc(f)) { found = f; break; } }
+      for (const f of page.frames()) {
+        if (auto) { const e = await detectEngine(f); if (e) { engine = e; engineDetected = true; found = f; break; } }
+        else if (await hasEngine(f)) { found = f; break; }
+      }
       if (found) { frame = found; break; }
       await sleep(1000);
     }
-    await frame.evaluate(bundle);
-    await frame.evaluate(() => { if (!window.__copse && window.copse) window.copse.install(window.cc); });
-    await frame.waitForFunction(() => !!window.__copse, { timeout: 10000 });
+    // Nothing answered. Fall back to cocos so the rest of the boot (and `doctor`'s report) still runs
+    // over a defined engine — `engineDetected:false` is what tells a caller the page never identified
+    // itself, which for doctor is the single most useful finding it can report.
+    if (engine == null) engine = 'cocos';
+    engineResolved = true;
+    // Cocos: the bundle goes in now (the engine is already up, so there's nothing to pre-arm).
+    // Pixi: evaluateOnNewDocument already ran it pre-boot in launch mode — but re-evaluating is
+    // idempotent (installInitHook/install both no-op when already present) and is the ONLY path in
+    // attach mode, where the page loaded before we ever saw it.
+    await frame.evaluate(bundleFor(engine));
+    await frame.evaluate((pixi) => {
+      if (window.__copse) return;
+      if (!window.copse) return;
+      if (pixi) window.copse.autoInstall();               // findPixi ladder → install (null-safe)
+      // Guard `cc`: on a page with no engine (or a release build that tree-shook it away)
+      // install(undefined) dies destructuring `{Button} = cc`, turning "no engine here" into an
+      // opaque crash. The bundle's own auto-install already gates on findCC(); this call must too.
+      else if (window.cc && window.cc.director) window.copse.install(window.cc);
+    }, isPixi());
+    // A page with NO engine (a plain page, a release build whose `cc` was tree-shaken, a Pixi game
+    // attached to after boot) never installs `__copse`. That must NOT throw: it is the exact
+    // situation `doctor` exists to diagnose, and a crash tells the user nothing. Record it, let the
+    // in-page reads degrade, and let `engineDetected`/`installed` carry the finding.
+    installed = await frame.waitForFunction(() => !!window.__copse, { timeout: 10000 }).then(() => true, () => false);
+    if (!installed) return;                               // skip framework/fps/ready — there's nothing to talk to
     // register framework adapters (PureMVC etc.) into the fresh __copse before anything reads state
     for (const a of fwAdapters) { try { await frame.evaluate((x) => { try { window.__copse.registerFramework && window.__copse.registerFramework(x); } catch { /* */ } }, adapterToInjectable(a)); } catch { /* */ } }
-    if (fps != null) await rawEv((f) => { const G = window.cc.game; try { G.frameRate = f; } catch {} try { G.setFrameRate && G.setFrameRate(f); } catch {} }, fps);
+    if (fps != null) await rawEv(([f, pixi]) => {
+      if (pixi) { try { const t = window.__copse.app.ticker; t.maxFPS = f; } catch {} return; }
+      const G = window.cc.game; try { G.frameRate = f; } catch {} try { G.setFrameRate && G.setFrameRate(f); } catch {}
+    }, [fps, isPixi()]);
     // Wait until the scene is actually LIVE before returning. A slow headless-CI SwiftShader renderer
     // can take 20s+ to boot the first scene (pptr.dev/troubleshooting), and returning early makes the
     // caller's first coverage/press read a null/empty scene. Break as soon as there are interactive
@@ -278,13 +368,14 @@ export async function connect(url, opts = {}) {
     // once it's up rather than spinning the whole budget on a loading screen. snapshot() degrades to
     // [] until the scene is live, so these reads never throw.
     for (let i = 0, n = opts.readyTries ?? 45; i < n; i++) {
-      const st = await rawEv(() => {
+      const st = await rawEv((pixi) => {
         try {
-          const s = window.cc.director.getScene(); const alive = !!(s && (s.children || []).length);
+          const root = pixi ? (window.__copse && window.__copse.app && window.__copse.app.stage) : window.cc.director.getScene();
+          const alive = !!(root && (root.children || []).length);
           let buttons = 0; try { buttons = window.__copse.interactive().length; } catch { /* pre-install */ }
           return { alive, buttons };
         } catch { return { alive: false, buttons: 0 }; }
-      });
+      }, isPixi());
       if (st.buttons > 0) break;                       // fully ready (a live scene WITH pressable controls)
       if (st.alive && i >= 8) break;                   // live but no buttons after a grace period → a genuinely button-less scene
       await sleep(1000);
@@ -303,8 +394,19 @@ export async function connect(url, opts = {}) {
   // Public evaluator: in-page calls wait for init, so a paused/deferred attach auto-unblocks them once
   // you resume. For launch + a live attach, `ready` is already settled → no extra delay. On a detached
   // frame (a navigation happened under us), re-inject and retry the call ONCE.
+  // The ONE place every in-page read goes through, so the "no engine here" contract is enforced once
+  // rather than hoped for. bootInPage's `installed:false` path leaves `window.__copse` undefined; a
+  // read then died on `Cannot read properties of undefined (reading 'snapshot')`, which is both
+  // useless and hides the diagnosis the caller needs. Fail with the finding instead.
+  const notInstalled = () => new Error(
+    `copse is not installed on this page — no ${engineDetected ? engine : 'engine'} was found. `
+    + 'Looked for a live cc.director scene and a Pixi Application (init hook / __PIXI_APP__ / devtools globals). '
+    + 'If this is a Pixi game you ATTACHED to after load, reconnect with engine:"pixi" so the pre-boot hook can arm; '
+    + 'if it is a release Cocos build, `cc` may be tree-shaken away (docs/INJECT.md). Run `doctor` for the full report.',
+  );
   const ev = async (fn, ...a) => {
     await ready;
+    if (!installed) throw notInstalled();
     try { return await frame.evaluate(fn, ...a); }
     catch (e) { if (!isDetached(e)) throw e; await reboot(); return frame.evaluate(fn, ...a); }
   };
@@ -449,7 +551,7 @@ export async function connect(url, opts = {}) {
       // the summary snapshot below (and the caller's very next step, e.g. runScripts) don't hit a
       // null getScene(). Belt-and-suspenders: the snapshot/interactive reads also degrade to [].
       for (let i = 0; i < 40; i++) {
-        if (await rawEv(() => { try { const s = window.cc.director.getScene(); return !!(s && (s.children || []).length); } catch { return false; } })) break;
+        if (await rawEv((pixi) => { try { const r = pixi ? window.__copse.app.stage : window.cc.director.getScene(); return !!(r && (r.children || []).length); } catch { return false; } }, isPixi())) break;
         await sleep(200);
       }
       const snap = await ev(() => window.__copse.snapshot({ relevant: true })).catch(() => []);
@@ -458,7 +560,21 @@ export async function connect(url, opts = {}) {
     },
     snapshot: (o) => ev((o) => window.__copse.snapshot(o), o ?? {}),
     interactive: () => ev(() => window.__copse.interactive()),
-    clickSurface: (o) => ev((o) => window.__copse.clickSurface(o), o ?? {}), // join-ready (ref, method) rows for coir cross-reference
+    // join-ready (ref, method) rows for coir cross-reference. Cocos-only BY CONSTRUCTION: the key's
+    // `method` is an editor-serialized ClickEvent handler name, and Pixi has no editor and serializes
+    // nothing. Refuse with an explanation rather than returning [] — an empty join reads as "nothing is
+    // wired", which is a false finding rather than a degraded one (docs/ENGINES.md §5).
+    clickSurface: async (o) => {
+      await ready;                       // never branch on an engine that hasn't been resolved yet
+      if (isPixi()) return Promise.reject(new Error('clickSurface/coverage is Cocos-only: Pixi serializes no click handlers, so every row would be method:null (docs/ENGINES.md §5). Use interactive() + codeHandlers instead.'));
+      return ev((o) => window.__copse.clickSurface(o), o ?? {});
+    },
+    // Which objects here were written by the GAME, and what is callable on them — minify-proof,
+    // because method names survive what mangles class names (docs/ENGINES.md §3). Both engines, but
+    // it answers a different question on each: on Pixi it's the ADDRESSING entry point (refs are
+    // positional gibberish); on Cocos refs are already readable, so its value is the RELEASE build,
+    // where component class names are mangled to `e`/`t` while their methods are not.
+    anchors: (o) => ev((o) => window.__copse.anchors(o), o ?? {}),
     press: (ref, o = {}) => { const { captureNetwork, ...pageOpts } = o || {}; return mutate(() => ev(([r, oo]) => window.__copse.press(r, oo), [ref, pageOpts]), captureNetwork); },
     call: (sel, ...a) => mutate(() => ev(([s, a]) => window.__copse.call(s, ...a), [sel, a])),
     // Arbitrary expression eval in the cc frame's MAIN WORLD (global scope) — NO pause, unlike the
@@ -605,6 +721,20 @@ export async function connect(url, opts = {}) {
     tabs: () => listTabs(browser),
     // which tab attach chose ({url,title,index,of}; null when launched) — surfaced so a wrong pick shows now.
     attachedTab,
+    // 'cocos'|'pixi', or NULL while `auto` is still resolving — attach mode's paused/stalled paths
+    // deliberately return from connect() without awaiting `ready`, so a caller can observe this
+    // before bootInPage has decided. Reporting null is the honest answer; `await cp.ready` first if
+    // you need the resolved value (`engineReady()` does exactly that).
+    get engine() { return engineResolved ? engine : null; },
+    // Declared capability profile for the resolved engine — so a consumer (arbor) BRANCHES on facts
+    // instead of assuming Cocos: clickSurface/coverage are Cocos-only; a frozen tripwire's refs are only
+    // stable on Cocos (docs/ENGINES.md §3, §5). null engine (unresolved / no engine) zeroes everything.
+    get capabilities() { return engineCapabilities(engineResolved ? engine : null); },
+    get engineResolved() { return engineResolved; },
+    /** Await boot, then hand back the settled engine — what to use instead of racing the getter. */
+    engineReady: async () => { try { await ready; } catch { /* boot failure is reported elsewhere */ } return engine; },
+    get engineDetected() { return engineDetected; }, // false = nothing identified itself (auto fell back to cocos); doctor's key finding
+    get installed() { return installed; },   // false = __copse never came up; every read then throws notInstalled()
     page, get frame() { return frame; }, browser, ready, paused, stalled,
     close: () => (opts.attach ? browser.disconnect() : browser.close()),
   };

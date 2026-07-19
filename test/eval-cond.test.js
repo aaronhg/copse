@@ -3,7 +3,7 @@
 // (watch change-detection depended on it), and parseDur must not silently truncate '2m'/'30sec'.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { jsonSafe, parseDur } from '../src/cocos/eval-cond.js';
+import { jsonSafe, parseDur } from '../src/core/eval-cond.js';
 
 test('jsonSafe: serialisable values pass through unchanged', () => {
   assert.equal(jsonSafe(true), true);

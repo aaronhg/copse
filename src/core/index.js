@@ -29,8 +29,11 @@
  * @property {(n:any,b:any)=>void} emitClick             // emit CLICK for code-registered listeners
  * @property {(n:any)=>boolean} [emitTouch]              // OPTIONAL: synthesize a tap (touch-start→end) for touch-wired buttons
  * @property {(n:any)=>{type:string,fn?:string,target?:string}[]} [codeHandlers]  // OPTIONAL: user node.on() listeners (engine-internal + Button's own filtered out)
- * @property {(n:any)=>{reachable:boolean|'unsure',reachableFraction?:number,partial?:boolean,blockedBy?:string|null,occludedBy?:string|null,visible?:boolean,reason?:string,via?:{consumer:string,camera:string}}} [reachable]     // OPTIONAL: can a TOUCH reach it (z-order / BlockInputEvents)? tri-state true|false|'unsure' (fail loud on can't-judge). `reachableFraction`/`partial` = multi-point coverage; `blockedBy` = top covering consumer; `occludedBy` = an opaque sprite hiding it visually; `visible` (opacity/scale!==0); `via` = which detection tier resolved it (cross-version provenance) — all separate signals
+ * @property {(n:any)=>{reachable:boolean|'unsure',reachableFraction?:number,partial?:boolean,blockedBy?:string|null,occludedBy?:string|null,visible?:boolean,reason?:string,via?:Object<string,string>}} [reachable]     // OPTIONAL: can a TOUCH reach it (z-order / BlockInputEvents)? tri-state true|false|'unsure' (fail loud on can't-judge). `reachableFraction`/`partial` = multi-point coverage; `blockedBy` = top covering consumer; `occludedBy` = an opaque sprite hiding it visually; `visible` (opacity/scale!==0); `via` = which detection tier resolved it (cross-version provenance) — all separate signals
  * @property {(n:any)=>object} [nodeInfo]  // OPTIONAL: node intrinsics (active/activeInHierarchy/opacity/scale/worldPos/size/onScreen)
+ * @property {boolean} [alwaysIndex]       // OPTIONAL: emit `name[i]` even for a unique name — for engines whose names are TYPES, not identities (see segOf)
+ * @property {(n:any)=>number[]|null} [position]  // OPTIONAL: local position, for the tree recorder's `motion` snapshot
+ * @property {(n:any)=>number|null} [opacity]            // OPTIONAL: opacity/alpha, for the tree recorder's `motion` snapshot
  */
 
 const joinSeg = (path, seg) => (path ? `${path}/${seg}` : seg);
@@ -46,9 +49,18 @@ function sameNameIndex(siblings, child, rt) {
 }
 
 // A child's path segment: bare name, or `name[i]` when a sibling shares the name.
+//
+// `rt.alwaysIndex` makes the `[i]` unconditional. This exists for engines whose node "names" are
+// TYPES rather than identities (Pixi — see docs/ENGINES.md §3), where same-name siblings are the
+// norm rather than the exception. Without it a ref is unstable across the 1→2 transition: a lone
+// `Text` becomes `Text[0]` the moment a second Text spawns beside it, so a `watch`/`diff` over a
+// live scene reports one disappearance and two appearances instead of one changed value. Emitting
+// the index from the start keeps existing refs fixed as siblings come and go — and `resolve` already
+// treats `Name` and `Name[0]` identically, so nothing needs to learn a new grammar.
+// Cocos leaves this unset: its names are real identities and its refs interop with coir's.
 function segOf(child, siblings, rt) {
   const name = rt.name(child);
-  const dup = siblings.filter((c) => rt.name(c) === name).length > 1;
+  const dup = rt.alwaysIndex || siblings.filter((c) => rt.name(c) === name).length > 1;
   return dup ? `${name}[${sameNameIndex(siblings, child, rt)}]` : name;
 }
 
@@ -70,11 +82,11 @@ const slimClick = (h) => {
  * covered); `codeHandlers` when any. Raw `components` are OFF by default (`{components:true}`
  * to include — they're minified noise on release builds).
  * @param {any} root @param {Runtime} rt
- * @param {{onlyInteractive?:boolean, includeInactive?:boolean, reachability?:boolean, relevant?:boolean, components?:boolean}} [opts]
+ * @param {{onlyInteractive?:boolean, includeInactive?:boolean, reachability?:boolean, relevant?:boolean, components?:boolean, motion?:boolean}} [opts]
  *        relevant: keep only nodes with a testable surface (button | label | codeHandlers) —
  *          cuts structural/visual noise (bones, backgrounds). reachability: O(buttons×nodes), opt-in.
  */
-export function snapshot(root, rt, { onlyInteractive = false, includeInactive = false, reachability = false, relevant = false, components = false } = {}) {
+export function snapshot(root, rt, { onlyInteractive = false, includeInactive = false, reachability = false, relevant = false, components = false, motion = false } = {}) {
   const out = [];
   if (!root) return out;   // a not-yet-booted / mid-swap / torn-down scene (getScene()===null) → empty snapshot, never a null-tree crash
   const visit = (node, path) => {
@@ -89,6 +101,11 @@ export function snapshot(root, rt, { onlyInteractive = false, includeInactive = 
     if (keep) {
       const desc = { ref: path };
       if (!active) desc.active = false;                                 // omit when true (the default)
+      if (motion) {                                                    // tree-recorder fields: active ALWAYS present + local position + opacity
+        desc.active = active;
+        const pos = rt.position ? rt.position(node) : null; if (pos) desc.position = pos;
+        const op = rt.opacity ? rt.opacity(node) : null; if (op != null) desc.opacity = op;
+      }
       if (components) desc.components = rt.components(node).map((c) => c.type);
       if (btn) {
         desc.button = true; desc.interactable = rt.isInteractable(btn); desc.click = rt.clickHandlers(btn).map(slimClick);
@@ -179,7 +196,8 @@ export function resolve(root, rt, path) {
  * `{ok, ref, fired, touched?}` or `{ok:false, ref, reason}`.
  * NOTE this tests the handler LOGIC, not whether a player could reach the button. By default z-order /
  * overlap / on-screen are NOT checked (see README "What it can't test"); pass `reachableGate:true` to refuse
- * a press to a button that's a confident `reachable:false` (covered) — the same gate runHarness applies.
+ * a press to a button that's a confident `reachable:false` (covered) — the same reachability signal
+ * `execute` surfaces as a fact (and arbor's loop vetoes on).
  * @param {any} root @param {Runtime} rt @param {string} path @param {{force?:boolean, reachableGate?:boolean}} [opts]
  */
 export function press(root, rt, path, { force = false, reachableGate = false } = {}) {
@@ -188,8 +206,8 @@ export function press(root, rt, path, { force = false, reachableGate = false } =
   const btn = rt.asButton(node);
   if (!btn) return { ok: false, ref: path, reason: 'not-a-button' };
   if (!force && !rt.isInteractable(btn)) return { ok: false, ref: path, reason: 'disabled' };
-  // OPT-IN reachability gate — the same protection runHarness applies, now available on the bare primitive
-  // (so MCP/CLI `press` can refuse driving a button a player can't reach: covered / off-screen). OFF by
+  // OPT-IN reachability gate — the same reachability signal `execute` reports as a fact, here on the bare
+  // primitive (so MCP/CLI `press` can refuse driving a button a player can't reach: covered / off-screen). OFF by
   // default, because copse's whole point is to drive the handler LOGIC regardless of reachability (`force`
   // also skips it). Gates only on a confident `reachable:false` (names blockedBy); 'unsure' is not a refusal.
   if (reachableGate && !force && rt.reachable) {

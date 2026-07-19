@@ -2,7 +2,7 @@
 
 ## Why
 
-Interactive testing (Claude Code driving the game over MCP, or `copse ai`) is
+Interactive testing (Claude Code driving the game over MCP, or arbor's AI modes) is
 **exploratory** — great for finding what to test, wasteful to re-run on every commit.
 Scripts close the loop:
 
@@ -22,8 +22,8 @@ generated/edited by an agent, and replays with zero LLM involvement.
 
 A script step **is the harness's `Step` shape** (`src/harness.js` `@typedef Step`:
 `{op, ref?, sel?, args?, opts?, note?}`) plus the assertion fields `expect` /
-`allowErrors` — so steps freeze 1:1 out of a `runHarness` round (see
-[Freezing from a harness run](#freezing-from-a-harness-run)) and out of recorded MCP
+`allowErrors` — so steps freeze 1:1 out of an `execute` run (see
+[Freezing from an execute run](#freezing-from-an-execute-run)) and out of recorded MCP
 tool calls, which use the same named fields.
 
 ```jsonc
@@ -56,7 +56,8 @@ tool calls, which use the same named fields.
 - Selectors are copse's usual grammar (`Parent/Child:Comp.prop`, `[i]`) — coir-interoperable.
 - **`expect`** — optional subset match (below). **Omitted** → the step passes when
   `result.ok !== false`. Two FACT gates then apply on top of either judgment (the same
-  facts `runHarness` hard-gates over the judge's opinion): a result carrying `errors`
+  facts `execute` reports — `facts.errored` / `facts.undriven` — that arbor's loop gates over
+  the judge's opinion): a result carrying `errors`
   fails the step (errorGate — a handler that threw/logged is never a silent pass), and a
   press with `drove:'nothing'` fails (driveGate — nothing was exercised). An **explicit
   assertion overrides its gate**: an `expect` naming `errors` (asserting the crash IS
@@ -104,7 +105,7 @@ runScript(driver, script) → {
       result: { ok: true, value: "95" } }   // failed steps carry the full result
   ]
 }
-// per-step `{step, result}` mirrors runHarness's rounds[].steps — same reading habits.
+// per-step `{step, result}` mirrors `execute`'s returned steps — same reading habits.
 // a gate failure carries `gate: 'errors' | 'drove'` instead of `mismatch`.
 ```
 
@@ -138,18 +139,18 @@ long strings sliced, depth-bounded), so a live-run value and a dumped step read 
   `observed` down to the minimal `expect` (usually one or two keys) and saves the file —
   judgment stays where judgment lives.
 
-## Freezing from a harness run
+## Freezing from an execute run
 
-The second freeze path: because a script step IS the harness `Step` shape, a
-`runHarness` result converts mechanically —
+The second freeze path: because a script step IS the `Step` shape `execute` drives, an
+`execute` result converts mechanically —
 
 ```js
-const steps = report.rounds.flatMap((r) => r.steps);   // [{step, result}, …]
+const { steps } = await execute(driver, plan);   // steps: [{step, result}, …]
 // each s.step is already a script step; trim each s.result into its `expect`
 ```
 
-— so an exploratory `copse ai` run can be frozen the same way a recorded MCP session
-is: keep the steps, distil the observed results into minimal assertions.
+— so an exploratory run (arbor's AI loop over `execute`) can be frozen the same way a
+recorded MCP session is: keep the steps, distil the observed results into minimal assertions.
 
 ## Entry points — three surfaces, 1:1 as always
 
@@ -169,8 +170,9 @@ src/cli.js             — `copse run` subcommand (lazy-imported, as usual)
 docs/SCRIPTS.md        — this file (format + semantics + explore→dump→trim→replay workflow)
 ```
 
-## Relation to the harness
+## Relation to `execute`
 
-`runHarness` stays untouched — it remains the **exploratory** loop (plan/judge with an
-LLM). `runScript` is the **frozen regression** loop. Both consume the same Driver
-adapter; a flow found by the former is replayed forever by the latter.
+`execute` (copse's deterministic flow executor — steps + facts, no verdict) is the raw
+material the **exploratory** loop runs on: arbor's plan/judge loop drives `execute` with an
+LLM to *find* a flow. `runScript` is the **frozen regression** loop that replays it. Both
+consume the same Driver adapter; a flow found by exploration is replayed forever by `runScript`.
