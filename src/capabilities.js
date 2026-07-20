@@ -18,12 +18,29 @@
 // single declared source, and the driver's `capabilities` getter returns it for the resolved engine.
 
 /**
+ * The version of the surface a CONSUMER binds to — `execute`'s step/facts shape, the driver's method set,
+ * and the fields of this capability object. Bump it when a consumer written against the old shape would
+ * now be WRONG (a field removed or repurposed, a fact renamed, a step result restructured); NOT for
+ * additions, which an old consumer ignores harmlessly.
+ *
+ * It exists because the package version cannot do this job here: arbor resolves copse DYNAMICALLY (a path
+ * from its config or env, deliberately — see arbor/src/driver.mjs), so npm's resolution never runs and a
+ * semver bump would be a number nobody checks. And during 0.x the interface moves without the version
+ * moving at all — one recent pass renamed an error code, changed what `./harness` exports, and reshaped a
+ * fact, none of which touched package.json. A number that tracks the INTERFACE is the only honest signal,
+ * and hanging it on `capabilities` means a consumer already reading capabilities to branch on engine facts
+ * gets the compatibility check for free.
+ */
+export const CONTRACT_VERSION = 1;
+
+/**
  * @param {('cocos'|'pixi'|null|undefined|string)} engine
- * @returns {{engine:('cocos'|'pixi'|null), clickSurface:boolean, stableRefs:boolean, reachability:boolean, visualManifest:boolean}}
+ * @returns {{contractVersion:number, engine:('cocos'|'pixi'|null), clickSurface:boolean, stableRefs:boolean, reachability:boolean, visualManifest:boolean}}
  */
 export function engineCapabilities(engine) {
   const known = engine === 'cocos' || engine === 'pixi';
   return {
+    contractVersion: CONTRACT_VERSION,
     engine: known ? /** @type {'cocos'|'pixi'} */ (engine) : null,
     clickSurface: engine === 'cocos',   // Pixi serializes no click handlers → no (ref,method) join
     stableRefs: engine === 'cocos',     // Pixi refs are positional (alwaysIndex) → shift under sibling churn

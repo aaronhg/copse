@@ -3,7 +3,7 @@
 // snapshot/press over your own Runtime adapter. runtime.js is the Cocos `cc.*`
 // adapter + `install(cc)` you inject into a running game.
 export { snapshot, clickSurface, resolve, press, get, call, reachable, node, diff } from './core/index.js';
-export { engineCapabilities } from './capabilities.js';
+export { engineCapabilities, CONTRACT_VERSION } from './capabilities.js';
 // NOTE: coverageJoin moved to arbor (the coverage JOIN is control-layer). copse keeps the ref-matching
 // interop adapters (resolveCoirPath/resolveCopseRef) that resolve against a live runtime view, plus the
 // `tailMatch` vocabulary they share — now PUBLIC so arbor's vendored copy (match.mjs) can cross-check
