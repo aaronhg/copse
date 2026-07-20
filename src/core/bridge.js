@@ -168,7 +168,7 @@ export function makeBridge({ rt, root, target = globalThis, engine }) {
   // collide with a path:Comp.method or a Name.method, so patch_clear/patch_calls treat them like any patch.
   //
   // traceMax defaults FAR above `patch`'s 200: measured on a real PureMVC game, one user action is 237 rows and an
-  // autoplay run sustains ~190 rows/sec, so 200 silently drops the start of a chain about a second in —
+  // a sustained run reaches ~190 rows/sec, so 200 silently drops the start of a chain about a second in —
   // and the dropped part is the beginning, which is the part you were tracing for.
   /** @param {{roles?:string[], traceMax?:number}} [opts] */
   function pmTraceImpl(opts = {}) {

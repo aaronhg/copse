@@ -105,8 +105,8 @@ From one real user action on a production-shaped PureMVC build (Cocos 3.5.2, min
 - **The information is in `dt`.** The interesting numbers were `+1129ms setRoundConfig`, `+610ms
   subPanel_HideAll`, `+583ms onShowResultLine` — the silences, not the bursts. Exactly what coir's
   `--time` cannot estimate.
-- **`traceMax` defaults to 5000**, not `patch`'s 200: one action's `@observe` alone is 523 rows and autoplay
-  sustains ~190 rows/sec, so 200 would drop the *start* of every chain — the part you were tracing for.
+- **`traceMax` defaults to 5000**, not `patch`'s 200: one action's `@observe` alone is 523 rows and a sustained sequence
+  reaches ~190 rows/sec, so 200 would drop the *start* of every chain — the part you were tracing for.
 
 ## Limits
 
