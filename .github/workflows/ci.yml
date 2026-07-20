@@ -1,0 +1,23 @@
+name: CI
+
+# Typecheck + test on every push to main and every PR — so the unit suite (test/*.test.js) actually
+# GATES changes, instead of only running when someone remembers `npm test` locally. Pure Node: the tests
+# drive copse's core over fake trees (no browser, no dist bundle, no API key), so this is fast + hermetic.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test

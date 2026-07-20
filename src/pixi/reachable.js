@@ -16,26 +16,19 @@
 // pointermove, does not push a hover event into the running game.
 import { refOf } from '../core/refpath.js';
 import { pixiName } from './pixitype.js';
+import { boundsRectOf, visibleOf } from './geom.js';
 
 /** The node's centre in Pixi WORLD/global space (what hitTest wants), or null if it has no area. */
 export function centreOf(node) {
-  let b; try { b = node.getBounds(); } catch { return null; }
-  const r = (b && b.rectangle) || b;                      // v8 returns Bounds (.rectangle); be tolerant
+  const r = boundsRectOf(node);
+  // Strictly positive, not >= 0: a degenerate box has no interior to aim a click at. visual.js keeps the
+  // looser predicate on purpose — so the shared helper returns the raw rect and each caller decides.
   if (!r || !(r.width > 0) || !(r.height > 0)) return null;
   return { x: r.x + r.width / 2, y: r.y + r.height / 2, rect: r };
 }
 
-/** Visible, or collapsed to nothing? A SEPARATE signal from reachable — input ignores alpha. */
-function visibleOf(node) {
-  let p = node;
-  while (p) {
-    if (p.visible === false) return false;
-    if (typeof p.alpha === 'number' && p.alpha === 0) return false;   // exact-zero only, no threshold guesswork
-    const s = p.scale; if (s && (s.x === 0 || s.y === 0)) return false;
-    p = p.parent;
-  }
-  return true;
-}
+// visibleOf (hidden / alpha 0 / scale 0, up the chain) now lives in geom.js — shared with visual.js
+// and mirroring cocos/geom.js, so the two engines report the same thing under the same field name.
 
 /** Is every ancestor still letting events through to its children? */
 function childrenInteractive(node, root) {

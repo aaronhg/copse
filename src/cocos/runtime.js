@@ -16,6 +16,7 @@ import { makeVisualManifest, frameRectToViewport } from './visual.js';
 import { probe } from './probe.js';
 import { makeCocosSurface, findAnchors, namedRefs } from './anchors.js';
 import { refOf } from '../core/refpath.js';
+import { synthTap } from './geom.js';   // dependency-free: the base/lite bundles pull this in
 import { safeBool } from '../core/eval-cond.js';
 
 const stripCc = (t) => (typeof t === 'string' && t.startsWith('cc.') ? t.slice(3) : t);
@@ -37,7 +38,7 @@ const ENGINE_EVENTS = new Set([
  * @param {any} cc
  */
 function baseRuntime(cc) {
-  const { Button, UITransform, Camera, Vec3 } = cc;
+  const { Button, UITransform } = cc;   // Camera/Vec3 moved with synthTap into geom.js
   const UIT = UITransform || 'cc.UITransform';
   const CLICK = Button?.EventType?.CLICK ?? 'click';
   const typeName = (c) => c?.constructor?.name || 'Unknown';
@@ -84,38 +85,10 @@ function baseRuntime(cc) {
     // is placed at the node's screen centre (same space worldToScreen/hitTest use) so a
     // handler's inside-node check on TOUCH_END passes. Best-effort: returns false if the
     // engine shapes don't line up (older/newer EventTouch signatures, no camera).
-    emitTouch: (n) => {
-      // EventTouch lives at cc.EventTouch in dev builds but only cc.Event.EventTouch in some
-      // (minified) release builds — resolve from either. cc.Touch is consistently top-level.
-      const EventTouch = cc.EventTouch || (cc.Event && cc.Event.EventTouch) || (cc.internal && cc.internal.EventTouch);
-      if (!EventTouch || !cc.Touch) return false;
-      const ET = (cc.Node && cc.Node.EventType) || {};
-      const START = ET.TOUCH_START || 'touch-start';
-      const END = ET.TOUCH_END || 'touch-end';
-      let x = 0, y = 0;
-      try {
-        const ui = n.getComponent(UIT);
-        const root = cc.director.getScene();
-        const cams = []; (function walk(z) { const c = z.getComponent && z.getComponent(Camera); if (c) cams.push(c); (z.children || []).forEach(walk); })(root);
-        if (ui && cams.length) {
-          const box = ui.getBoundingBoxToWorld();
-          const o = new Vec3(); cams[0].worldToScreen(new Vec3(box.x + box.width / 2, box.y + box.height / 2, 0), o);
-          x = o.x; y = o.y;
-        }
-      } catch { /* fall back to (0,0) */ }
-      try {
-        const touch = new cc.Touch(x, y, 0);
-        for (const type of [START, END]) {
-          const ev = new EventTouch([touch], true, type, [touch]);
-          try { ev.touch = touch; } catch { /* read-only in some versions */ }
-          try { ev.simulate = true; } catch { /* optional */ }
-          if (typeof n.dispatchEvent === 'function') n.dispatchEvent(ev);
-          else if (n._eventProcessor && n._eventProcessor.dispatchEvent) n._eventProcessor.dispatchEvent(ev);
-          else return false;
-        }
-        return true;
-      } catch { return false; }
-    },
+    // START → TOUCH_END: the ACTUATION phase pair, so a Button's own inside-node check on TOUCH_END
+    // passes and its handler runs. (The probe path in installProbe passes endType:'cancel' to observe a
+    // touch WITHOUT actuating — same code, one parameter. See geom.js `synthTap`.)
+    emitTouch: (n) => synthTap(cc, n, { endType: 'end' }),
 
     // USER node.on() listeners, read from the engine's NodeEventProcessor. Filters out
     // engine-internal node events + mouse-* + the Button's OWN touch listeners, leaving
@@ -409,17 +382,12 @@ export function installProbe(cc, target = globalThis) {
   // Baselines persist across ticks in this frame's closure (was window.__copseUntil). Reuses find/assets/rt.
   let _boot = null, _seen = false, _lblBase = null;
   const meaningful = (s) => s != null && String(s).trim() !== '' && String(s).trim() !== '0';
-  // synthetic touch (opt-in via reachable.dispatch): START → CANCEL at the node's screen centre, no click.
-  const synthTouch = (n) => { try {
-    const ET = cc.EventTouch || (cc.Event && cc.Event.EventTouch) || (cc.internal && cc.internal.EventTouch); if (!ET || !cc.Touch) return false;
-    const TET = (cc.Node && cc.Node.EventType) || {}; const START = TET.TOUCH_START || 'touch-start', CANCEL = TET.TOUCH_CANCEL || 'touch-cancel';
-    let x = 0, y = 0;
-    try { const ut = rt.getComponent(n, 'cc.UITransform'); const cams = []; (function w(z) { const c = z && rt.getComponent(z, 'cc.Camera'); if (c) cams.push(c); (rt.children(z) || []).forEach(w); })(root());
-      if (ut && cams.length) { const bb = ut.getBoundingBoxToWorld(); const o = new cc.Vec3(); cams[cams.length - 1].worldToScreen(new cc.Vec3(bb.x + bb.width / 2, bb.y + bb.height / 2, 0), o); x = o.x; y = o.y; } } catch { /* geometry best-effort */ }
-    const touch = new cc.Touch(x, y, 0);
-    for (let ti = 0; ti < 2; ti++) { const ev = new ET([touch], true, ti === 0 ? START : CANCEL, [touch]); try { ev.touch = touch; } catch { /* */ } try { ev.simulate = true; } catch { /* */ }
-      if (typeof n.dispatchEvent === 'function') n.dispatchEvent(ev); else if (n._eventProcessor && n._eventProcessor.dispatchEvent) n._eventProcessor.dispatchEvent(ev); else return false; }
-    return true; } catch { return false; } };
+  // synthetic touch (opt-in via reachable.dispatch): START → CANCEL at the node's screen centre, so the
+  // node OBSERVES a touch (confirming a hit test) but NO click fires — this is a probe, not an actuation.
+  // Same implementation as emitTouch's actuation above; `endType` is the only real difference, and it
+  // used to be the only INTENDED one — the two hand-maintained copies had also drifted on which camera
+  // they projected through (`cams[0]` here vs `cams[cams.length - 1]` there). See geom.js `synthTap`.
+  const synthTouch = (n) => synthTap(cc, n, { endType: 'cancel', root: root() });
   // Evaluate the selected PAGE conditions → { held:[{id,node,detail}], scene, assets } for a --until composer.
   const until = (specs) => { try {
     const scene = root(); const sceneName = (scene && (scene.name || scene._name)) || null;

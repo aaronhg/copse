@@ -21,6 +21,7 @@ import { makeReachable } from './reachable.js';
 import { makeVisualManifest } from './visual.js';
 import { pixiPress } from './press.js';
 import { probe } from './probe.js';
+import { boundsRectOf, visibleChain } from './geom.js';
 
 /** Walk a dotted member path (`_game.score.value`). Pixi's named refs are inherently multi-hop. */
 const readPath = (o, path) => String(path).split('.').reduce((v, k) => (v == null ? v : v[k]), o);
@@ -39,7 +40,7 @@ export function pixiRuntime(app, root) {
     children: (n) => n.children || [],
     // Pixi has no `active` separate from `visible`; renderability is the closest equivalent, and it
     // must consider ancestors (a hidden parent hides the subtree) to match Cocos's activeInHierarchy.
-    isActive: (n) => { let p = n; while (p) { if (p.visible === false) return false; p = p.parent; } return true; },
+    isActive: (n) => visibleChain(n),   // the ancestor `visible` walk — one definition, in geom.js
     components: (n) => [{ type: pixiType(n), raw: n }],
     // No component system: a node "has" the component that IS its own type. `Label` is a pseudo-type
     // mapped onto any Text flavour, which is what lets core's snapshot/diff labelChanged work
@@ -94,11 +95,11 @@ export function pixiRuntime(app, root) {
     }),
     reachable: makeReachable(app, root),
     nodeInfo: (n) => {
-      const info = { active: n.visible !== false, activeInHierarchy: (() => { let p = n; while (p) { if (p.visible === false) return false; p = p.parent; } return true; })() };
+      const info = { active: n.visible !== false, activeInHierarchy: visibleChain(n) };
       if (typeof n.alpha === 'number') info.alpha = n.alpha;
       try { const s = n.scale; if (s) info.scale = { x: s.x, y: s.y }; } catch { /* */ }
       try { const p = n.getGlobalPosition ? n.getGlobalPosition() : null; if (p) info.worldPos = { x: Math.round(p.x), y: Math.round(p.y) }; } catch { /* */ }
-      try { const b = n.getBounds(); const r = (b && b.rectangle) || b; if (r) info.size = { w: Math.round(r.width), h: Math.round(r.height) }; } catch { /* */ }
+      try { const r = boundsRectOf(n); if (r) info.size = { w: Math.round(r.width), h: Math.round(r.height) }; } catch { /* */ }
       if (typeof n.text === 'string') info.text = n.text;
       return info;
     },

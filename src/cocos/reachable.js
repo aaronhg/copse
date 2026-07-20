@@ -4,36 +4,19 @@
 // lite caller doesn't want) and (b) reused as ONE implementation instead of being re-derived
 // elsewhere. `makeReachable(cc)` is SELF-CONTAINED re: cc CLASS resolution — it re-resolves the cc classes
 // it needs (the same feature-probe/fallback ladder runtime.js uses), so it has no dependency on the base
-// runtime. Its ONE import is the shared node→ref path helper (refpath.js), kept in lockstep with visual.js
-// so both emit the same ref grammar (trivially inlinable if this is ever built as a standalone snippet).
+// runtime. Its imports are the shared node→ref path helper (refpath.js), so this and visual.js emit the
+// same ref grammar, and geom.js for camera/visibility — both dependency-free and trivially inlinable if
+// this is ever built as a standalone snippet. `camOf`/`visibleOf` used to be duplicated here AND in
+// visual.js, with both headers promising to keep them in lockstep by hand; geom.js makes that structural.
 //
 // Best-effort geometric reachability (Rung 2+3): replay the engine's input z-order over the live
 // tree. See the returned method's contract below + CLAUDE.md "Capability boundary" for the honest
 // limits (no alpha hit-areas, no event-penetration, single-frame; answers "would a TOUCH reach it").
 import { refOf } from '../core/refpath.js';
+import { camOf, collectCameras, visibleOf } from './geom.js';
 
-// node → its rendering camera: the active camera whose `visibility` mask includes the node's `layer`,
-// taking the highest `priority`. Falls back to the first camera. (Cross-camera/Layer z-order.)
-const camOf = (node, cams) => {
-  let best = null;
-  for (const c of cams) {
-    if (c.enabled === false || (c.node && c.node.activeInHierarchy === false)) continue; // disabled camera doesn't render
-    if (c.visibility === undefined || (node.layer & c.visibility)) { if (!best || (c.priority || 0) > (best.priority || 0)) best = c; }
-  }
-  return best || cams[0];
-};
-// Is the node visually present, or collapsed to nothing — `opacity === 0` or `scale === 0` anywhere up
-// the chain? A SEPARATE visibility signal (input ignores opacity/scale, so this is NOT folded into
-// `reachable`); exact-zero only, so no threshold guesswork. Reported alongside reachable.
-const visibleOf = (node, UIOpacity) => {
-  let p = node;
-  while (p) {
-    if (UIOpacity) { const u = p.getComponent && p.getComponent(UIOpacity); if (u && u.opacity === 0) return false; }
-    const s = p.scale; if (s && (s.x === 0 || s.y === 0)) return false;
-    p = p.parent;
-  }
-  return true;
-};
+// camOf (node → its rendering camera) and visibleOf (opacity/scale collapse, up the chain) now live in
+// geom.js — shared with visual.js, which needs the identical answers.
 // node -> the sibling-index chain from the scene root (the draw-order key's TAIL). The HEAD is the
 // node's render-camera priority, prepended in reachable (so cross-camera/Layer z-order resolves).
 const siblingKey = (node, root) => {
@@ -56,7 +39,7 @@ const isAncestor = (anc, n) => { let p = n.parent; while (p) { if (p === anc) re
  * @returns {(n:any)=>{reachable:boolean|'unsure', reachableFraction?:number, partial?:boolean, blockedBy?:string|null, occludedBy?:string|null, visible?:boolean, reason?:string, via?:{consumer:string,camera:string}}}
  */
 export function makeReachable(cc) {
-  const { Button, UITransform, BlockInputEvents, Camera, UIOpacity, Vec2, Vec3 } = cc;
+  const { Button, UITransform, BlockInputEvents, Vec2, Vec3 } = cc;
   const UIRenderer = cc.UIRenderer || cc.Renderable2D; // the 2D-renderable base (Sprite/Label/…) — visual-occlusion probe
   // Some builds don't expose every class as a `cc.*` global (tree-shaking) — `cc.UITransform` was UNDEFINED on a
   // real 3.8.6 preview, which silently made reachable() return 'unsure' for EVERY button. getComponent accepts the
@@ -161,11 +144,11 @@ export function makeReachable(cc) {
   //     this never flips reachable). Best-effort, centre-point, no alpha hit-areas.
   //   • via:{consumer,camera} — which detection tier resolved it (provenance for cross-version trust).
   return (n) => {
-    const visible = visibleOf(n, UIOpacity); // separate signal (opacity/scale === 0) — never affects `reachable`
+    const visible = visibleOf(cc, n); // separate signal (opacity/scale === 0) — never affects `reachable`
     const root = cc.director.getScene();
     const ui = n.getComponent(UIT); if (!ui) return { reachable: 'unsure', blockedBy: null, visible, reason: 'no-uitransform' };
     const c = caps(ui);
-    const cams = []; (function walk(x) { const cam = x.getComponent && x.getComponent(Camera); if (cam) cams.push(cam); (x.children || []).forEach(walk); })(root);
+    const cams = collectCameras(cc, root);   // name-string fallback: `cc.Camera` is undefined on some release builds
     if (!cams.length) return { reachable: 'unsure', blockedBy: null, visible, reason: 'no-camera' };
     const rc = renderCamOf(n, cams);
     const via = { consumer: consumerTier(n) || 'forced', camera: rc.authoritative ? 'render' : 'heuristic' };
@@ -206,7 +189,7 @@ export function makeReachable(cc) {
     if (cp) (function walk(x) {
       if (x.activeInHierarchy !== false) {
         const u = x.getComponent && x.getComponent(UIT), r = x.getComponent && x.getComponent(UIR);
-        if (u && r && x !== n && !isAncestor(n, x) && !isAncestor(x, n) && visibleOf(x, UIOpacity)) {
+        if (u && r && x !== n && !isAncestor(n, x) && !isAncestor(x, n) && visibleOf(cc, x)) {
           let hit = false; try { hit = u.hitTest(cp); } catch { /* */ }
           if (hit) { const k = drawKey(x); if (cmpKey(k, myKey) > 0 && (!occ || cmpKey(k, occKey) > 0)) { occ = x; occKey = k; } }
         }

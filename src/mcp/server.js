@@ -8,6 +8,7 @@
 import readline from 'node:readline';
 import { readFileSync } from 'node:fs';
 import { TOOLS, TOOLS_BY_NAME, FAMILY, FAMILY_ORDER, HEADLINE, familyTag } from './tools.js';
+import { errClass } from '../script.js';   // one definition of the driver's error class (see script.js)
 
 const VERSION = (() => { try { return JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8')).version; } catch { return '?'; } })();
 const PROTOCOL_VERSION = '2025-06-18';
@@ -47,10 +48,15 @@ export function createDispatcher(state) {
         const { name, arguments: args = {} } = msg.params || {};
         const tool = TOOLS_BY_NAME.get(name);
         if (!tool) return { error: { code: -32602, message: `unknown tool: ${name}` } };
+        /** @type {{data?:any,error?:string,image?:any,recoverable?:boolean,code?:string}} */
         let res;
         try { res = await tool.run(state, args); }
-        catch (e) { res = { error: e instanceof Error ? e.message : String(e) }; }
-        if (res && res.error) return toolResult(`✗ ${`${res.error}`.replace(/^\s*✗\s*/, '')}`, true);
+        // Keep the driver's error CLASS, not just its sentence (see the `err` helper in drivers/puppeteer.js).
+        catch (e) { res = { error: e instanceof Error ? e.message : String(e), ...errClass(e) }; }
+        // A tool error reaches the model as TEXT, so the class has to be in the text or it may as well not
+        // exist: `[recoverable]` tells a driving agent "this same call may just work in a moment" without
+        // asking it to infer that from prose. The tag is the contract; the sentence is the explanation.
+        if (res && res.error) return toolResult(`✗ ${res.recoverable ? '[recoverable] ' : ''}${res.code ? `[${res.code}] ` : ''}${`${res.error}`.replace(/^\s*✗\s*/, '')}`, true);
         // A tool returning `{ image }` (screenshot) emits an MCP image content block so the model
         // actually SEES the pixels — the whole point of pairing a logic state with the screen.
         if (res && res.image) return { result: { content: [{ type: 'image', data: res.image.data, mimeType: res.image.mimeType || 'image/png' }] } };

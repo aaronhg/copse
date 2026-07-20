@@ -566,3 +566,82 @@ with a clear reason, so they no longer read as defects.
   instead. → backend behavior.
 - The `cc.find` / minified-name root cause is the Cocos engine/build; copse works around it via
   snapshot/selectors (B2) + registry-name access (B3).
+
+### F — the wait budget: fail LOUD, not long
+
+A second field report, from a long attach-driven session (a multi-project feature migration: dozens of
+build → reload → verify loops). Its headline complaint was that a detached frame made every op wait 40s,
+and that one `run_script` hung for **1953s (32.5 min)** before the MCP host's idle timeout killed it — not
+copse. The symptom was real; **the diagnosis was wrong**, and measuring it against a real Chrome is what
+found the actually-severe bug. Kept here because the corrections are more instructive than the fix:
+
+| the report's claim | what measurement showed |
+|---|---|
+| every op blocks 40s after a detach | the **main frame never detaches** (not on reload, not on cross-site nav). Only an iframe does (the editor-preview shape) — and its `evaluate` throws **synchronously, 0ms**. After a healthy F5 copse already re-attached in **4ms**. |
+| the 40s comes from puppeteer/CDP | **no** — it was copse's own `bootTries ?? 40` × `sleep(1000)`. Grepping for `40000` found nothing because the number is 40×1000. |
+| an in-flight detach never settles | not in the reload case: puppeteer **rejects in 533ms**, and `isDetached` already matched that message. |
+
+The 32-minute hang was real but unrelated to detaching: `ev()` opened with an unbounded `await ready`,
+and attach mode deliberately never awaits it — so once `ready` stalled (renderer on a breakpoint, engine
+never up) *every* later op hung forever. The proposed detach-race would not have touched it.
+
+**The worst bug was the one the report didn't find.** When `bootInPage` couldn't find `cc` it fell back to
+`page.mainFrame()` — a live frame with no game on it. Nothing about it is "detached", so `isDetached`
+never fired again and the session was wedged **permanently**, not recovering even after the game came back
+healthy. That, not detaching, is why the session needed a manual reconnect every time: one F5 that landed
+mid-rebuild poisoned it irreversibly.
+
+What closed it — the principle is *not* "make the numbers smaller", it is **make failure explicit and
+recoverable**; short budgets are only safe once a failure can be retried:
+
+| situation | before | after |
+|---|---|---|
+| first op after a healthy F5 | 4ms | **6ms** (unchanged) |
+| op after attaching to a not-yet-booted tab | ≤**80s of silence** | **5.0s** + `phase=finding-engine, 6.0s elapsed` |
+| reload landing mid-rebuild, single op | **∞** (wedged forever) | **15.2s** + the reason; next op fails fast in **0ms**; self-heals in **6ms** once the game returns |
+| `browseTabs()` over 10 tabs | ≤**16s** (sequential, 800ms/tab) | **18ms** (parallel) |
+
+Then three more "we already knew the answer and were still waiting" cases: `attachTries` 30s → **8s**, and
+on failure it lists every open tab (a mistyped `match` went from 30s of silence to 8.3s and the answer on
+screen); a reboot no longer inherits the cold-boot scene budget (each reboot phase uses `rebootTries`);
+`injectStallMs` 20s → **the same number as `readyTimeout`** (connect used to block 20s before admitting it
+wasn't ready, when readyGate could say so in 5s *and* name the phase). Plus a genuine infinite wait hiding
+behind a clean error message: **`connect` didn't close the browser it had launched when it threw**, leaving
+a live CDP websocket that kept the caller's Node process alive forever — all post-launch throws now go
+through `bail()`.
+
+Two later rounds mattered more than any number:
+
+- **`opTimeout` (60s default).** The first pass only bounded "init never finished". A renderer that wedges
+  **after** connect (a breakpoint mid-session, a JS thread in a loop) was still silent forever, because
+  `readyGate` is a no-op once init settles and the `frame.evaluate` under it had no bound at all. **Half a
+  guarantee is worse than none, because people trust it.** `watch` derives its own budget (or
+  `watch({timeout:'2m'})` would be killed by the cap) and `eval` may pass `{timeout}` — it is the one op
+  whose duration is the caller's to choose, and the reported 1953s was an eval.
+- **`recoverable` + `code`.** The report asked for this; the first version shipped only well-written human
+  prose. But a runner that stops at the first failure, and an agent, can then only string-match sentences —
+  they cannot tell "retry me" from "your selector is wrong". Errors now carry `recoverable`/`code`
+  (`init-pending` / `boot-failed` / `no-engine` / `not-installed` / `op-timeout` / `no-tab` /
+  `ambiguous-tab` / `renderer-silent` / `interrupted`), through script.js and harness.js via one `errClass`
+  definition, and MCP puts the tags in the **text** (`✗ [recoverable] [init-pending] …`) — an MCP client
+  only ever sees text, so a flag left on the Error object may as well not exist. Deliberately **not**
+  recoverable: anything a retry would only replay — a mistyped or ambiguous `match`, a wedged renderer.
+
+A third review pass (focused on silent failures and long waits, verified on a real browser) found a layer
+under that: **an operation reported as failed may still have run.** Adding deadlines broke an invariant the
+old `ev` held implicitly — it never reported failure before the op was sent, so "failed ⇒ didn't run" used
+to be true. `evWith` now carries a `sent` bit: not-yet-sent failures are safe to retry by construction (and
+a zombie run is barred by `abandoned` from firing late), while an in-flight navigation raises
+`[interrupted]` — "this may have taken effect; verify before retrying a mutating op" — instead of silently
+re-firing. That also cured an **older** double-fire: the detach-retry path blindly re-sent mutating ops.
+`mutate()` follows the same rule: once the actuation has happened, a failed *observation* can only annotate
+`observation.lost` on the result — calling an executed press "failed, please retry" is telling an agent to
+place a second bet.
+
+**Not done:** the report's P2, a CDP `Page.frameDetached` signal to race in-flight ops against. With a
+healthy F5 already self-healing in 6ms and a reload rejecting in 533ms, it would turn 533ms into ~0ms —
+an optimisation, not a bug fix. **Unreconciled:** the exact 40048ms + detached-message combination never
+reproduced (the closest was 50119ms with a different message); closing that needs a real editor preview.
+
+The acceptance criteria the report proposed are now executable rather than prose: they are
+`test/driver-reconnect.l2.test.js`, which launches a real Chrome and skips when none is available.

@@ -10,11 +10,11 @@
 import { refOf } from '../core/refpath.js';
 import { pixiName, pixiType, DEFAULT_DYNAMIC } from './pixitype.js';
 import { toClient } from './press.js';
+import { boundsRectOf, visibleOf } from './geom.js';
 
 /** Bounds → a plain rect, tolerating both v8's Bounds (.rectangle) and a raw Rectangle. */
 const rectOf = (node) => {
-  let b; try { b = node.getBounds(); } catch { return null; }
-  const r = (b && b.rectangle) || b;
+  const r = boundsRectOf(node);
   if (!r || !(r.width >= 0) || !(r.height >= 0)) return null;
   return { x: r.x, y: r.y, width: r.width, height: r.height };
 };
@@ -42,9 +42,9 @@ export function makeVisualManifest(app, root, { dynamicTypes = DEFAULT_DYNAMIC }
     const stage = root();
     const ref = refOf(node, stage, pixiName, true) || pixiName(node);
     const r = rectOf(node);
-    if (!r) return { ref, rect: null, maskRects: [], visible: node.visible !== false, via: 'geometric', reason: 'no-rect' };
+    if (!r) return { ref, rect: null, maskRects: [], visible: visibleOf(node), via: 'geometric', reason: 'no-rect' };
     const rect = toViewport(app, r);
-    if (!rect) return { ref, rect: null, maskRects: [], visible: node.visible !== false, via: 'geometric', reason: 'no-canvas-size' };
+    if (!rect) return { ref, rect: null, maskRects: [], visible: visibleOf(node), via: 'geometric', reason: 'no-canvas-size' };
     const maskRects = [];
     (function walk(n, d) {
       if (!n || d > 64) return;
@@ -54,6 +54,6 @@ export function makeVisualManifest(app, root, { dynamicTypes = DEFAULT_DYNAMIC }
       }
       for (const c of n.children || []) walk(c, d + 1);
     })(node, 0);
-    return { ref, rect, maskRects, visible: node.visible !== false, via: 'geometric' };
+    return { ref, rect, maskRects, visible: visibleOf(node), via: 'geometric' };
   };
 }

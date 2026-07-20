@@ -12,7 +12,7 @@
 // This module is the whole `__copse` surface EXCEPT the installer itself: the engine layer
 // calls makeBridge(...) and assigns the result to `target.__copse`.
 import { snapshot, clickSurface, resolve, press, get, call, reachable, node, diff, splitMember } from './index.js';
-import { registerInto, describe, stateWith, callWith, patchTargetWith, notifyWith, retrieveWith } from './framework.js';
+import { registerInto, describe, stateWith, callWith, patchTargetWith, notifyWith, retrieveWith, traceTargetsWith } from './framework.js';
 import { jsonSafe, parseDur, safeVal, safeBool } from './eval-cond.js';
 
 /**
@@ -74,6 +74,20 @@ export function makeBridge({ rt, root, target = globalThis, engine }) {
   // before/after hooks under try/catch so a buggy hook can't break the original call — the three
   // things testers kept getting wrong hand-writing monkey-patches on the running game.
   const PATCHES = target.__copsePatches || (target.__copsePatches = new Map());
+  // Traced calls are stamped against ONE epoch + ONE sequence counter shared by every patch, so calls
+  // recorded by DIFFERENT patches are directly comparable — per-patch origins made a merged timeline
+  // silently wrong, and cross-method ORDER ("did the mediator's handler run before the command?") is the
+  // whole reason to trace a chain. `t` (ms since the first patch) answers "how long apart"; `i` answers
+  // "which first" — Date.now() is ms-granular and a synchronous command chain runs well inside one
+  // millisecond, so t alone can't order it. Both reset on patch_clear() (clear-all) → a fresh timeline.
+  const patchEpoch = () => target.__copsePatchEpoch || (target.__copsePatchEpoch = Date.now());
+  const patchSeq = () => (target.__copsePatchSeq = (target.__copsePatchSeq || 0) + 1);
+  // Nesting depth, shared like the seq. A framework's dispatch is DEPTH-FIRST: measured on a real dispatch chain, one
+  // sendNotification's observer list gets interrupted by the whole subtree each observer kicks off (observer
+  // #1 of `appEvAction` ran a command that sent 20 more notifications before observer #2 of `appEvAction`
+  // was reached). A flat list of that reads as nonsense — `d` is what lets a reader indent it back into the
+  // tree it actually was, and it's the axis coir's static flow output is already shaped along.
+  const patchDepth = (delta) => (target.__copsePatchDepth = (target.__copsePatchDepth || 0) + delta);
   const compileHook = (src) => { if (!src) return null; if (typeof src === 'function') return src; return (0, eval)('(' + src + ')'); };
   // Cheap, cycle-safe truncation for traced args/ret — a live object graph is huge/circular.
   const traceVal = (v, d = 0) => {
@@ -94,29 +108,44 @@ export function makeBridge({ rt, root, target = globalThis, engine }) {
   // proxy/mediator instance, or a command CLASS prototype) — same before/after/replace hooks, trace, and restore.
   function wrapTarget(sel, tgt, member, hooks) {
     if (typeof tgt[member] !== 'function') return { ok: false, reason: 'not-a-method', ref: sel };
-    let before, after, replace;
-    try { before = compileHook(hooks.before); after = compileHook(hooks.after); replace = compileHook(hooks.replace); }
+    let before, after, replace, label;
+    try { before = compileHook(hooks.before); after = compileHook(hooks.after); replace = compileHook(hooks.replace); label = compileHook(hooks.label); }
     catch (e) { return { ok: false, reason: 'bad-hook', error: (e && e.message) || String(e) }; }
     if (PATCHES.has(sel)) restore(sel);              // re-patching the same selector replaces
     const hadOwn = Object.prototype.hasOwnProperty.call(tgt, member);
     const orig = tgt[member];
     const errors = [];
-    // trace:true records each call {t (ms since patch), args, ret[, threw]} into a ring buffer — read
-    // via patch_calls. The runtime companion to coir's STATIC command flow: confirm real order + timing live.
-    const trace = !!hooks.trace; const traceMax = hooks.traceMax || 200; const calls = []; const t0 = Date.now();
+    // trace:true records each call {i (shared seq), t (ms since the shared epoch), args, ret[, threw]} into
+    // a ring buffer — read via patch_calls (per-sel, or merged across patches). The runtime companion to
+    // coir's STATIC command flow: confirm real order + timing live.
+    const trace = !!hooks.trace; const traceMax = hooks.traceMax || 200; const calls = []; const t0 = patchEpoch();
     const wrapper = function (...args) {
-      let a = args; const started = Date.now();
+      // Stamp seq/depth/label on ENTRY, not at the trace push below (which happens after the original
+      // returns). Three reasons, all load-bearing: a nested call returns FIRST, so exit-stamping would order
+      // a caller after its own callee; depth must be read before the callee increments it; and `label` must
+      // see the receiver as it was on the way IN — MacroCommand.execute ends with `this.subCommands.splice(0)`,
+      // so a label reading self.subCommands at exit reports an empty list on every macro, every time.
+      let a = args; const started = Date.now(); const seq = trace ? patchSeq() : 0;
+      const depth = trace ? patchDepth(1) - 1 : 0;
       if (before) { try { const r = before(a, this); if (Array.isArray(r)) a = r; } catch (e) { errors.push('before: ' + ((e && e.message) || e)); } }
+      let lbl;
+      if (trace && label) { try { lbl = label(a, this); } catch (e) { errors.push('label: ' + ((e && e.message) || e)); } }
       let ret, threw = null;
       try { ret = replace ? replace(a, this) : orig.apply(this, a); } catch (e) { threw = e; }   // orig/replace throw still propagates (below)
       if (after && !threw) { try { const r = after(a, ret, this); if (r !== undefined) ret = r; } catch (e) { errors.push('after: ' + ((e && e.message) || e)); } }
-      if (trace) { calls.push({ t: started - t0, args: traceVal(a), ...(threw ? { threw: (threw && threw.message) || String(threw) } : { ret: traceVal(ret) }) }); if (calls.length > traceMax) calls.shift(); }
+      if (trace) {
+        patchDepth(-1);   // before the push, and before the rethrow below — every escape path is past this point
+        // A label REPLACES args: a labelled hook is one whose caller already said what it wants recorded, and
+        // these hooks' raw args (a Notification object) truncate into noise that costs tokens per row.
+        calls.push({ i: seq, d: depth, t: started - t0, ...(lbl !== undefined ? { label: traceVal(lbl) } : { args: traceVal(a) }), ...(threw ? { threw: (threw && threw.message) || String(threw) } : { ret: traceVal(ret) }) });
+        if (calls.length > traceMax) calls.shift();
+      }
       if (threw) throw threw;
       return ret;
     };
     try { tgt[member] = wrapper; } catch (e) { return { ok: false, reason: 'unwritable', error: (e && e.message) || String(e) }; }
-    PATCHES.set(sel, { target: tgt, member, hadOwn, orig, errors, calls });
-    return { ok: true, ref: sel, method: member, hooks: ['before', 'after', 'replace'].filter((k) => hooks[k]), ...(trace ? { trace: true } : {}) };
+    PATCHES.set(sel, { target: tgt, member, hadOwn, orig, errors, calls, trace });
+    return { ok: true, ref: sel, method: member, hooks: ['before', 'after', 'replace', 'label'].filter((k) => hooks[k]), ...(trace ? { trace: true } : {}) };
   }
   function patchImpl(sel, hooks = {}) {
     let comp, member;
@@ -134,14 +163,56 @@ export function makeBridge({ rt, root, target = globalThis, engine }) {
     const r = wrapTarget(sel, pt.target, pt.member, hooks);
     return r.ok ? { ...r, kind: pt.kind } : r;   // kind: 'instance' (proxy/mediator) | 'command' (class prototype)
   }
-  // Read a traced patch's recorded calls (empty if the patch wasn't trace:true / doesn't exist).
-  function patchCallsImpl(sel) { const p = PATCHES.get(sel); return { ok: !!p, ref: sel, calls: p && p.calls ? p.calls.slice() : [] }; }
+  // pm_trace: arm EVERY dispatch choke point the adapter declares, in one call — the whole app-layer flow
+  // instead of a selector you had to guess. The selectors are '@role' (@send/@observe/@macro), which can't
+  // collide with a path:Comp.method or a Name.method, so patch_clear/patch_calls treat them like any patch.
+  //
+  // traceMax defaults FAR above `patch`'s 200: measured on a real PureMVC game, one user action is 237 rows and an
+  // autoplay run sustains ~190 rows/sec, so 200 silently drops the start of a chain about a second in —
+  // and the dropped part is the beginning, which is the part you were tracing for.
+  /** @param {{roles?:string[], traceMax?:number}} [opts] */
+  function pmTraceImpl(opts = {}) {
+    const tt = traceTargetsWith(target, FW, opts.roles);
+    if (!tt.ok) return tt;                       // no-framework / adapter-has-no-trace / nothing resolved → loud
+    const traceMax = opts.traceMax || 5000;
+    const armed = []; const failed = [];
+    for (const t of tt.targets) {
+      const sel = '@' + t.role;
+      const r = wrapTarget(sel, t.target, t.member, { trace: true, traceMax, ...(t.label ? { label: t.label } : {}) });
+      if (r.ok) armed.push({ role: t.role, sel, at: t.at, labelled: !!t.label });
+      else failed.push({ role: t.role, at: t.at, ...r });
+    }
+    return {
+      ok: armed.length > 0, armed, traceMax,
+      ...(failed.length ? { failed } : {}), ...(tt.unresolved ? { unresolved: tt.unresolved } : {}),
+      read: 'patch_calls() → the merged timeline; patch_clear() to disarm',
+    };
+  }
+  // Read a traced patch's recorded calls (empty if the patch wasn't trace:true / doesn't exist). NO sel →
+  // the MERGED timeline across every traced patch: each call tagged with its `sel`, ordered by the shared
+  // seq — the cross-method question ("what actually ran, in what order") that a per-selector read can't
+  // answer without the caller hand-merging origins that used to be incomparable. `traced` names the patches
+  // in scope, so an empty timeline reads as "these were armed, nothing fired" rather than an ambiguous blank.
+  function patchCallsImpl(sel) {
+    if (sel) { const p = PATCHES.get(sel); return { ok: !!p, ref: sel, calls: p && p.calls ? p.calls.slice() : [] }; }
+    const traced = []; const calls = [];
+    for (const [k, p] of PATCHES) { if (!p.trace) continue; traced.push(k); for (const c of p.calls) calls.push({ sel: k, ...c }); }
+    calls.sort((a, b) => a.i - b.i);
+    // `dt` (gap from the previous row) is the merged view's payload, not a convenience. Measured on a real
+    // chain, 96 of 102 sends land in four same-millisecond bursts and everything interesting is the silence
+    // BETWEEN them (+134ms board animation, +1848ms result animation) — a column of near-identical `t`s hides exactly
+    // the thing you opened the timeline to find. Only meaningful once merged, hence not recorded per patch.
+    let prev = 0;
+    for (const c of calls) { const dt = c.t - prev; prev = c.t; c.dt = dt; }
+    return { ok: true, traced, calls };
+  }
   function patchClearImpl(sel) {
     const errsOf = (k) => { const p = PATCHES.get(k); return p && p.errors.length ? p.errors.slice() : null; };
     if (sel) { const he = errsOf(sel); const ok = restore(sel); return { ok: true, cleared: ok ? [sel] : [], ...(he ? { hookErrors: { [sel]: he } } : {}) }; }
     const all = [...PATCHES.keys()]; const hookErrors = {};
     for (const k of all) { const he = errsOf(k); if (he) hookErrors[k] = he; }
     for (const k of all) restore(k);
+    delete target.__copsePatchEpoch; delete target.__copsePatchSeq;   // nothing left to compare against → next patch starts a fresh timeline
     return { ok: true, cleared: all, ...(Object.keys(hookErrors).length ? { hookErrors } : {}) };
   }
 
@@ -227,7 +298,7 @@ export function makeBridge({ rt, root, target = globalThis, engine }) {
     watch: (opts) => watchImpl(opts),                     // diff-only timeline of exprs/selectors over time
     patch: (sel, hooks) => patchImpl(sel, hooks),         // wrap a live method to verify a fix pre-rebuild
     patch_clear: (sel) => patchClearImpl(sel),            // restore patched method(s)
-    patch_calls: (sel) => patchCallsImpl(sel),            // read a trace:true patch's recorded calls (order/timing)
+    patch_calls: (sel) => patchCallsImpl(sel),            // a trace:true patch's recorded calls (order/timing); no sel → merged across all traced patches
     hold: (sel, opts) => holdImpl(sel, opts),             // freeze the loop at a trigger → screenshot/inspect a transient state
     release: () => releaseImpl(),                         // resume the loop (clears the hold/trigger)
     hold_status: () => holdStatusImpl(),                  // { armed?, held?, sel, via, sinceMs }
@@ -237,6 +308,7 @@ export function makeBridge({ rt, root, target = globalThis, engine }) {
     pmSet: (sel, value) => stateWith(target, FW, sel, true, value), // WRITE a proxy/mediator leaf
     pmCall: (sel, args) => callWith(target, FW, sel, args), // call a proxy/mediator method
     pmPatch: (sel, hooks) => pmPatchImpl(sel, hooks),     // wrap a proxy/mediator/command method (patch_clear/patch_calls apply)
+    pmTrace: (opts) => pmTraceImpl(opts),                 // arm every dispatch choke point the adapter declares → patch_calls() reads the merged flow
     pmNotify: (name, body, type) => notifyWith(target, FW, name, body, type), // fire a framework notification (direct flow entry)
     rt, // exposed for ad-hoc poking from a console
   };
@@ -247,7 +319,7 @@ export function makeBridge({ rt, root, target = globalThis, engine }) {
   // boundary in-page) — what you'd otherwise dig out of puremvc.Facade.instance.retrieveProxy(...) by hand.
   api.pm = {
     get: api.pmGet, set: api.pmSet, call: (sel, ...args) => api.pmCall(sel, args),
-    notify: api.pmNotify, patch: api.pmPatch,
+    notify: api.pmNotify, patch: api.pmPatch, trace: api.pmTrace,
     proxy: (name) => retrieveWith(target, FW, name),
     mediator: (name) => retrieveWith(target, FW, name),
   };

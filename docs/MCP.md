@@ -55,7 +55,7 @@ npm i -D puppeteer-core # the browser edge (peer dep); the server launches syste
 
 ## Tools
 
-The default tool set is 36 testing primitives (the Debugger tools below are hidden unless `--debug`).
+The default tool set is 41 testing primitives (the 7 Debugger tools below are hidden unless `--debug`).
 The tool names match the library 1:1 (`connect`, `snapshot`, `press`, …) — the MCP edge is the same
 surface over stdio.
 
@@ -66,6 +66,20 @@ rest are variants / lower-level"), and prefixes every description with its tag �
 **usable** (`reachable`★) · **observe** (`watch`★) · **fix** (`patch`★) · **coverage** (`click_surface`★) ·
 **script** (`run_script`★) · **orient** (`orient`★) · **escape** (`eval`, no ★ — the raw hatch, a last resort).
 The core loop is the ★s of session/see/drive/read.
+
+**Failures are typed, in the text.** An MCP client only ever sees strings, so a flag left on an Error
+object may as well not exist — the tags are put *ahead of the prose*: `✗ [recoverable] [init-pending]
+in-page init hasn't finished yet (phase=finding-engine, 6.0s elapsed) …`. `recoverable` means retrying
+is worth it by construction (the session is still coming up, the page is mid-rebuild); its ABSENCE is
+equally deliberate — a mistyped or ambiguous `match`, a wedged renderer, or a page with no engine will
+only replay the same failure. `code` is the stable key to branch on: `init-pending` · `boot-failed` ·
+`no-engine` · `not-installed` · `renderer-silent` · `op-timeout` · `interrupted` · `no-tab` ·
+`ambiguous-tab`. `interrupted` is the one to read carefully: the page navigated while the call was
+IN FLIGHT, so the op **may have taken effect** — verify before retrying anything that mutates.
+
+Every in-page call is bounded (`opTimeout`, 60s by default) so a renderer that wedges *after* connect
+can't hang a tool call forever; `eval` takes its own `{timeout}` because it is the one op whose
+duration is the caller's to choose.
 
 | tool | what it does |
 |---|---|
@@ -84,7 +98,8 @@ The core loop is the ★s of session/see/drive/read.
 | `probe()` | engine-coupling self-diagnostic: `{version, classes, reach, events, touch, framework}` — which version-sensitive internals resolve on this build (drift → visible, not a silent `'unsure'`) |
 | `logs({grep?, level?, tail?, since?})` | captured `console.*` + uncaught errors (all frames), server-side filtered so a chatty game can't blow the token budget |
 | `watch({exprs?, selectors?, interval?, until?, timeout?, settle?, captureNetwork?})` | diff-only state TIMELINE over time → `{timeline, stoppedBy}` (replaces hand-written polling loops) |
-| `patch(sel, {before?, after?, replace?, trace?})` / `patch_clear(sel?)` / `patch_calls(sel)` | wrap a live component method to verify a fix pre-rebuild; `trace:true` records calls, read via `patch_calls` |
+| `patch(sel, {before?, after?, replace?, trace?})` / `patch_clear(sel?)` / `patch_calls(sel?)` | wrap a live component method to verify a fix pre-rebuild; `trace:true` records calls. `patch_calls(sel)` reads that method's calls; **`patch_calls()` with NO sel** returns the MERGED timeline across every traced patch — one shared epoch (`t` comparable) + a sequence number stamped on ENTRY (`i`), so order by `i`, not `t`: a synchronous command chain runs inside a single millisecond |
+| `pm_trace({roles?, traceMax?})` | arm the FRAMEWORK's dispatch choke points in one call — the whole app-layer flow without guessing which class to name (PureMVC: `Facade.sendNotification` / `Observer.notifyObserver` / `MacroCommand.execute`). Then `patch_calls()` reads the merged timeline and `patch_clear()` disarms. Rows carry `i` (order), `d` (nesting depth), `dt` (gap from the previous row — where the time actually went) and a `label`. See [`PM-TRACE.md`](PM-TRACE.md) |
 | `framework()` / `register_framework(adapter)` | detect the app framework (PureMVC etc.) + `{proxies, mediators, commands, capabilities}` / install an adapter this session (core ships none — see [`INJECT.md`](INJECT.md)/`copse.frameworks.mjs`) |
 | `pm_get(sel)` / `pm_set(sel, value)` / `pm_call(sel, args)` | READ (family `read`) / WRITE (family `drive` — an actuation, verified + carries `errors`/`changed`) proxy/mediator state OUTSIDE the cc tree / call a proxy/mediator method |
 | `pm_patch(sel, {…, trace?})` / `pm_notify(name, body?, type?)` | patch a proxy/mediator/command method / **fire a notification** — the direct entry into a notification-driven flow |

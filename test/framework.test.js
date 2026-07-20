@@ -3,7 +3,7 @@
 // plus a code-adapter string. Pure over win + adapters: no browser, no cc.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { normalizeAdapter, registerInto, detectWith, describe, stateWith, callWith, patchTargetWith, notifyWith, retrieveWith } from '../src/core/framework.js';
+import { normalizeAdapter, registerInto, detectWith, describe, stateWith, callWith, patchTargetWith, notifyWith, retrieveWith, traceTargetsWith } from '../src/core/framework.js';
 
 // The PureMVC config adapter (the shape shipped as copse.frameworks.example.mjs).
 const PUREMVC = {
@@ -21,7 +21,7 @@ function fakeFacade() {
   const proxyMap = { GameDataProxy: gdp };
   const mediatorMap = { PanelMediator: med };
   class StartupCommand { execute() { return 'started'; } }
-  class ActionCommand { execute() { return 'spun'; } }        // transient per notification → patched at the class prototype
+  class ActionCommand { execute() { return 'ran'; } }        // transient per notification → patched at the class prototype
   const commandMap = { StartupCommand, ActionCommand };         // keys are the notification names too
   const notes = [];
   const facade = {
@@ -209,4 +209,83 @@ test('detectWith honors registration order: first matching adapter wins', () => 
   const s = store(A, B);
   assert.equal(describe({ b: {} }, s).kind, 'b');                 // only B matches
   assert.equal(describe({ a: {}, b: {} }, s).kind, 'a');          // both match → first registered (A)
+});
+
+// ---- traceTargetsWith: the DISPATCH choke points (docs/PM-TRACE.md) ------------------------
+// Resolved from the WINDOW to a class prototype, not from the facade through a registry — because a real
+// PureMVC View/Controller captures mediator.handleNotification / this.executeCommand as a function VALUE at
+// registration, so the registry-reachable objects are the ones patching them observes nothing on.
+const TRACE_CFG = {
+  send: { at: ['puremvc.Facade.prototype.sendNotification'], label: '(a) => ({ n: a[0] })' },
+  observe: { at: ['nope.missing', 'puremvc.Observer.prototype.notifyObserver'], label: '(a, self) => ({})' },
+  macro: { at: ['puremvc.MacroCommand.prototype.execute'] },
+};
+// A win carrying the puremvc CLASSES (what trace targets), on top of the facade instance (what detect needs).
+const classWin = () => {
+  const f = fakeFacade();
+  class Facade { sendNotification() {} }
+  class Observer { notifyObserver() {} }
+  class MacroCommand { execute() {} }
+  return { win: { puremvc: { Facade: Object.assign(Facade, { instance: f.facade }), Observer, MacroCommand } }, ...f };
+};
+
+test('traceTargetsWith resolves each role to a prototype + member, carrying its label', () => {
+  const s = store({ ...PUREMVC, trace: TRACE_CFG });
+  const { win } = classWin();
+  const r = traceTargetsWith(win, s);
+  assert.equal(r.ok, true);
+  assert.deepEqual(r.targets.map((t) => t.role).sort(), ['macro', 'observe', 'send']);
+  const send = r.targets.find((t) => t.role === 'send');
+  assert.equal(send.at, 'puremvc.Facade.prototype.sendNotification');
+  assert.equal(send.target, win.puremvc.Facade.prototype, 'must hand back the PROTOTYPE object to wrap');
+  assert.equal(send.member, 'sendNotification');
+  assert.equal(send.label, '(a) => ({ n: a[0] })');
+  // candidate lists absorb per-build naming: the first path missed, the second resolved
+  assert.equal(r.targets.find((t) => t.role === 'observe').at, 'puremvc.Observer.prototype.notifyObserver');
+  assert.equal(r.targets.find((t) => t.role === 'macro').label, null, 'a role may omit its label');
+  assert.equal(r.unresolved, undefined);
+});
+
+test('traceTargetsWith reports an unresolvable role LOUDLY instead of thinning the timeline', () => {
+  const s = store({ ...PUREMVC, trace: { ...TRACE_CFG, ghost: { at: ['puremvc.Nope.prototype.gone', 'also.missing'] } } });
+  const { win } = classWin();
+  const r = traceTargetsWith(win, s);
+  assert.equal(r.ok, true, 'the roles that DID resolve still arm');
+  assert.deepEqual(r.unresolved, [{ role: 'ghost', tried: ['puremvc.Nope.prototype.gone', 'also.missing'] }]);
+});
+
+test('traceTargetsWith honors a roles filter, and names a role the adapter never declared', () => {
+  const s = store({ ...PUREMVC, trace: TRACE_CFG });
+  const { win } = classWin();
+  const r = traceTargetsWith(win, s, ['send', 'bogus']);
+  assert.deepEqual(r.targets.map((t) => t.role), ['send']);
+  assert.deepEqual(r.unresolved, [{ role: 'bogus', tried: [], reason: 'no-such-role' }]);
+});
+
+test('traceTargetsWith fails loud: no framework, and an adapter with no trace block', () => {
+  const s = store({ ...PUREMVC, trace: TRACE_CFG });
+  assert.deepEqual(traceTargetsWith({}, s), { ok: false, reason: 'no-framework' });
+  const bare = store(PUREMVC);                       // the shipped config, no trace block
+  const r = traceTargetsWith(classWin().win, bare);
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, 'adapter-has-no-trace');
+  assert.match(r.hint, /copse\.frameworks\.mjs/);    // says where to fix it
+});
+
+test('a path resolving to a NON-function is not a trace target (a data field named like a method)', () => {
+  const s = store({ ...PUREMVC, trace: { send: { at: ['puremvc.Facade.prototype.notAFunction', 'puremvc.Facade.prototype.sendNotification'] } } });
+  const { win } = classWin();
+  win.puremvc.Facade.prototype.notAFunction = 42;
+  assert.equal(traceTargetsWith(win, s).targets[0].at, 'puremvc.Facade.prototype.sendNotification');
+});
+
+test('a code adapter supplies its OWN traceTargets', () => {
+  const src = "({ kind:'custom', detect:(w)=> w.app || null, proxies:()=>[], mediators:()=>[], commands:()=>[], retrieve:()=>null," +
+    " traceTargets:(w, roles)=> ({ ok:true, targets:[{ role:'bus', at:'app.bus.emit', target:w.app.bus, member:'emit', label:null }], asked: roles || null }) })";
+  const s = store(src);
+  const win = { app: { bus: { emit() {} } } };
+  const r = traceTargetsWith(win, s, ['bus']);
+  assert.equal(r.ok, true);
+  assert.equal(r.targets[0].member, 'emit');
+  assert.deepEqual(r.asked, ['bus'], 'the roles filter is passed through to the code adapter');
 });

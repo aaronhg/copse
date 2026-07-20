@@ -1,5 +1,6 @@
 // @ts-check
 import { snapshot as snap, press, get, call, reachable as coreReachable } from './core/index.js';
+import { errClass } from './script.js';   // one definition of the driver's error class (see script.js)
 // The deterministic FLOW EXECUTOR — `execute(driver, steps)` runs a step list against copse's live-page
 // driver and reports the FACTS (extractFacts): unreachable/errored/undriven presses, uncertain actions,
 // shown-but-not-drawn nodes. NO agent, NO loop, NO pass/fail verdict — that's policy, and policy is the
@@ -81,8 +82,10 @@ async function execStep(driver, step, gates) {
         }
         const r = await driver.press(step.ref, step.opts);
         if (unreachable && r && typeof r === 'object') r.unreachable = unreachable; // surfaced to judge + hard-failed below
-        // a synthetic tap into a button with no VISIBLE handler — verify, don't hard-fail (copse's codeHandlers can miss a real one)
-        if (!uncertain && r && Array.isArray(r.drove) && r.drove.length === 1 && r.drove[0] === 'touch' && r.wired === false) uncertain = 'touch-into-void';
+        // a synthetic tap into a button with no VISIBLE handler — verify, don't hard-fail (copse's codeHandlers can miss a real one).
+        // The synthetic-dispatch token is ENGINE-SPECIFIC: Cocos emits 'touch', Pixi emits 'pointer' — both mean "we tapped the
+        // input pipeline but can't confirm a real listener ran". Matching only 'touch' let a dead PIXI button pass with NO fact at all.
+        if (!uncertain && r && Array.isArray(r.drove) && r.drove.length === 1 && (r.drove[0] === 'touch' || r.drove[0] === 'pointer') && r.wired === false) uncertain = 'touch-into-void';
         if (uncertain && r && typeof r === 'object') r.uncertain = uncertain; // surfaced as out.uncertain (verify), NOT hard-failed
         await visualConfirm(driver, r, gates); // pixel soft-signal: did the subtree this press SHOWED actually render?
         return r;
@@ -100,7 +103,10 @@ async function execStep(driver, step, gates) {
       default:            return { ok: false, reason: 'unknown-op', op: step.op };
     }
   } catch (e) {
-    return { ok: false, reason: 'threw', error: e instanceof Error ? e.message : String(e) };
+    // Keep the driver's error class (see script.js) — a caller deciding whether to retry needs the fact,
+    // not a sentence to pattern-match. A step that failed because the game was still booting (recoverable)
+    // is a different fact from one that failed because the selector is wrong.
+    return { ok: false, reason: 'threw', error: e instanceof Error ? e.message : String(e), ...errClass(e) };
   }
 }
 

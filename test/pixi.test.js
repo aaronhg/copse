@@ -10,6 +10,7 @@ import { pixiType, gameLabel, pixiName, isText } from '../src/pixi/pixitype.js';
 import { makePixiSurface, isAnchor, anchorInfo, findAnchors, gameApi, namedRefs } from '../src/pixi/anchors.js';
 import { pixiRuntime } from '../src/pixi/runtime.js';
 import { refOf } from '../src/core/refpath.js';
+import { visibleOf } from '../src/pixi/geom.js';
 
 // ---- fake Pixi tree ------------------------------------------------------------------------
 // Mimics the shapes that matter: renderPipeId as an instance field, Pixi's constructor-default
@@ -393,4 +394,41 @@ test('cocos anchors: the FLOOR still subtracts cc.Component when the namespace i
     assert.equal(found.length, 2);
     assert.deepEqual(found.map((f) => f.methods).flat().sort(), ['buy', 'refresh']);
   });
+});
+
+// --- the `visible` contract, across BOTH layers ------------------------------------------------
+// visualManifest used to report `visible: node.visible !== false` (the node alone) while `reachable`
+// reported the same FIELD NAME from an ancestor-aware walk — so a node inside a hidden parent came back
+// visible:true from one and visible:false from the other, and Cocos (where both layers share one
+// visibleOf) agreed with neither. Both now call pixi/geom.js `visibleOf`. Pinned here because it is a
+// semantic promise, not an implementation detail: a caller gating on `visible && drawn` depends on it.
+const fakeApp = () => ({
+  canvas: { width: 100, height: 100, getBoundingClientRect: () => ({ left: 0, top: 0, width: 100, height: 100 }) },
+  renderer: { events: { resolution: 1 } },
+});
+
+test('pixi visible: visualManifest and reachable agree when an ANCESTOR is hidden', async () => {
+  const { makeVisualManifest } = await import('../src/pixi/visual.js');
+  const { makeReachable } = await import('../src/pixi/reachable.js');
+  const leaf = mk({ label: 'Buy', _w: 10, _h: 10 });
+  const hiddenParent = mk({ label: 'Panel', visible: false }, [leaf]);
+  const stage = mk({ label: 'stage' }, [hiddenParent]);
+
+  const manifest = makeVisualManifest(fakeApp(), () => stage)(leaf);
+  assert.equal(manifest.visible, false, 'the manifest must see the hidden ANCESTOR, not just the node');
+
+  const reach = makeReachable(fakeApp(), () => stage)(leaf);
+  assert.equal(reach.visible, false);
+  assert.equal(manifest.visible, reach.visible, 'one field name, one meaning');
+});
+
+test('pixi visible: alpha 0 up the chain collapses it, and a plain visible node stays true', () => {
+  const leaf = mk({ label: 'Buy', _w: 10, _h: 10 });
+  const dim = mk({ label: 'Panel', alpha: 0 }, [leaf]);
+  const stage = mk({ label: 'stage' }, [dim]);
+  assert.equal(visibleOf(leaf), false, 'alpha 0 on an ancestor');
+
+  const ok = mk({ label: 'Buy2', _w: 10, _h: 10 });
+  mk({ label: 'stage2' }, [ok]);
+  assert.equal(visibleOf(ok), true);
 });

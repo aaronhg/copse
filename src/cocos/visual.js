@@ -14,43 +14,14 @@
 // bundle, so esbuild drops it from the lite/probe bundles exactly as it drops reachable.js. `via:'geometric'`
 // — this layer never claims pixel truth on its own; only the driver's pixel pass upgrades to 'pixel-confirmed'.
 import { refOf } from '../core/refpath.js';
+import { camOf, collectCameras, visibleOf } from './geom.js';   // shared with reachable.js — identical answers, one definition
 
 // Descendant component types whose pixels change frame-to-frame — masked out of the anchor so animation/
 // particle/text jitter never trips a signature compare. Overridable via makeVisualManifest opts.dynamicTypes.
 export const DEFAULT_DYNAMIC = ['cc.ParticleSystem2D', 'cc.ParticleSystem', 'cc.Label', 'cc.RichText', 'sp.Skeleton'];
 
-// All active cc.Camera components in the scene (depth-first). Uses the class-NAME-string fallback (like
-// screenRectOf's UITransform) so a tree-shaken/minified release build — where the `cc.Camera` global is
-// `undefined` but getComponent('cc.Camera') still resolves — doesn't silently find zero cameras.
-const collectCameras = (cc, root) => {
-  const Camera = cc.Camera || 'cc.Camera'; const cams = [];
-  (function walk(x) { const cam = x.getComponent && x.getComponent(Camera); if (cam) cams.push(cam); (x.children || []).forEach(walk); })(root);
-  return cams;
-};
 
-// node → its rendering camera: the active camera whose visibility mask includes the node's layer, highest
-// priority. The reachable.js `camOf` heuristic (NOT the authoritative getFirstRenderCamera — for an
-// anchor rect a few px is tolerable and the driver's pixel pass adjudicates; via stays 'geometric').
-const camOf = (node, cams) => {
-  let best = null;
-  for (const c of cams) {
-    if (c.enabled === false || (c.node && c.node.activeInHierarchy === false)) continue;
-    if (c.visibility === undefined || (node.layer & c.visibility)) { if (!best || (c.priority || 0) > (best.priority || 0)) best = c; }
-  }
-  return best || cams[0] || null;
-};
 
-// Is the node visually present, or collapsed (opacity/scale === 0 anywhere up the chain)? Same separate
-// signal reachable.js exposes — reported alongside so a caller can gate on `visible && drawn`.
-const visibleOf = (cc, node) => {
-  const { UIOpacity } = cc; let p = node;
-  while (p) {
-    if (UIOpacity) { const u = p.getComponent && p.getComponent(UIOpacity); if (u && u.opacity === 0) return false; }
-    const s = p.scale; if (s && (s.x === 0 || s.y === 0)) return false;
-    p = p.parent;
-  }
-  return true;
-};
 
 /**
  * Project a node's world AABB to a screen-space rect `{x,y,w,h}` (the AABB of its four projected corners),

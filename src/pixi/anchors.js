@@ -10,9 +10,12 @@
 //     and fields survive, and — critically — are no longer subtracted from every OTHER node too.
 // The earlier `renderPipeId ? [n] : []` sampling got that second case backwards and silently emptied
 // `anchors()` on any game that subclasses a renderable.
-import { makeSurface, findAnchors as findAnchorsCore, anchorInfo, gameApi, namedRefs, LIFECYCLE } from '../core/anchors.js';
+import { makeSurface, findAnchors as findAnchorsCore, anchorInfo, gameApi, isAnchor, namedRefs, LIFECYCLE } from '../core/anchors.js';
 
-export { anchorInfo, gameApi, namedRefs, LIFECYCLE };
+// `isAnchor` is engine-agnostic (it asks the SURFACE, which is the only engine-specific part), so it is
+// re-exported like the rest rather than reimplemented — it used to be a byte-for-byte second copy here,
+// simply because it was left out of this list. cocos/anchors.js correctly never had one.
+export { anchorInfo, gameApi, isAnchor, namedRefs, LIFECYCLE };
 
 /** The Pixi engine surface, calibrated across every node of each display kind. @param {any} root */
 export const makePixiSurface = (root) => makeSurface(root, { samplesOf: (n) => [{ obj: n, kind: n.renderPipeId || 'container' }] });
@@ -22,8 +25,3 @@ export function findAnchors(root, refOf, opts = {}) {
   return findAnchorsCore(root, refOf, { ...opts, surface: opts.surface || makePixiSurface(root) });
 }
 
-/** Back-compat boolean; prefer `anchorInfo`, which reports WHY. @param {any} n @param {any} [surface] */
-export function isAnchor(n, surface) {
-  if (!surface) return !!(n && typeof n.show === 'function' && typeof n.hide === 'function' && typeof n.resize === 'function');
-  return anchorInfo(n, surface).anchor;
-}

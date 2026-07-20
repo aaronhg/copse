@@ -47,6 +47,18 @@ const canRoot = (root, cfg) => !!root && typeof root === 'object'
 
 const asList = (v, dflt) => (Array.isArray(v) ? v : (v != null ? [v] : dflt));
 
+// "puremvc.Observer.prototype.notifyObserver" → { objPath:'puremvc.Observer.prototype', member:'notifyObserver' }
+const splitLast = (p) => { const i = String(p).lastIndexOf('.'); return i < 0 ? null : { objPath: String(p).slice(0, i), member: String(p).slice(i + 1) }; };
+// First candidate path that resolves to an object carrying a callable member — the wrap target.
+const firstMethodAt = (win, paths) => {
+  for (const p of asList(paths, [])) {
+    const sp = splitLast(p); if (!sp) continue;
+    const obj = getPath(win, sp.objPath);
+    if (obj && typeof obj[sp.member] === 'function') return { at: p, target: obj, member: sp.member };
+  }
+  return null;
+};
+
 /**
  * Turn a CONFIG object into the adapter interface. `via`/`map` field-name CANDIDATE lists absorb the
  * per-game/per-port NAME differences; a code adapter (its own detect/retrieve/commandTarget/notify)
@@ -86,6 +98,7 @@ function configAdapter(cfg) {
     commands: (root) => Object.keys(mapObj(root, cfg.command && cfg.command.map) || {}),
     retrieve: (root, name) => retrieveVia(root, name, cfg.proxy) || retrieveVia(root, name, cfg.mediator),
     commandTarget, notify,
+    trace: cfg.trace || null,   // pure data — resolved against the WINDOW by traceTargetsWith, not the facade
     // Self-diagnostic: which capabilities RESOLVE on this build (so pointing copse at a new PureMVC game
     // shows what to fix in the config, instead of a silent no-op). Mirrors probe()'s per-internal report.
     capabilities: (root) => {
@@ -165,6 +178,49 @@ export function patchTargetWith(win, adapters, sel) {
   const ct = hit.adapter.commandTarget ? hit.adapter.commandTarget(hit.root, name, member) : null;
   if (ct && typeof ct.proto[ct.member] === 'function') return { ok: true, kind: 'command', target: ct.proto, member: ct.member, name };
   return { ok: false, reason: 'not-found', name };
+}
+
+/**
+ * Resolve the adapter's `trace` hook points to PATCHABLE targets: [{role, at, target, member, label}].
+ *
+ * Why this exists next to patchTargetWith rather than inside it: a framework's DISPATCH choke points live
+ * on the framework's own CLASSES, not in its registries. Measured on a real PureMVC build, patching what
+ * the registries hand you does NOT observe dispatch — `registerMediator` does
+ * `new Observer(mediator.handleNotification, mediator)` and `registerCommand` does
+ * `new Observer(this.executeCommand, this)`, i.e. both capture the function VALUE at registration, so a
+ * later wrap of the mediator instance (or of Controller.prototype.executeCommand) is never called: it was
+ * measured firing 0 times across 60 command executions. The observable points are the class prototypes the
+ * Observer ultimately calls THROUGH. So `at` is a dotted path from the WINDOW ('puremvc.Observer.prototype
+ * .notifyObserver'), candidate-listed like every other adapter field, and per-game knowledge stays in
+ * copse.frameworks.mjs. A code adapter may instead expose its own `traceTargets(win, roles)`.
+ *
+ * `label` (a fn-expr source string, compiled in-page by the patch machinery) is what makes a trace row
+ * readable: the raw args of these methods are a Notification object, so without an extractor a timeline is
+ * a wall of truncated objects — and the useful field ("which mediator is this going to") lives on `self`,
+ * which the generic arg-recorder cannot reach at all.
+ *
+ * @param {any} win @param {any[]} adapters @param {string[]} [roles] only these roles (default: all)
+ */
+export function traceTargetsWith(win, adapters, roles) {
+  const hit = detectWith(win, adapters);
+  if (!hit) return { ok: false, reason: 'no-framework' };
+  const a = hit.adapter;
+  if (typeof a.traceTargets === 'function') {   // code adapter brings its own
+    try { return a.traceTargets(win, roles); } catch (e) { return { ok: false, reason: 'threw', error: (e && e.message) || String(e) }; }
+  }
+  const spec = a.trace;
+  if (!spec || typeof spec !== 'object') return { ok: false, reason: 'adapter-has-no-trace', kind: a.kind, hint: "add a `trace:{role:{at:[…paths], label?}}` block to this adapter in copse.frameworks.mjs" };
+  const want = (roles && roles.length) ? roles : null;
+  const targets = []; const unresolved = [];
+  for (const role of Object.keys(spec)) {
+    if (want && !want.includes(role)) continue;
+    const s = spec[role] || {};
+    const found = firstMethodAt(win, s.at);
+    if (!found) { unresolved.push({ role, tried: asList(s.at, []) }); continue; }   // fail LOUD per role, don't silently thin the timeline
+    targets.push({ role, at: found.at, target: found.target, member: found.member, label: s.label || null });
+  }
+  if (want) for (const r of want) if (!spec[r]) unresolved.push({ role: r, tried: [], reason: 'no-such-role' });
+  return { ok: targets.length > 0, targets, ...(unresolved.length ? { unresolved } : {}) };
 }
 
 /**

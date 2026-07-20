@@ -266,7 +266,9 @@ enough that it only makes sense on a build you own and control. See [`docs/DEBUG
 ## Develop
 
 ```bash
-npm test          # node:test over fake trees — no engine, no install (+ an opt-in real-engine L2 test that skips unless reference/cocos/<ver> is cloned)
+npm test          # node:test over fake trees — no engine, no install, no browser (excludes the L2 tier)
+npm run test:l2   # L2 only: needs a real engine (reference/cocos/<ver> cloned) or a real Chrome; self-skips without one
+npm run test:all  # both tiers
 npm run typecheck # tsc --noEmit (needs `npm install` for the dev deps)
 npm run build     # → dist/copse.inject.js (full) + .lite.js (press-only, no reachability) + .probe.js (load-metrics) + .pixi.js (PixiJS 8); all self-contained IIFEs
 ```

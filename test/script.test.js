@@ -137,6 +137,29 @@ test('no expect: ok:false fails, ok:true passes; a thrown step is captured as a 
   assert.match(threw.steps[0].result.error, /kaboom/);
 });
 
+test('a thrown step keeps the driver error CLASS, not just its sentence', async () => {
+  // The runner stops at the first failed step and has no retry, so "the game was still booting" and "your
+  // selector is wrong" must be distinguishable as DATA. Prose is unusable here — nobody should have to
+  // regex an error sentence to decide whether a rerun is worth it.
+  const boom = (recoverable, code) => Object.assign(new Error('nope'), { copse: true, recoverable, code });
+  const d = {
+    get: async () => { throw boom(true, 'init-pending'); },
+    call: async () => { throw boom(false, 'op-timeout'); },
+  };
+  const r1 = await runScript(d, { steps: [{ op: 'get', sel: 'x' }] });
+  assert.equal(r1.steps[0].result.recoverable, true);
+  assert.equal(r1.steps[0].result.code, 'init-pending');
+
+  const r2 = await runScript(d, { steps: [{ op: 'call', sel: 'x:Y.z' }] });
+  assert.equal(r2.steps[0].result.code, 'op-timeout');
+  // absent, not `false` — a plain error carries no claim either way, and inventing one would be a lie
+  assert.equal('recoverable' in r2.steps[0].result, false);
+
+  const plain = await runScript({ get: async () => { throw new Error('kaboom'); } }, { steps: [{ op: 'get', sel: 'x' }] });
+  assert.equal('recoverable' in plain.steps[0].result, false);
+  assert.equal('code' in plain.steps[0].result, false);
+});
+
 test('errors gate: result.errors fails even a matching expect; allowErrors or an explicit errors expect opts out', async () => {
   const d = fakeDriver({ press(ref) { return { ok: true, ref, fired: 1, drove: ['clickEvent'], errors: [{ level: 'error', text: 'TypeError: boom' }] }; } });
   const gated = await runScript(d, { steps: [{ op: 'press', ref: 'X', expect: { ok: true } }] });

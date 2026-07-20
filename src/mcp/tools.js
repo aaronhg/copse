@@ -41,7 +41,7 @@ export const FAMILY = {
   press: 'drive', call: 'drive', pm_set: 'drive', pm_call: 'drive', pm_notify: 'drive',
   reachable: 'usable', visual_check: 'usable', visual_baseline: 'usable',
   watch: 'observe', logs: 'observe', network: 'observe', screenshot: 'observe', hold: 'observe', release: 'observe', hold_status: 'observe',
-  patch: 'fix', patch_clear: 'fix', patch_calls: 'fix', pm_patch: 'fix',
+  patch: 'fix', patch_clear: 'fix', patch_calls: 'fix', pm_patch: 'fix', pm_trace: 'fix',
   click_surface: 'coverage', resolve: 'coverage',
   run_script: 'script', dump_script: 'script',
   orient: 'orient', anchors: 'orient', doctor: 'orient', framework: 'orient', register_framework: 'orient',
@@ -70,7 +70,8 @@ const toStep = (name, a = {}) => {
     case 'call': return { op: 'call', sel: a.sel, ...(a.args && a.args.length ? { args: a.args } : {}) };
     case 'node': return { op: 'node', ref: a.ref };
     case 'reachable': return { op: 'reachable', ref: a.ref, ...((a.visual || a.baseline) ? { opts: { ...(a.visual ? { visual: true } : {}), ...(a.baseline ? { baseline: a.baseline } : {}) } } : {}) };
-    case 'eval': return { op: 'eval', expr: a.expr };
+    // timeout rides along: a step recorded at '3m' that replays at the 60s default is not the session it froze
+    case 'eval': return { op: 'eval', expr: a.expr, ...(a.timeout ? { timeout: a.timeout } : {}) };
     // framework-aware + patch ops freeze into replayable steps so a PureMVC flow (register → read/write
     // proxy state → call a mediator → patch a method) can be dumped and re-run by script.js/run_script.
     case 'pm_get': return { op: 'pmGet', sel: a.sel };
@@ -104,7 +105,9 @@ const ensureDbg = async (state) => {
   return state.dbg;
 };
 
-/** @type {{name:string,description:string,inputSchema:any,debug?:boolean,record?:boolean,run:(state:any,args:any)=>Promise<{data?:any,error?:string,image?:any}>}[]} */
+// recoverable/code: the driver's machine-readable error class, carried through to the text an agent reads
+// (server.js tags it ahead of the prose) — see the `err` helper in drivers/puppeteer.js.
+/** @type {{name:string,description:string,inputSchema:any,debug?:boolean,record?:boolean,run:(state:any,args:any)=>Promise<{data?:any,error?:string,image?:any,recoverable?:boolean,code?:string}>}[]} */
 export const TOOLS = [
   {
     name: 'connect',
@@ -140,11 +143,15 @@ export const TOOLS = [
       // fall back to the target/match string only if that read fails (it was reporting the match substring).
       const at = () => { try { return state.cp.page.url() || target; } catch { return target; } };
       // paused = the renderer is HALTED in the debugger → copse inject is deferred (it'd hang). Debugger
-      // tools work immediately; snapshot/press/break_in auto-run once you resume.
-      if (state.cp.paused) return { data: { ok: true, url: at(), attached: true, paused: true, note: 'renderer HALTED (debugger) — inject deferred. Use wait_pause/eval_frame/break_at now; snapshot/press/break_in run after you resume.' } };
-      // stalled = init didn't settle in time — almost always the game is on a loading/intro screen (no
-      // interactive buttons yet), NOT a debugger pause. __copse is usually already installed, so a read works.
-      if (state.cp.stalled) return { data: { ok: true, url: at(), attached: true, injecting: true, note: 'inject still settling — the game looks like it is on a loading/intro screen (no interactive buttons yet). __copse is likely already installed: call snapshot/interactive again in a moment, or reload.' } };
+      // tools work immediately.
+      // "run after you resume" was implemented by ev()'s bare `await ready`, which queued every call until
+      // init finished. That wait is gone (unbounded, it turned a halted renderer into a silent 32-min hang),
+      // so calls now FAIL FAST while paused instead of queueing. Say that: an agent that believes the old
+      // note sits waiting for a result that will never arrive.
+      if (state.cp.paused) return { data: { ok: true, url: at(), attached: true, paused: true, note: 'renderer HALTED (debugger) — inject deferred. Use wait_pause/eval_frame/break_at now. snapshot/press/break_in do NOT queue: until you resume they fail fast with [recoverable] init-pending — resume, then call them again.' } };
+      // stalled = init didn't finish in time (bundle/__copse install still queued, or the engine has no
+      // scene up yet), NOT a debugger pause. This no longer fires merely because a screen has no buttons.
+      if (state.cp.stalled) return { data: { ok: true, url: at(), attached: true, injecting: true, note: 'inject did not finish in time — __copse may not be installed yet, or the engine has no scene up. Call orient/snapshot again in a moment, or reload.' } };
       // A page with no engine leaves __copse uninstalled, so these reads throw by design. That's the
       // FINDING, not a failure of connect — report it (and point at doctor) instead of surfacing a
       // raw error, which is what a caller sees when the thing they attached to isn't a game at all.
@@ -229,8 +236,8 @@ export const TOOLS = [
     name: 'eval',
     record: true,
     description: "ESCAPE HATCH — arbitrary JS in the game frame's main world (no pause). LAST RESORT: prefer the curated tools (they carry the guardrails — reachable/drove/errors gates, structured output — that raw eval bypasses); reach here only when nothing else fits. `cc`, `window`, `window.__copse`, `cc.find(path)` in reach: read engine/proxy state, fire input press can't (e.g. cc.find('…/Btn').emit('touch-end')), or drive logic and watch async timing live. For framework state use the in-page `__copse.pm` namespace (NOT the snake_case tool names — `__copse.pm_get` is not a function): `__copse.pm.get('GameDataProxy.active')` / `pm.set` / `pm.call` / `pm.notify`, and `pm.proxy('GameDataProxy')`/`pm.mediator('XxxViewMediator')` for the RAW live object to poke. `await`/thenables work (a returned Promise is awaited). Returns {ok, value} (coerced JSON-safe) or {ok:false, error}. Pass an IIFE for multi-statement logic.",
-    inputSchema: { type: 'object', properties: { expr: { type: 'string', description: 'a JS expression (or IIFE) evaluated in-page at global scope' } }, required: ['expr'] },
-    run: async (state, a) => ({ data: await needCp(state).eval(a.expr) }),
+    inputSchema: { type: 'object', properties: { expr: { type: 'string', description: 'a JS expression (or IIFE) evaluated in-page at global scope' }, timeout: { type: 'string', description: "how long to allow before failing loud (default '60s'). Raise it for a deliberately long await/poll; it exists so a wedged renderer can't hang the call forever." } }, required: ['expr'] },
+    run: async (state, a) => ({ data: await needCp(state).eval(a.expr, a.timeout ? { timeout: a.timeout } : {}) }),
   },
   {
     name: 'reachable',
@@ -328,9 +335,16 @@ export const TOOLS = [
   },
   {
     name: 'patch_calls',
-    description: "Read a trace:true patch's recorded calls: {ok, ref, calls:[{t (ms since patch), args, ret | threw}]}. Shows the METHOD's real call order + timing on the running game — pair with coir's static command flow to confirm what actually fired when (e.g. did setRoundInfo run before the action request?).",
-    inputSchema: { type: 'object', properties: { sel: { type: 'string', description: 'the path:Comp.method you patched with trace:true' } }, required: ['sel'] },
+    description: "Read trace:true patches' recorded calls. With `sel`: that method's calls, {ok, ref, calls:[{i, t, args, ret | threw}]}. WITHOUT `sel`: the MERGED timeline across every traced patch — {ok, traced:[sels], calls:[{sel, i, t, …}]} — which is how you answer CROSS-method order (\"did the mediator's handler run before the command?\") after arming several patches. `t` = ms since the first patch (ONE epoch shared by all patches, so times are comparable); `i` = a shared sequence number stamped on call ENTRY — order by `i`, not `t`, since a synchronous command chain runs inside a single millisecond. Pair with coir's static command flow to confirm what actually fired when.",
+    inputSchema: { type: 'object', properties: { sel: { type: 'string', description: 'the path:Comp.method you patched with trace:true (omit for the merged timeline across all traced patches)' } } },
     run: async (state, a) => ({ data: await needCp(state).patchCalls(a.sel) }),
+  },
+  {
+    name: 'pm_trace',
+    record: true,
+    description: "Arm the framework's DISPATCH choke points in one call — the whole app-layer flow, without knowing which class to name. Where pm_patch needs a selector you had to guess, this wraps whatever the registered adapter declares (PureMVC: `send` = Facade.sendNotification, `observe` = Observer.notifyObserver, `macro` = MacroCommand.execute), then `patch_calls()` (no sel) reads the merged timeline and `patch_clear()` disarms. Each row: {sel:'@role', i (order — USE THIS, not t), d (nesting depth), t, dt (gap from the previous row — where the real time hides), label}. Why the choke points and not the registries: a PureMVC View/Controller captures `mediator.handleNotification` / `this.executeCommand` as a function VALUE at registration, so patching a mediator instance or Controller.executeCommand observes NOTHING (measured: 0 hits / 60 executions) — an `observe` row whose label.to==='Controller' IS that notification's command running. Returns {ok, armed:[{role,sel,at}], unresolved?, failed?}; unresolved names any role whose paths didn't resolve on THIS build (widen them in copse.frameworks.mjs) rather than silently thinning the timeline.",
+    inputSchema: { type: 'object', properties: { roles: { type: 'array', items: { type: 'string' }, description: "only arm these roles (default: all the adapter declares, e.g. ['send','observe','macro'])" }, traceMax: { type: 'number', description: 'ring-buffer rows per role (default 5000 — one action is ~237 rows and a sustained sequence gives ~190/s, so the `patch` default of 200 would drop the START of a chain)' } } },
+    run: async (state, a) => ({ data: await needCp(state).pmTrace({ roles: a.roles, traceMax: a.traceMax }) }),
   },
   {
     name: 'framework',

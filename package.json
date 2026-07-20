@@ -25,7 +25,9 @@
     "dist"
   ],
   "scripts": {
-    "test": "node --test test/*.test.js",
+    "test": "node --test $(ls test/*.test.js | grep -v '\\.l2\\.')",
+    "test:l2": "node --test test/*.l2.test.js",
+    "test:all": "node --test test/*.test.js",
     "typecheck": "tsc --noEmit",
     "prepare": "npm run build",
     "build": "npm run build:full && npm run build:lite && npm run build:probe && npm run build:pixi",

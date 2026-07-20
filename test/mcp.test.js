@@ -24,7 +24,7 @@ function fakeCp() {
     listeners(ref) { this.calls.push(['listeners', ref]); return [{ type: 'click', fn: 'onBuy' }]; },
     async probe() { this.calls.push(['probe']); return { version: '3.8.6', framework: { kind: 'puremvc' }, ok: true }; },
     async eval(expr) { this.calls.push(['eval', expr]); return { ok: true, value: { name: 'game', children: 2 } }; },
-    orient() { this.calls.push(['orient']); return { url: 'http://x/', scene: 'game1', engine: '3.8.6', framework: { kind: 'puremvc', registered: 1, capabilities: { proxy: true } }, buttons: 3, entryPoints: ['Canvas/Btn'], hint: 'press an entryPoint' }; },
+    orient() { this.calls.push(['orient']); return { url: 'http://x/', scene: 'MainScene', engine: '3.8.6', framework: { kind: 'puremvc', registered: 1, capabilities: { proxy: true } }, buttons: 3, entryPoints: ['Canvas/Btn'], hint: 'press an entryPoint' }; },
     logs(arg = 0) {
       this.calls.push(['logs', arg]);
       const o = typeof arg === 'number' ? { since: arg } : (arg || {});
@@ -45,6 +45,7 @@ function fakeCp() {
     pmSet(sel, value) { this.calls.push(['pmSet', sel, value]); return { ok: true, ref: sel, wrote: value }; },
     pmCall(sel, ...args) { this.calls.push(['pmCall', sel, args]); return { ok: true, ref: sel, value: 'switched' }; },
     pmPatch(sel, hooks) { this.calls.push(['pmPatch', sel, hooks]); return { ok: true, ref: sel, method: sel.split('.').pop(), kind: sel.includes('Command') ? 'command' : 'instance', ...(hooks && hooks.trace ? { trace: true } : {}) }; },
+    pmTrace(o) { this.calls.push(['pmTrace', o]); return { ok: true, armed: [{ role: 'send', sel: '@send', at: 'puremvc.Facade.prototype.sendNotification', labelled: true }], traceMax: (o && o.traceMax) || 5000 }; },
     pmNotify(name, body, type) { this.calls.push(['pmNotify', name, body, type]); return { ok: true, via: 'sendNotification', value: 'sent:' + name }; },
     screenshot(o = {}) { this.calls.push(['screenshot', o]); return o.path ? { ok: true, path: o.path, clipped: false } : { base64: 'AAAA', mimeType: 'image/png', clipped: !!o.selector }; },
     visualCheck(ref, o) { this.calls.push(['visualCheck', ref, o]); const based = !!(o && o.baseline); return { ref, drawn: true, matches: based ? true : 'unknown', clear: based ? true : 'unknown', via: based ? 'pixel-confirmed' : 'geometric', visible: true }; },
@@ -81,7 +82,7 @@ test('tools registry: each tool has name/description/object inputSchema; core to
   const names = TOOLS.map((t) => t.name);
   for (const n of ['connect', 'reload', 'snapshot', 'interactive', 'click_surface', 'resolve', 'press', 'get', 'call', 'reachable', 'node', 'orient', 'doctor', 'logs', 'close',
     'run_script', 'dump_script',
-    'watch', 'patch', 'patch_clear', 'patch_calls', 'framework', 'register_framework', 'pm_get', 'pm_set', 'pm_call', 'pm_patch', 'pm_notify', 'network', 'screenshot',
+    'watch', 'patch', 'patch_clear', 'patch_calls', 'framework', 'register_framework', 'pm_get', 'pm_set', 'pm_call', 'pm_patch', 'pm_trace', 'pm_notify', 'network', 'screenshot',
     'visual_check', 'visual_baseline',
     'break_at', 'break_in', 'break_exceptions', 'wait_pause', 'eval_frame', 'debug_step', 'clear_breakpoints']) {
     assert.ok(names.includes(n), `missing tool ${n}`);
@@ -126,6 +127,38 @@ test('every tool has a family; tools/list is family-tagged, grouped, headline-fi
   assert.ok(fams.lastIndexOf('session') < fams.indexOf('orient'), 'families are contiguous & ordered');
   const drive = tools.filter((t) => FAMILY[t.name] === 'drive');
   assert.equal(drive[0].name, 'press', 'the ★ headline leads its family');
+});
+
+test('a tool error carries the driver error class into the TEXT an agent reads', async () => {
+  // An MCP client only ever sees text. A `recoverable` flag that stays on the Error object is invisible to
+  // the one caller it was added for — so the tag has to be in the string, ahead of the prose.
+  // `copse: true` is the brand errClass gates on — without it a stray Node errno (ECONNREFUSED) would
+  // render as if it were copse's vocabulary. An unbranded error must contribute NO class at all.
+  const boom = (props) => ({ get: async () => { throw Object.assign(new Error('still booting'), props); } });
+
+  const rec = await createDispatcher({ cp: boom({ copse: true, recoverable: true, code: 'init-pending' }) })(
+    { id: 1, method: 'tools/call', params: { name: 'get', arguments: { sel: 'x' } } });
+  assert.equal(rec.result.isError, true);
+  assert.match(rec.result.content[0].text, /\[recoverable\]/);
+  assert.match(rec.result.content[0].text, /\[init-pending\]/);
+  assert.match(rec.result.content[0].text, /still booting/, 'the prose still explains WHY');
+
+  // Not recoverable → no tag. Absence is the signal; tagging everything would make the tag meaningless.
+  const hard = await createDispatcher({ cp: boom({ copse: true, recoverable: false, code: 'op-timeout' }) })(
+    { id: 2, method: 'tools/call', params: { name: 'get', arguments: { sel: 'x' } } });
+  assert.doesNotMatch(hard.result.content[0].text, /\[recoverable\]/);
+  assert.match(hard.result.content[0].text, /\[op-timeout\]/);
+
+  const plain = await createDispatcher({ cp: boom({}) })(
+    { id: 3, method: 'tools/call', params: { name: 'get', arguments: { sel: 'x' } } });
+  assert.equal(plain.result.content[0].text, '✗ still booting');
+
+  // `code` is ALSO Node's errno convention. An unbranded system error must not wear copse's class — an
+  // agent cannot act on `[ECONNREFUSED]` as if it were one of copse's documented codes.
+  const errno = await createDispatcher({ cp: boom({ code: 'ECONNREFUSED' }) })(
+    { id: 4, method: 'tools/call', params: { name: 'get', arguments: { sel: 'x' } } });
+  assert.equal(errno.result.content[0].text, '✗ still booting');
+  assert.doesNotMatch(errno.result.content[0].text, /ECONNREFUSED/);
 });
 
 test('tools/call dispatches to the Driver and wraps the result as MCP text content', async () => {
@@ -356,7 +389,7 @@ test('inspection tools dispatch to the Driver (diff/listeners/doctor)', async ()
   const o = await handle({ id: 4, method: 'tools/call', params: { name: 'orient', arguments: {} } });
   assert.deepEqual(cp.calls.at(-1), ['orient']);
   const oj = JSON.parse(o.result.content[0].text);
-  assert.equal(oj.scene, 'game1'); assert.deepEqual(oj.entryPoints, ['Canvas/Btn']); assert.equal(oj.framework.kind, 'puremvc');
+  assert.equal(oj.scene, 'MainScene'); assert.deepEqual(oj.entryPoints, ['Canvas/Btn']); assert.equal(oj.framework.kind, 'puremvc');
 });
 
 test('visual tools dispatch to the Driver (visual_check/visual_baseline); reachable(visual) combines', async () => {
@@ -502,4 +535,22 @@ test('run_script replays a frozen script over the live session and returns the r
   assert.equal(bad.pass, false);
   assert.equal(bad.failedAt, 0);
   assert.equal(bad.steps[0].mismatch.path, 'value');
+});
+
+test('pm_trace passes roles/traceMax through and patch_calls reads the merged timeline (no sel)', async () => {
+  const cp = fakeCp();
+  const handle = createDispatcher({ cp });
+
+  // no args → arm everything the adapter declares
+  const a = await handle({ id: 1, method: 'tools/call', params: { name: 'pm_trace', arguments: {} } });
+  assert.deepEqual(cp.calls.at(-1), ['pmTrace', { roles: undefined, traceMax: undefined }]);
+  assert.equal(JSON.parse(a.result.content[0].text).armed[0].sel, '@send');
+
+  const b = await handle({ id: 2, method: 'tools/call', params: { name: 'pm_trace', arguments: { roles: ['send', 'observe'], traceMax: 9000 } } });
+  assert.deepEqual(cp.calls.at(-1), ['pmTrace', { roles: ['send', 'observe'], traceMax: 9000 }]);
+  assert.equal(JSON.parse(b.result.content[0].text).traceMax, 9000);
+
+  // patch_calls without sel = the merged read (the whole point of pm_trace); sel is no longer required
+  await handle({ id: 3, method: 'tools/call', params: { name: 'patch_calls', arguments: {} } });
+  assert.deepEqual(cp.calls.at(-1), ['patchCalls', undefined]);
 });

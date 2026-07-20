@@ -25,6 +25,8 @@
  * @property {any[]} [args]    arguments — call / pmCall
  * @property {any} [opts]      options passthrough — press / snapshot / reachable / watch / network / clickSurface / screenshot / visualCheck / captureBaseline
  * @property {string} [expr]   expression — eval
+ * @property {string|number} [timeout]  eval only: raise the driver's op deadline for this step ('90s'/ms). A long
+ *   poll frozen from a session replays at the 60s default without it, and fails the step it was recorded from.
  * @property {number} [ms]     duration — sleep
  * @property {number} [since]  log index — logs
  * @property {any} [before]    earlier snapshot — diff
@@ -58,6 +60,18 @@
  */
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// The driver's machine-readable error class (see the `err` factory in drivers/puppeteer.js), lifted off a
+// thrown Error so a step result / MCP text can carry it. ONE definition, imported by harness.js and
+// mcp/server.js: the same spread written out at three call sites meant a fourth class field would have to
+// be added in three places, and missing one would silently drop it on that path only — MCP text would keep
+// tagging it while run_script results didn't, so retry logic would diverge by entry point.
+// Gated on the `copse` brand: `code` is ALSO Node's errno convention, so reading any `.code` let a stray
+// ECONNREFUSED render as `✗ [ECONNREFUSED] …`, wearing the same shape as a vocabulary it isn't part of.
+// Absent, never false: an unbranded Error makes no claim either way, and inventing one would be a lie.
+export const errClass = (e) => (e && e.copse
+  ? { ...(e.recoverable ? { recoverable: true } : {}), ...(e.code ? { code: e.code } : {}) }
+  : {});
 
 // READ ops whose whole point is the value they return — a green one that omitted its value read as
 // counterintuitive ("active is… what?"), forcing a redundant single-shot pm_get/eval to peek. So a
@@ -122,7 +136,7 @@ async function execStep(driver, step) {
       case 'interactive': return need('interactive') || await driver.interactive();
       case 'node':        return need('node') || await driver.node(step.ref);
       case 'reachable':   return need('reachable') || await driver.reachable(step.ref, step.opts || {});
-      case 'eval':        return need('eval') || await driver.eval(step.expr);
+      case 'eval':        return need('eval') || await driver.eval(step.expr, step.timeout != null ? { timeout: step.timeout } : {});
       case 'logs':        return need('logs') || await driver.logs(step.since || 0);
       // framework-aware + patch ops (frozen from an MCP session by toStep) — same Driver methods.
       case 'pmGet':       return need('pmGet') || await driver.pmGet(step.sel);
@@ -156,7 +170,10 @@ async function execStep(driver, step) {
       default:            return { ok: false, reason: 'unknown-op', op: step.op };
     }
   } catch (e) {
-    return { ok: false, reason: 'threw', error: e instanceof Error ? e.message : String(e) };
+    // Carry the driver's machine-readable class through. A step that failed because the game was still
+    // booting (recoverable) is a different fact from one that failed because the selector is wrong, and a
+    // runner that stops at the first failure can't tell them apart from prose alone.
+    return { ok: false, reason: 'threw', error: e instanceof Error ? e.message : String(e), ...errClass(e) };
   }
 }
 

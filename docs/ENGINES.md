@@ -73,6 +73,18 @@ in the extension's own order: `__PIXI_DEVTOOLS__.app` → `__PIXI_APP__` → `__
 | freeze / unfreeze (`hold`) | `app.ticker.stop()` / `.start()` | ⚠️ |
 | `assetsPending` | no public pending count on `Assets` → `{known:false}` | ⚠️ |
 
+**One field, one meaning — across both layers AND both engines.** `visible` is reported by *two* layers
+(`reachable` and `visualManifest`) and must mean the same thing in both, or a caller gating on
+`visible && drawn` is silently reading two different questions. It is the PERCEPTUAL signal: hidden,
+`alpha`/`opacity === 0`, or `scale === 0` **anywhere up the ancestor chain** — exact-zero only, no
+thresholds. It is deliberately kept OUT of the `reachable` boolean, because input ignores alpha: a fully
+transparent button is still clickable. Each engine has ONE definition (`cocos/geom.js` / `pixi/geom.js`
+`visibleOf`) that both of its layers call. Pixi's `isActive`/`activeInHierarchy` is a *narrower*
+question — the ancestor `visible` chain only, the analogue of Cocos's `activeInHierarchy` — and uses
+`visibleChain`, which ignores alpha by design. (This was a real divergence: `visualManifest` reported
+`visible` from the node ALONE, so a node under a hidden parent came back `true` from one layer and
+`false` from the other, and Cocos agreed with neither. Pinned in `test/pixi.test.js`.)
+
 `pixiType(n)` must be **duck-typed**, never `instanceof` and never `constructor.name` (§3).
 Copy the approach in the official devtools' `getPixiType.ts`: `renderPipeId === 'sprite'`,
 `_leftWidth`/`_rightWidth` → NineSliceSprite, `particleChildren` → ParticleContainer, etc.

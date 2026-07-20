@@ -106,6 +106,13 @@ test('facts.uncertain: a synthetic tap into a no-visible-handler button (drove:[
   assert.deepEqual(t.facts.uncertain, [{ ref: 'Canvas/MaybeDead', why: 'touch-into-void' }]);
 });
 
+test("facts.uncertain: the PIXI synthetic-tap token 'pointer' is treated the SAME as Cocos 'touch' (engine parity — a dead Pixi button isn't silently green)", async () => {
+  const { scene } = fixture();
+  const driver = { ...localDriver(scene, fakeRuntime()), press: (ref) => ({ ok: true, ref, fired: 0, drove: ['pointer'], wired: false }) };
+  const t = await execute(driver, [{ op: 'press', ref: 'Canvas/PixiDead' }]);
+  assert.deepEqual(t.facts.uncertain, [{ ref: 'Canvas/PixiDead', why: 'touch-into-void' }]);
+});
+
 test('facts.visual: a subtree the logic diff SHOWED but did not render (via visualCheck); visualGate:false / no capability = no-op', async () => {
   const { scene } = fixture();
   const base = localDriver(scene, fakeRuntime());

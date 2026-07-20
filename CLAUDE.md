@@ -43,7 +43,9 @@ scene. copse's own launch mode is the standalone fallback. See `docs/MCP.md`.
 - **MCP** (`copse mcp`): the bridge as MCP tools; verified driving a running game **natively
   from Claude Code** (open → dismiss → press → panel via `changed.appeared` → press
   close → `changed.disappeared`), no browser-use, adaptive (waited for a toggle to enable).
-- **CI**: 101 `node:test` cases green (+1 engine-gated skip), `npm run typecheck` clean, `npm run build` → three
+- **CI**: 219 `node:test` cases green over fakes (`npm test`), plus an L2 tier that needs a real engine /
+  a real Chrome and self-skips without one (`npm run test:l2` — 12 cases: the driver's reconnect contract
+  against a live Chrome, and the 3.8.6 listener-table parse). `npm run typecheck` clean, `npm run build` → three
   self-contained IIFEs (each auto-installs `window.__copse` once `cc` is live): `dist/copse.inject.js`
   (full — the QA/coverage surface), `dist/copse.inject.lite.js` (lite — snapshot/press/get/call/node/diff,
   reachability tree-shaken out; ~half the size, for a `press`-only caller like mast), and
@@ -53,7 +55,9 @@ scene. copse's own launch mode is the standalone fallback. See `docs/MCP.md`.
 ## Commands
 
 ```bash
-npm test           # node:test over FAKE trees (no engine, no install) — test/*.test.js (core + harness + mcp)
+npm test           # node:test over FAKE trees (no engine, no install, no browser) — EXCLUDES test/*.l2.test.js
+npm run test:l2    # L2 only — the tests that need a REAL engine / a real Chrome (slow; self-skip when absent)
+npm run test:all   # everything, L1 + L2
 npm run typecheck  # tsc --noEmit (JSDoc); needs `npm install` for the dev deps only
 npm run build      # build:full + :lite + :probe + :pixi → dist/copse.inject{,.lite,.probe,.pixi}.js (IIFEs, gitignored)
 ```
@@ -146,6 +150,14 @@ Layout (grouped by concern; `src/index.js` is the public barrel):
     the opposite of Cocos's default; `force:true` falls back to `emit` and says so (`drove:'emit-unsafe'`).
   - `visual.js` / `probe.js` / `runtime.js` (`pixiRuntime`/`install`/`findPixi`/`installInitHook`) /
     `inject.js` (the build entry — arms `__PIXI_APP_INIT__` FIRST, since that only works pre-boot).
+  - `geom.js` — the Pixi counterpart of `cocos/geom.js`: `boundsRectOf` (v8 returns `Bounds`, earlier
+    versions a `Rectangle` — normalized once, and it hands back the RAW rect because callers legitimately
+    differ: `reachable` needs `> 0` to aim a click, `visual` accepts a collapsed rect), `visibleChain`
+    (the ancestor `visible` walk = Cocos's `activeInHierarchy`; ignores alpha by design) and `visibleOf`
+    (+ alpha/scale === 0, the perceptual signal). The duplication here was cheap but its consequence
+    wasn't: `visualManifest` reported `visible` from the node ALONE while `reachable` reported the same
+    field from an ancestor-aware walk, so a node under a hidden parent came back `true` from one and
+    `false` from the other — and Cocos agreed with neither. One definition each; pinned in `test/pixi.test.js`.
 - `src/cocos/` — the **engine-coupled** layer (the only place that touches `cc.*`):
   - `runtime.js` — the `Runtime` adapter over ONE shared `baseRuntime(cc)` (`press`/`get`/`call` driving +
     `codeHandlers` via `_eventProcessor` + `nodeInfo` intrinsics), in two shapes: `cocosRuntime(cc)` =
@@ -164,6 +176,16 @@ Layout (grouped by concern; `src/index.js` is the public barrel):
     **imported only by the full `cocosRuntime`** → esbuild tree-shakes it out of the lite bundle. Self-contained
     (re-resolves the cc classes it needs), so it could later be built into a standalone injectable snippet.
     Exercised in CI by `test/reachable.test.js` over a geometric fake `cc`.
+  - `geom.js` — the primitives more than one Cocos layer needs the SAME answer from: `collectCameras`
+    (class-NAME-string fallback, so a tree-shaken build doesn't find zero cameras), `camOf` (node → its
+    rendering camera: layer/visibility mask, highest priority), `visibleOf` (opacity/scale collapse up the
+    chain) and `synthTap` (the synthetic two-phase touch). Each of these had 2–4 copies kept "in lockstep"
+    by hand — and they had already drifted: the two synthetic-touch paths projected through DIFFERENT
+    cameras (`cams[0]` vs `cams[cams.length - 1]`), so at most one was right. `synthTap` now takes the
+    camera from `camOf` and differs only by `endType` — `'end'` actuates (a Button's handler runs),
+    `'cancel'` only lets the node observe a touch (reachable's opt-in probe; no click). Dependency-free
+    on purpose: the base/probe bundles pull it in. Pinned by `test/geom.test.js` (the touch path had NO
+    test before — core.test.js stubs `emitTouch`, which is how the drift went unnoticed).
   - `inject.js` — the **full build entry** (not public API): re-exports the in-page surface on
     `globalThis.copse` + auto-installs the full `window.__copse` via `install`. esbuild → `dist/copse.inject.js`.
   - `inject-lite.js` — the **lite build entry**: the minimal surface + auto-install via `installLite`.
@@ -207,10 +229,24 @@ Layout (grouped by concern; `src/index.js` is the public barrel):
   insurance, since the hook must be armed before detection is possible). `copse doctor` DEFAULTS to
   auto — it's the "why won't it even run" command, so requiring you to already know the engine would
   defeat it; it reports `engine` (null when nothing identified itself), `injected`, and what it looked
-  for. A page with no engine no longer throws: `cp.installed` is false and reads degrade.
+  for. A page with no engine FAILS the boot (`[recoverable] no-engine`) rather than handing back a
+  half-session: a boot that returned left `frame` on `page.mainFrame()` — live, no game, never
+  "detached" — so recovery never re-fired and the session stayed broken even after the game came back.
   Attach mode (`{attach:true, browserURL, match?}`) drives an already-open tab; **no `match`/url →
-  the ACTIVE tab** (visibilityState/hasFocus probes, race-bounded so a paused tab can't hang the
-  scan — a paused game must be attached via `match`). `cp.reload()` (factored `bootInPage`)
+  the ACTIVE tab** (visibilityState/hasFocus/title probes — each race-bounded so a paused tab can't hang the
+  scan, and run in PARALLEL so N tabs cost one probe window, not N — a paused game must be attached via `match`).
+  **Waits are budgeted, and every one of them fails LOUD rather than long** (DEVELOPMENT.md §25F
+  has the measured before/after): a session survives the tab reloading under it — the frame detaches, `ev`
+  re-finds the engine + re-injects (~6ms on a healthy F5) — and a boot that FAILS is recoverable, not terminal
+  (`bootTries` 40s cold vs `rebootTries` 15s after a navigation, then a 2s fail-fast cooldown that the next
+  navigation cancels, so a reload landing mid-rebuild self-heals on the op after the build finishes instead of
+  wedging the session forever). `readyTimeout` (5s) bounds a call's wait on unfinished init and names the phase
+  it's stuck in (`phase=finding-engine, 6.0s elapsed`) — init keeps running, so retrying is the fix. `opTimeout`
+  (60s) caps ANY in-page call so a renderer that wedges AFTER connect can't hang one forever (`eval` may pass its
+  own `{timeout}`). Errors carry a machine-readable class — `{recoverable, code}`, one definition in
+  `errClass` (script.js) — so a caller branches on the fact instead of pattern-matching prose. Re-injection
+  wipes the caller's in-page `patch`/`hold` hooks: it warns into `cp.logs()` and counts in `cp.reinjects`.
+  `cp.reload()` (factored `bootInPage`, routed through the same deduped reboot)
   re-navigates the tab + re-injects — picks up the editor's CURRENT
   scene after `scene_open_scene`, and recovers a wedged/empty preview (attach-found-`getScene()===null`).
   Browser-glue, so deliberately not `@ts-check`ed.
@@ -227,9 +263,9 @@ Layout (grouped by concern; `src/index.js` is the public barrel):
   out of `tools/list` when `state.debug` is falsy, and GROUPS the advertised list by `FAMILY` with one ★
   `HEADLINE` per family — each description prefixed `[family ★]`/`[family]` so the flat surface reads as a
   guided map (signposting, not gating; families: session/see/read/drive/usable/observe/fix/coverage/script/orient/escape,
-  `eval` alone in `escape` — the raw hatch, no ★); `tools.js` = the tool registry — 40 testing primitives
+  `eval` alone in `escape` — the raw hatch, no ★); `tools.js` = the tool registry — 41 testing primitives
   (`connect`/`list_tabs`/`reload`/`snapshot`/`interactive`/`click_surface`/`resolve`/`press`/`get`/`call`/`eval`/`reachable`/`node`/`diff`/
-  `listeners`/`orient`/`probe`/`logs`/`watch`/`hold`/`release`/`hold_status`/`patch`/`patch_clear`/`patch_calls`/`framework`/`register_framework`/`pm_get`/`pm_set`/`pm_call`/`pm_patch`/`pm_notify`/`network`/`screenshot`/`visual_check`/`visual_baseline`/`run_script`/`dump_script`/`close`)
+  `listeners`/`orient`/`probe`/`logs`/`watch`/`hold`/`release`/`hold_status`/`patch`/`patch_clear`/`patch_calls`/`framework`/`register_framework`/`pm_get`/`pm_set`/`pm_call`/`pm_patch`/`pm_trace`/`pm_notify`/`network`/`screenshot`/`visual_check`/`visual_baseline`/`run_script`/`dump_script`/`close`)
   + 7 `debug:true`-tagged Debugger tools (`break_*`/`wait_pause`/
   `eval_frame`/`debug_step`/`clear_breakpoints`, family `debug`), **hidden from `tools/list` by default**
   (dev-build-only — pausing the runtime is intrusive; `copse mcp --debug` surfaces them, still callable by
@@ -264,6 +300,18 @@ Layout (grouped by concern; `src/index.js` is the public barrel):
   esbuild-bundles the event source from `reference/cocos/<ver>` (gitignored local checkout; virtual/deep-leaf modules
   stubbed) → a real `CallbacksInvoker`, and asserts `codeHandlers` parses the real `_callbackTable`. SKIPS when no
   engine is checked out. Add a version: `git clone --depth 1 -b v3.8.6 https://github.com/cocos/cocos-engine reference/cocos/3.8.6`.
+- `test/patch-trace.test.js` — the trace contract over a fake `cc` + a stubbed clock: one shared epoch
+  (`t` comparable across patches armed at different moments) + one shared seq (`i`, on ENTRY → a nested callee sorts
+  after its caller; sub-ms chains stay ordered), the merged `patch_calls()` read (+`dt`), epoch reset on clear-all only,
+  shared `d` (unwinds even when the method throws), entry-time `label` (pins the MacroCommand-splice case), and
+  `pm_trace` arming/roles-filter/unresolved over a fake framework. See docs/PM-TRACE.md.
+- `test/driver-reconnect.l2.test.js` — **L2**: the puppeteer driver's auto-reconnect against a REAL Chrome (launches one;
+  SKIPS without Chrome/puppeteer-core, so `npm test` stays green everywhere — but adds ~20s where it runs; `npm run test:l2`).
+  Pins the two ways a session dies around a reload, both measured, neither what the field report originally blamed:
+  a boot that fails mid-rebuild must not wedge the session FOREVER (bootInPage fell back to `page.mainFrame()` — live, no
+  game, never "detached" → `isDetached` never fires again → no recovery even after the game is healthy), and `ev()` must
+  BOUND its wait on `ready` (attach deliberately leaves it pending; a bare `await` made every call hang silently — 1953s
+  in the reported session). A healthy F5 already self-heals in ~4ms; that's pinned too so a fix can't regress it.
 - `docs/COVERAGE.md` — the **coir × copse** join recipe: `clickSurface`/`click_surface` emits copse's
   runtime click surface (`(ref, method)` rows); the JOIN itself (`coverageJoin` → buckets covered /
   blocked / unreached / ambiguous / code-only) now lives in **arbor**. copse keeps the interop resolvers
@@ -288,6 +336,12 @@ Layout (grouped by concern; `src/index.js` is the public barrel):
 - `docs/DEBUG.md` — `copse/debug` (CDP Debugger): breakpoints (incl. `break_in path:Comp.method`) +
   call stack / `eval_frame` / step, as MCP tools — for your own dev build.
 - `docs/INJECT.md` — the three ways to inject + the AI test loop.
+- `docs/PM-TRACE.md` — **`pm_trace`**: the runtime half of a command flow (coir `flow --time` is a static lower bound
+  and says so; animation durations "stay a runtime question" — this answers it). Why the hook points are the framework's
+  CLASS prototypes and not its registries (PureMVC captures the handler fn at registration → patching the registry object
+  fires 0 times, measured), the row shape (`i` orders, `d` indents, `dt` is where the time went), the `label` extractor +
+  why it runs on entry, the measured defaults, and the limits (minified notification names; subcommands nameable only via
+  coir's `⊕ addSubCommand` — the intended join, keyed like docs/COVERAGE.md).
 - `docs/AI-DRIVER.md` — copse's one AI-testing rail, `execute(driver, steps, opts?)`: runs a step
   list, reports the FACTS — no plan/loop/judge. The autonomous LOOP + verdict/veto live in **arbor**,
   which drives `execute`.
@@ -312,6 +366,8 @@ __copse.probe()                                   // engine-coupling self-diagno
 __copse.logs(sinceTs?)                            // captured console.* + uncaught errors → [{level,text,t,stack?}] (started on inject load)
 __copse.watch({exprs?,selectors?,interval?,until?,timeout?,settle?})  // diff-only state TIMELINE over time → { timeline:[{t,dt,changes}], stoppedBy } (one in-page loop; replaces hand-written polling)
 __copse.patch('Canvas/Mgr:Ctrl.setBet', {before?,after?,replace?,trace?})  // wrap a live method (JS fn-expr src) to verify a fix pre-rebuild; trace:true records calls → { ok, method, hooks }; patch_clear(sel?) restores, patch_calls(sel) reads trace
+__copse.patch_calls()                             // NO sel → the MERGED timeline across every traced patch: { traced:[sels], calls:[{sel,i,t,dt,d,args,ret}] } — one shared epoch (t comparable) + one shared seq stamped on ENTRY (order by `i`, not `t`: a synchronous command chain runs inside a single ms)
+__copse.pmTrace({roles?, traceMax?})              // arm the adapter's DISPATCH choke points in one call (no selector to guess) → { ok, armed:[{role,sel:'@role',at}], unresolved?, failed? }. See docs/PM-TRACE.md
 __copse.hold('PanelMediator.toggle', {at?,pmMode?,holdMs?})  // arm a ONE-SHOT freeze of the engine loop at a trigger → the transient state is held (screenshot/inspect), then release(); { ok, armed } or { ok:false, reason:'no-freeze-api' }. hold_status() → { armed, held, sel, via, sinceMs }; release() resumes
 __copse.registerFramework(adapterOrSrc)           // install a framework adapter for this session → { ok, kind, registered }  (core ships NONE)
 __copse.framework()                               // detect via REGISTERED adapters + enumerate → { kind, proxies, mediators, commands, registered, capabilities:{proxy,mediator,command,notify} }  (capabilities = what resolved on THIS build)
@@ -327,11 +383,16 @@ engine — no PureMVC baked in; not every game has a framework and those that do
 driver auto-loads adapters from `copse.frameworks.mjs` (this machine's, next to the package, **git-ignored**;
 then a per-project one in cwd) + `connect({frameworks})` / `--framework <file>` / the `register_framework`
 tool, and injects them so `framework`/`pm_state`/`pm_call`/`pm_patch`/`pm_notify` light up. An adapter is a
-CONFIG object (`{kind, facade:[…locations], proxy:{via?,map?}, mediator, command:{map?,execute?}, notify:{via?}}`
+CONFIG object (`{kind, facade:[…locations], proxy:{via?,map?}, mediator, command:{map?,execute?}, notify:{via?}, trace:{role:{at,label?}}}`
 — field-name CANDIDATE lists absorb per-game NAME differences) or a code-adapter source string (its own
-`detect`/`retrieve`/`commandTarget`/`notify` for STRUCTURAL quirks the config can't express). `pm_patch` wraps a
+`detect`/`retrieve`/`commandTarget`/`notify`/`traceTargets` for STRUCTURAL quirks the config can't express). `pm_patch` wraps a
 proxy/mediator INSTANCE or a command CLASS prototype (transient commands); `pm_notify` fires a notification (the
-direct flow entry). Per-game variance is handled purely in `copse.frameworks.mjs` — core stays zero-assumption,
+direct flow entry); **`pm_trace`** arms the `trace` block's DISPATCH choke points — `at` is a dotted path from the
+WINDOW to a class prototype, because a framework's registries are NOT where dispatch is observable (PureMVC's
+View/Controller capture `mediator.handleNotification`/`this.executeCommand` as function VALUES at registration, so
+patching what the registry hands you fires zero times — measured). `label` (a fn-expr src) extracts the readable
+row; it runs on ENTRY, so it sees state the method destroys. See **[docs/PM-TRACE.md](docs/PM-TRACE.md)**.
+Per-game variance is handled purely in `copse.frameworks.mjs` — core stays zero-assumption,
 fails LOUD when a target can't resolve, and `framework().capabilities` reports what resolved on THIS build (like
 `probe` for engine internals). See `copse.frameworks.example.mjs`.
 

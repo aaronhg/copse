@@ -20,7 +20,7 @@ export default [
     // 'a.b.*' expands a map object and tries each value (e.g. the .instanceMap multiton). Add your
     // game's location here if auto-detect misses.
     facade: [
-      'puremvc.Facade.instance',        // the common singleton (what most real builds keep it)
+      'puremvc.Facade.instance',        // the common singleton — where most real builds keep it
       'puremvc.Facade.instanceMap.*',   // the multiton: Facade.instanceMap keyed by module name
       'PureMVC.Facade.instance',
       'gameFacade', 'appFacade', 'facade',
@@ -35,6 +35,32 @@ export default [
     // notify: how pm_notify FIRES a notification — the facade method name candidates. If your game dispatches
     // notifications a non-standard way, use a code adapter's own notify(root,name,body,type) instead.
     notify: { via: ['sendNotification', 'notify'] },
+    // trace: the DISPATCH choke points pm_trace arms (docs/PM-TRACE.md). `at` is a candidate list of dotted
+    // paths from the WINDOW to a class prototype — NOT a registry lookup, and that distinction is the whole
+    // point: PureMVC's View.registerMediator does `new Observer(mediator.handleNotification, mediator)` and
+    // Controller.registerCommand does `new Observer(this.executeCommand, this)`, both capturing the function
+    // VALUE at registration — so wrapping what the registry hands you back observes NOTHING (measured on a real
+    // build: 0 hits across 60 command executions). These prototypes are what the Observer calls THROUGH.
+    // `label` (a fn-expr src, compiled in-page) extracts the readable row and runs on ENTRY — see the macro note.
+    trace: {
+      send: {
+        at: ['puremvc.Facade.prototype.sendNotification', 'PureMVC.Facade.prototype.sendNotification'],
+        label: '(a) => ({ n: a[0] })',
+      },
+      // notifyObserver's notifyContext IS the mediator (or the Controller — a row whose to==='Controller' is
+      // that notification's command running, since commandMap is keyed by notification name).
+      observe: {
+        at: ['puremvc.Observer.prototype.notifyObserver', 'PureMVC.Observer.prototype.notifyObserver'],
+        label: '(a, self) => { const c = self.getNotifyContext && self.getNotifyContext(); const n = a[0] && a[0].getName && a[0].getName(); return { n, to: (c && c.getMediatorName && c.getMediatorName()) || (c && c.constructor && c.constructor.name) }; }',
+      },
+      // MacroCommand.execute ENDS with this.subCommands.splice(0) — a label reading it at exit would report 0
+      // on every macro. Labels run on entry, so this counts them; NAMING them is coir's `⊕ addSubCommand` job
+      // (the refs here are minified and can even collide — a real macro reports ['r','n','r']).
+      macro: {
+        at: ['puremvc.MacroCommand.prototype.execute', 'PureMVC.MacroCommand.prototype.execute'],
+        label: '(a, self) => ({ n: a[0] && a[0].getName && a[0].getName(), subs: (self.subCommands || []).length })',
+      },
+    },
   },
 
   // CODE adapter (advanced) — a source string eval'd IN-PAGE to an object with the same interface, for a

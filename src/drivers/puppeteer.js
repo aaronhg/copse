@@ -11,8 +11,21 @@ import { pathToFileURL } from 'node:url';
 import { diff as coreDiff } from '../core/index.js';
 import { engineCapabilities } from '../capabilities.js';
 import { signature, visualVerdict } from '../sensors/pixel.js';
+import { parseDur } from '../core/eval-cond.js';   // pure duration grammar ('2m'/'500ms'/n) — same one the in-page watch loop parses with
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Failures carry a machine-readable class next to the prose. `recoverable` = "the same call, made again,
+// may just work — nothing needs a human first". Prose alone is readable but un-actionable: run_script has
+// no retry and stops at the first failed step, and neither it nor an agent can tell "retry me" from "your
+// selector is wrong" by string-matching a sentence. (the field report asked for this
+// flag; the first pass shipped only the sentences.)
+// Deliberately NOT recoverable: anything a retry would merely repeat — a match that matches nothing, an
+// ambiguous match, a wedged renderer (retrying just re-hangs for another opTimeout).
+// `copse: true` brands it as OURS. `code` is Node's own errno convention on Error, so harvesting any `.code`
+// meant puppeteer's ECONNREFUSED surfaced to an agent as `✗ [ECONNREFUSED] …` — indistinguishable from the
+// vocabulary this flag exists to define. A class you don't control the namespace of isn't a class.
+const err = (message, { recoverable = false, code } = {}) => Object.assign(new Error(message), { copse: true, recoverable, ...(code ? { code } : {}) });
 
 // ---- framework adapters (SUGGESTIONS #4) ----------------------------------------------------
 // copse core ships NO framework knowledge; the driver auto-loads adapters from copse.frameworks.mjs
@@ -104,18 +117,35 @@ function normMatch(m) {
 }
 const condMatch = (conds, url, title) => conds.every((c) => (c.field === 'title' ? (title || '') : (url || '')).includes(c.needle));
 
+// EVERY CDP read against a not-yet-chosen tab is race-bounded: a tab halted at a breakpoint answers
+// nothing, and one unbounded await hangs the whole scan. `title()` used to be exactly that hole — it sat
+// un-raced right next to a carefully raced evaluate, so a paused tab hung the scan the race was there to
+// prevent. Bound both, and default rather than throw: a tab we can't read is a tab we don't pick.
+const PROBE_MS = 800;
+const probeTab = (pg, fn, dflt) => Promise.race([Promise.resolve().then(() => pg.evaluate(fn)).then((v) => v, () => dflt), sleep(PROBE_MS).then(() => dflt)]);
+// null when the tab wouldn't answer in time — NOT ''. title() is an evaluate under the hood, so a tab whose
+// main thread is busy (a Cocos loading screen doing heavy synchronous work — precisely when you attach) loses
+// the race. Defaulting that to '' made a title-based `match` silently miss the tab AND then list it back to
+// the user as "(no title)": a guess laundered into a fact, telling them to fix a match that was correct.
+// The bound itself has to stay — an unbounded title() let one paused tab hang the whole scan.
+// Its own budget, wider than PROBE_MS: title() is instant on a free main thread, so the bound only ever
+// bites when the thread is busy with synchronous work (a loading screen's parse/compile bursts) — and at
+// 800ms a burst-heavy tab could fail all 8 attach tries. 2.5s per probe still can't hang the scan (probes
+// run in parallel) but rides out a burst; a tab busy CONTINUOUSLY beyond that gets the unreadable-title
+// note in the failure rather than a silent miss.
+const TITLE_MS = 2500;
+const titleOf = (pg) => Promise.race([Promise.resolve().then(() => pg.title()).then((v) => v, () => null), sleep(TITLE_MS).then(() => null)]);
+const showTitle = (t) => (t === null ? '(title unreadable — tab busy or paused)' : (t || '(no title)'));
+
 // Enumerate a browser's open tabs → [{index,url,title,active}] (active = visible + focused). No injection,
-// no navigation — safe reconnaissance. `active` is race-bounded so a paused/breakpointed tab can't hang it.
+// no navigation — safe reconnaissance. Probes run in PARALLEL and are each race-bounded, so N tabs cost
+// ~one probe window, not N of them, and no single tab can hang the scan.
 export async function listTabs(browser) {
   const pages = await browser.pages();
-  const out = [];
-  for (let i = 0; i < pages.length; i++) {
-    const pg = pages[i]; let t = '', active = false;
-    try { t = await pg.title(); } catch { /* */ }
-    try { active = await Promise.race([pg.evaluate(() => document.visibilityState === 'visible' && document.hasFocus()).then((v) => v, () => false), sleep(600).then(() => false)]); } catch { /* */ }
-    out.push({ index: i, url: pg.url(), title: t, active });
-  }
-  return out;
+  return Promise.all(pages.map(async (pg, index) => ({
+    index, url: pg.url(), title: await titleOf(pg),
+    active: await probeTab(pg, () => document.visibilityState === 'visible' && document.hasFocus(), false),
+  })));
 }
 // Connect to an existing Chrome JUST to list its tabs, then disconnect — for choosing a `match`/`pick`
 // BEFORE connect (the chrome-devtools-mcp composition: it opens tabs, you pick which to attach).
@@ -133,7 +163,33 @@ export async function browseTabs({ browserURL, browserWSEndpoint } = {}) {
  * screenshot) plus `page`, `frame` (the frame cc was found in — may be a
  * nested/cross-origin iframe), `browser`, and `close()`.
  * @param {string} url
- * @param {{engine?:'cocos'|'pixi', bundlePath?:string|URL, executablePath?:string, browserURL?:string, browserWSEndpoint?:string, attach?:boolean, match?:string, attachTries?:number, headless?:any, viewport?:any, fpsCap?:number, timeout?:number, bootTries?:number, readyTries?:number, maxLogs?:number, settle?:boolean|{maxMs?:number,interval?:number}}} [opts]
+ * @param {{engine?:'cocos'|'pixi', bundlePath?:string|URL, executablePath?:string, browserURL?:string, browserWSEndpoint?:string, attach?:boolean, match?:string, pick?:number, attachTries?:number, headless?:any, viewport?:any, fpsCap?:number, timeout?:number, bootTries?:number, rebootTries?:number, readyTries?:number, readyTimeout?:number, installTimeout?:number, opTimeout?:number, rebootCooldown?:number, pauseProbeMs?:number, injectStallMs?:number, frameworks?:any[], maxLogs?:number, maxNet?:number, settle?:boolean|{maxMs?:number,interval?:number}}} [opts]
+ *        `engine` picks the lane: 'cocos' (default), 'pixi', or 'auto' to detect from the page. See
+ *        docs/ENGINES.md — the resolved value and what it implies are readable as cp.engine/cp.capabilities.
+ *        The waits, and why each is the size it is. The rule they all follow: fail LOUD rather than long —
+ *        a clear failure you can retry beats a silent wait you can't read (DEVELOPMENT.md §25F has the measured before/after).
+ *        attachTries (8): seconds to wait for a tab matching `match` to appear. Short because the usual
+ *        cause is a match that matches nothing, and the failure lists every open tab so you can fix it.
+ *        bootTries (40): seconds to find a frame with a live cc scene on a COLD connect — a game may be
+ *        booting from nothing, and this is the one wait worth being patient for.
+ *        rebootTries (15): the budget for EACH wait phase of a reboot after a navigation detached us. The
+ *        game was alive moments ago, so this is deliberately much shorter; a failed reboot is recoverable
+ *        (see rebootCooldown), so undershooting costs one visible retry, not a wedged session.
+ *        installTimeout (10000): ms for the injected bundle to expose window.__copse.
+ *        readyTries (25): seconds for the engine to build a scene on a cold boot — NOT a hard gate, it
+ *        falls through (a scene that never appears is the caller's to judge via snapshot/orient).
+ *        readyTimeout (5000): ms an in-page call waits on unfinished init before saying which phase it's
+ *        in and handing back control. Short by design — init keeps running, so retrying is the fix; the
+ *        old unbounded wait turned a halted renderer into a silent 32-minute hang. Raise it to block instead.
+ *        opTimeout (60000): ms ANY in-page call may take before failing loud. Most ops are milliseconds, so
+ *        it never fires for them and only caps a hang: without it a renderer that wedges AFTER connect (a
+ *        breakpoint mid-session) hung every call forever. `eval` can pass its own `{timeout}`, and `watch`
+ *        derives one from its own duration — those are the ops allowed to be legitimately long.
+ *        injectStallMs (= readyTimeout): ms connect waits on init before returning stalled:true. One
+ *        number for "how long before copse says it isn't ready", whichever way you ask.
+ *        rebootCooldown (2000): ms after a failed (re)connect during which calls fail fast with that
+ *        reason instead of re-paying the boot budget each time. A navigation cancels it — the world
+ *        just changed, so the retry is worth making now.
  *        attach: drive an ALREADY-OPEN tab in `browserURL`'s Chrome (find it by `match` URL
  *        substring; omit match+url to attach the ACTIVE tab; no navigation — for your own game
  *        behind a login/staging gate you opened yourself, so a fresh goto won't bounce you back to
@@ -194,6 +250,21 @@ export async function connect(url, opts = {}) {
     : await puppeteer.launch({ executablePath: opts.executablePath || DEFAULT_CHROME, headless: opts.headless ?? 'new',
         args: ['--no-sandbox', '--disable-setuid-sandbox', '--use-gl=angle', '--use-angle=swiftshader', '--ignore-gpu-blocklist', '--enable-unsafe-swiftshader', '--mute-audio'] });
 
+  // Give the browser back before rethrowing. A connect that throws AFTER the browser exists used to just
+  // leak it: in attach mode that's a live CDP websocket that keeps the CALLER's process alive forever (a
+  // failed connect made plain `node` hang at exit — an infinite wait hiding behind a clean error message),
+  // and in launch mode it's an orphaned Chrome. Every post-browser throw in this function goes through
+  // here; keep it that way if you add another.
+  const bail = async (e) => {
+    try { if (opts.attach) browser.disconnect(); else await browser.close(); } catch { /* the original failure is the one worth reporting */ }
+    throw e;
+  };
+  // Wrap anything that can throw between here and the `cp` return. The comment above used to claim every
+  // post-browser throw went through bail while three of them didn't — including page.goto, which fails on
+  // the single most common mistake there is (dev server not running). A claimed invariant that the code
+  // doesn't keep is worse than no invariant: it stops anyone from checking.
+  const guard = async (fn) => { try { return await fn(); } catch (e) { return await bail(e); } };
+
   // attach mode: drive an ALREADY-OPEN tab (your own game behind a login/staging gate you opened
   // yourself) — find it by URL substring and DON'T navigate (a fresh goto would bounce you back out
   // of it; CDP attach opens no DevTools panel either). No match/url → the ACTIVE tab (the one being
@@ -205,36 +276,56 @@ export async function connect(url, opts = {}) {
   if (opts.attach) {
     const conds = normMatch(opts.match || url);   // [] → active-tab mode
     const shown = JSON.stringify(opts.match || url);
-    const probe = (pg, fn, dflt) => Promise.race([pg.evaluate(fn).then((v) => v, () => dflt), sleep(800).then(() => dflt)]);
+    // Probe every tab CONCURRENTLY (each still race-bounded): the scan cost is one probe window, not one
+    // per tab. Sequentially this was ~1.6s × tabs before attach could even start.
     const activeTab = async (pages) => {
-      const vis = [];
-      for (const pg of pages) { if (await probe(pg, () => document.visibilityState, 'hidden') === 'visible') vis.push(pg); }
-      for (const pg of vis) { if (await probe(pg, () => document.hasFocus(), false)) return pg; }
-      return vis[0] || pages[0] || null;
+      const vis = (await Promise.all(pages.map((pg) => probeTab(pg, () => document.visibilityState, 'hidden'))))
+        .map((v, i) => (v === 'visible' ? pages[i] : null)).filter(Boolean);
+      const focused = await Promise.all(vis.map((pg) => probeTab(pg, () => document.hasFocus(), false)));
+      const i = focused.indexOf(true);
+      return (i >= 0 ? vis[i] : vis[0]) || pages[0] || null;
     };
-    for (let i = 0, n = opts.attachTries ?? 30; i < n && !page; i++) {
+    // Short budget on purpose. This loop exists for a real race (copse starts, you open the game a moment
+    // later), but the overwhelmingly common failure is a `match` that doesn't match anything — and 30s of
+    // silence is a terrible way to be told about a typo when the tab list is right there, known, the whole
+    // time. Wait briefly, then FAIL with what's actually open (below) so the fix is one edit, not one
+    // `list_tabs` round trip.
+    for (let i = 0, n = opts.attachTries ?? 8; i < n && !page; i++) {
       const pages = await browser.pages();
       if (conds.length) {
         // Collect ALL matches (url + title) — a lone `.find()` silently grabbed the FIRST, so two builds
         // sharing a url fragment connected to the wrong one, discovered late. >1 match is an ambiguity.
-        const cand = [];
-        for (const pg of pages) { const u = pg.url(); let t = ''; try { t = await pg.title(); } catch { /* */ } if (condMatch(conds, u, t)) cand.push({ pg, url: u, title: t }); }
+        const rows = await Promise.all(pages.map(async (pg) => ({ pg, url: pg.url(), title: await titleOf(pg) })));
+        const cand = rows.filter((r) => condMatch(conds, r.url, r.title));
         if (cand.length > 1 && opts.pick == null) {
-          throw new Error(`attach: ${cand.length} open tabs match ${shown} — narrow the match (a list ANDs, title matches too) or pass pick:<index>:\n`
-            + cand.map((c, k) => `  [${k}] ${c.title || '(no title)'} — ${c.url}`).join('\n'));
+          await bail(err(`attach: ${cand.length} open tabs match ${shown} — narrow the match (a list ANDs, title matches too) or pass pick:<index>:\n`
+            + cand.map((c, k) => `  [${k}] ${showTitle(c.title)} — ${c.url}`).join('\n'), { code: 'ambiguous-tab' }));
         }
         const chosen = cand[opts.pick || 0];
-        if (chosen) { page = chosen.pg; attachedTab = { url: chosen.url, title: chosen.title, index: opts.pick || 0, of: cand.length }; }
+        if (chosen) { page = chosen.pg; attachedTab = { url: chosen.url, title: chosen.title ?? '', index: opts.pick || 0, of: cand.length }; }
       } else {
         page = await activeTab(pages);
-        if (page) { let t = ''; try { t = await page.title(); } catch { /* */ } attachedTab = { url: page.url(), title: t, index: 0, of: 1, active: true }; }
+        if (page) attachedTab = { url: page.url(), title: (await titleOf(page)) ?? '', index: 0, of: 1, active: true };
       }
       if (!page) await sleep(1000);
     }
-    if (!page) throw new Error(conds.length ? `attach: no open tab matching ${shown} — open the game in that Chrome first (or \`list_tabs\` to see what's open)` : 'attach: no open tab in that Chrome — open the game first');
+    if (!page) {
+      // Name what IS open. We just spent the whole budget looking at these tabs, so making the caller run
+      // `list_tabs` to find out why the match missed is withholding an answer we already have.
+      const open = await listTabs(browser).catch(() => []);
+      const list = open.length
+        ? '\n  open tabs:\n' + open.map((t) => `    [${t.index}]${t.active ? ' (active)' : ''} ${showTitle(t.title)} — ${t.url}`).join('\n')
+        : ' (that Chrome has no tabs open)';
+      // Don't tell someone their title match is wrong when we simply couldn't read the titles.
+      const blind = conds.some((c) => c.field === 'title') && open.some((t) => t.title === null)
+        ? '\n  NOTE: at least one tab did not report a title in time, so a title match cannot rule it out — match on url instead, or retry once the tab settles.' : '';
+      await bail(err(conds.length
+        ? `attach: no open tab matching ${shown} after ${opts.attachTries ?? 8}s — fix the match (a list ANDs; title matches too), or open the game in that Chrome.${list}${blind}`
+        : `attach: no usable tab in that Chrome — open the game first.${list}`, { code: 'no-tab' }));
+    }
   } else {
-    page = await browser.newPage();
-    await page.setViewport(opts.viewport || { width: 414, height: 896, isMobile: true, hasTouch: true, deviceScaleFactor: 2 });
+    page = await guard(() => browser.newPage());
+    await guard(() => page.setViewport(opts.viewport || { width: 414, height: 896, isMobile: true, hasTouch: true, deviceScaleFactor: 2 }));
   }
 
   // Capture console + uncaught errors from ALL frames (no injection needed; survives reloads).
@@ -278,33 +369,79 @@ export async function connect(url, opts = {}) {
   // over it. That ~57kb of dead weight is why 'auto' is opt-in rather than the default for connect().
   if (isPixi() || auto) { try { await page.evaluateOnNewDocument(bundleFor('pixi')); } catch { /* attach-mode targets may refuse */ } }
 
-  if (!opts.attach) await page.goto(url, { waitUntil: 'load', timeout: opts.timeout ?? 60000 });
+  // guard(): the most common connect failure of all (dev server down / a url that times out) — it must
+  // not orphan the Chrome we just launched.
+  if (!opts.attach) await guard(() => page.goto(url, { waitUntil: 'load', timeout: opts.timeout ?? 60000 }));
 
   // Find the frame that has cc — the game is often inside a (possibly nested, possibly
   // cross-origin) iframe. page.frames() gives EACH frame its own evaluate context, so
   // cross-origin works here (unlike in-page JS, which SOP blocks). Drive that frame.
-  const hasCc = (f) => f.evaluate(async () => {
+  // 'ready' (an engine + a built scene/stage) | 'booting' (the engine is live but has nothing up yet) |
+  // 'none' (no engine at all). The booting/none split is what lets the find-loop below tell "wait, it's
+  // coming" from "nothing here", which are worth very different amounts of patience.
+  // try/catch, NOT .catch(): a detached frame's evaluate throws SYNCHRONOUSLY (puppeteer guards the call
+  // before it ever returns a promise), so the throw sails straight past a .catch() and out of the loop
+  // that calls this. A frame can detach between page.frames() and this call on any reloading page — i.e.
+  // routinely, in the build→reload loop copse is driven in.
+  // RACE-BOUNDED, like every other probe against a frame we don't control yet. A halted renderer answers
+  // an evaluate with neither a value NOR a throw — so an un-raced `await` here hung the find-loop forever,
+  // and findMs (checked only between iterations) could never fire. That put the 32-minute silent hang
+  // straight back into the recovery path this file exists to make safe: boot fails → bootFailed → next
+  // call reboots → find-loop → hang, with opTimeout powerless because it wraps the evaluate, not this.
+  // Verified before fixing: an op with opTimeout:4000 was still hanging at 12s.
+  const PROBE_MS = 2000;   // generous for a property read (+ a possible System.import), still finite
+  // "The renderer is halted" is a claim about the WHOLE tab, so it needs evidence from the whole tab: only
+  // if nothing answered and something timed out. A latch on "any frame was ever slow" is not that — one
+  // sluggish foreign iframe (ads/analytics/payments, and an editor preview is itself a cross-origin iframe)
+  // would convict the renderer, turning a recoverable mid-rebuild `no-engine` into `renderer-silent`, which
+  // is NOT recoverable and tells the caller to go resume a debugger that was never paused.
+  // The bias is deliberate: calling a halted renderer `no-engine` costs one pointless retry, while calling a
+  // mid-rebuild `renderer-silent` stops run_script dead and sends a human hunting a breakpoint. A throw
+  // counts as an answer — it means something is alive enough to refuse us.
+  let probeAnswered = false, probeTimedOut = false;
+  // One race, both engines: the bound is a property of the FRAME (is this renderer answering at all?), not
+  // of which engine we're asking about, so cocos and pixi must not each grow their own copy of it.
+  const probe = async (f, fn) => {
+    let timer;
+    try {
+      return await Promise.race([
+        f.evaluate(fn).then((v) => { probeAnswered = true; return v; }),
+        new Promise((res) => { timer = setTimeout(() => { probeTimedOut = true; res('none'); }, PROBE_MS); }),
+      ]);
+    } catch { probeAnswered = true; return 'none'; }
+    finally { clearTimeout(timer); }   // the evaluate won → the timer must not fire and claim silence
+  };
+  const ccState = (f) => probe(f, async () => {
     let cc = window.cc;
     if ((!cc || !cc.director) && window.System) { try { cc = (await System.import('cc')).default || await System.import('cc'); } catch {} }
-    if (!(cc && cc.director && cc.director.getScene)) return false;
-    window.cc = cc; const s = cc.director.getScene(); return !!(s && (s.children || []).length);
-  }).catch(() => false);
+    if (!(cc && cc.director && cc.director.getScene)) return 'none';
+    window.cc = cc; const s = cc.director.getScene();
+    return (s && (s.children || []).length) ? 'ready' : 'booting';
+  });
   // Pixi's equivalent: an Application with a populated stage, from the init-hook capture or any of the
   // devtools globals (the bundle's own findPixi ladder covers the same ground once it's installed).
-  const hasPixi = (f) => f.evaluate(() => {
+  // An app with an EMPTY stage is 'booting' for the same reason a sceneless cc.director is — Application
+  // .init has run but the game hasn't put anything on screen yet, and that is worth waiting through.
+  const pixiState = (f) => probe(f, () => {
     const app = (window.__copse && window.__copse.app)
       || (window.__copsePixi && window.__copsePixi.app)
       || (window.__PIXI_DEVTOOLS__ && window.__PIXI_DEVTOOLS__.app)
       || window.__PIXI_APP__;
-    return !!(app && app.stage && (app.stage.children || []).length);
-  }).catch(() => false);
-  // In AUTO, probe both and let the page decide. Cocos is tried first only because it's the primary
-  // lane; the two are mutually exclusive in practice (a Pixi page has no `window.cc`).
-  const detectEngine = async (f) => (await hasCc(f)) ? 'cocos' : (await hasPixi(f)) ? 'pixi' : null;
-  const hasEngine = (f) => (auto ? detectEngine(f).then(Boolean) : (isPixi() ? hasPixi(f) : hasCc(f)));
+    if (!(app && app.stage)) return 'none';
+    return (app.stage.children || []).length ? 'ready' : 'booting';
+  });
+  // In AUTO, probe both and let the page decide; the engine that answers is the answer. Cocos is tried
+  // first only because it's the primary lane, and the two are mutually exclusive in practice (a Pixi page
+  // has no `window.cc`). A 'booting' cocos answer still short-circuits: it means cc IS there.
+  const engineState = async (f) => {
+    if (!auto) return { state: await (isPixi() ? pixiState(f) : ccState(f)), engine };
+    const cc = await ccState(f);
+    if (cc !== 'none') return { state: cc, engine: 'cocos' };
+    const px = await pixiState(f);
+    return { state: px, engine: px === 'none' ? null : 'pixi' };
+  };
 
   let frame = page.mainFrame();
-  const rawEv = (fn, ...a) => frame.evaluate(fn, ...a); // used DURING init (must NOT await `ready`)
   // heat control: cap fps low for our headless launch (NOT pause — pausing can freeze a game still
   // loading). In attach mode it's the user's real browser/GPU, so leave its fps alone unless asked.
   const fps = opts.fpsCap ?? (opts.attach ? null : 10);
@@ -316,31 +453,104 @@ export async function connect(url, opts = {}) {
   // __copse installs → `ready` resolves). See the pause auto-detect below.
   // Framework adapters to inject once __copse is up (resolved once; re-injected on every boot/reload
   // since a navigation wipes the in-page registry). Empty unless a copse.frameworks.mjs / opts.frameworks exists.
-  const fwAdapters = await resolveFrameworks(opts);
+  const fwAdapters = await guard(() => resolveFrameworks(opts));   // a typo'd --framework path throws here, post-browser
 
   // Find the cc frame → inject the bundle → install __copse → settle to a UI scene. Factored out so
   // `cp.reload()` can re-run it after a navigation (a reload replaces the frames + wipes __copse).
-  const bootInPage = async () => {
-    for (let i = 0, n = opts.bootTries ?? 40; i < n; i++) {
-      let found = null;
+  // Init progress, published so a caller kept waiting is TOLD which phase is slow rather than just made
+  // to wait. The reported session's core complaint wasn't the waiting, it was that 32 minutes of silence
+  // gave it no way to tell "game stuck" from "script wrong" from "connection dead".
+  let bootPhase = 'starting', bootAt = Date.now();
+  // Poll granularity for the find/scene waits. The BUDGETS below stay in seconds (bootTries/readyTries are
+  // ~1s counts, and are public options), but a healthy reboot finds the engine in ~2ms and shouldn't pay up
+  // to a full second of dead sleep to notice.
+  const POLL = 250;
+  // The diagnosis for "this page has no engine on it", kept as one string because it is thrown from the
+  // find phase AND quoted by doctor. It used to be a bare `Cannot read properties of undefined (reading
+  // 'snapshot')` from the first read, which is both useless and hides the finding the caller needs.
+  // The "what to do about it" half is IDENTICAL for both ways a page can turn out to have no engine
+  // (nothing answered the find probe; __copse never installed), so it is written once — two copies of a
+  // user-facing paragraph drift silently, and only one of them ever gets the fix.
+  const NO_ENGINE_HELP = 'Looked for a live cc.director scene and a Pixi Application (init hook / __PIXI_APP__ / devtools globals). '
+    + 'If this is a Pixi game you ATTACHED to after load, reconnect with engine:"pixi" so the pre-boot hook can arm; '
+    + 'if it is a release Cocos build, `cc` may be tree-shaken away (docs/INJECT.md). Run `doctor` for the full report.';
+  const noEngineMsg = (findMs) => `copse: no frame in this tab has a live ${auto ? 'engine' : engine} after ${Math.round(findMs / 1000)}s (phase=finding-engine). `
+    + 'The tab is probably still loading, on the wrong page, or the build is mid-rebuild — retry once the game is up. '
+    + NO_ENGINE_HELP;
+  // findMs/sceneMs are passed per-boot so a REBOOT can be impatient where a cold boot must not be — same
+  // code, different patience. See reboot() below for why.
+  const bootInPage = async ({ findMs = (opts.bootTries ?? 40) * 1000, sceneMs = (opts.readyTries ?? 25) * 1000 } = {}) => {
+    bootPhase = 'finding-engine'; bootAt = Date.now(); probeAnswered = false; probeTimedOut = false;
+    let found = null, booting = null, foundEngine = null, bootingEngine = null;
+    for (let t0 = Date.now(); Date.now() - t0 < findMs && !found;) {
+      booting = null; bootingEngine = null;
       for (const f of page.frames()) {
-        if (auto) { const e = await detectEngine(f); if (e) { engine = e; engineDetected = true; found = f; break; } }
-        else if (await hasEngine(f)) { found = f; break; }
+        // The budget has to be checked HERE too, not just between rounds: each probe can cost the full
+        // PROBE_MS, so a page with several unresponsive frames overshoots findMs by a whole round.
+        if (Date.now() - t0 >= findMs) break;
+        const st = await engineState(f);
+        if (st.state === 'ready') { found = f; foundEngine = st.engine; break; }
+        if (st.state === 'booting' && !booting) { booting = f; bootingEngine = st.engine; }
       }
-      if (found) { frame = found; break; }
-      await sleep(1000);
+      if (!found && Date.now() - t0 < findMs) await sleep(POLL);   // don't sleep out a budget that's already spent
     }
-    // Nothing answered. Fall back to cocos so the rest of the boot (and `doctor`'s report) still runs
-    // over a defined engine — `engineDetected:false` is what tells a caller the page never identified
-    // itself, which for doctor is the single most useful finding it can report.
+    // No scene yet but the engine IS live → drive that frame anyway and let the install wait below cover the
+    // last stretch of the engine's boot (the bundle self-installs once the engine is reachable). Note this
+    // now picks the frame that actually HAS the engine; the old fall-through injected into page.mainFrame()
+    // regardless, which is simply the wrong frame when the game is in an iframe.
+    if (found || booting) {
+      frame = found || booting;
+      // In `auto`, whichever probe answered IS the answer — record it before anything branches on isPixi().
+      const e = foundEngine || bootingEngine;
+      if (auto && e) { engine = e; engineDetected = true; }
+    }
+    // But if NOTHING answered, injecting anywhere is hopeless — we just spent the entire find budget
+    // proving no engine is in this tab, and waiting another installTimeout for a __copse that cannot appear
+    // adds silence to a question already answered. Say so instead. (Measured: this alone was 10s of the
+    // 25s a single op paid after a reload landed mid-rebuild.)
+    //
+    // This MUST throw rather than return a degraded session: a boot that returns leaves `frame` anchored to
+    // page.mainFrame() — a perfectly LIVE frame with no game on it. Nothing about it is "detached", so
+    // isDetached() never fires, reboot is never retried, and the session stays broken even after the game
+    // comes back healthy. Throwing is what lets trackBoot record it and the next call retry. See the
+    // bootFailed note below; pinned by test/driver-reconnect.l2.test.js.
+    //
+    // "no engine here" and "nobody answered" are different answers and must not share one message: a silent
+    // frame is a renderer that isn't running JS at all, which retrying cannot fix (hence not recoverable).
+    else if (!probeAnswered && probeTimedOut) { engine = engine ?? 'cocos'; engineResolved = true; throw err(`copse: no frame in this tab answered an engine probe within ${Math.round(findMs / 1000)}s (phase=finding-engine) — the renderer isn't running JS at all, which almost always means it's halted at a breakpoint. Resume the tab, then retry.`, { code: 'renderer-silent' }); }
+    // recoverable: the overwhelmingly common cause is a tab that's mid-rebuild or still loading, which
+    // fixes itself. It can also be a tab on the wrong page, which won't — but retrying that is cheap and
+    // harmless, whereas refusing to retry the common case is what wedged sessions in the first place.
+    else { engine = engine ?? 'cocos'; engineResolved = true; throw err(noEngineMsg(findMs), { recoverable: true, code: 'no-engine' }); }
+    // Nothing below may still be guessing: fall back to cocos so the rest of the boot (and `doctor`'s
+    // report) runs over a defined engine — `engineDetected:false` is what tells a caller the page never
+    // identified itself, which for doctor is the single most useful finding it can report.
     if (engine == null) engine = 'cocos';
     engineResolved = true;
+    bootPhase = 'injecting';
+    // Every remaining boot step is race-bounded like the find phase was — a renderer can halt BETWEEN
+    // phases (the probe answers 'booting', then a breakpoint in some component's onLoad fires) and an
+    // unbounded evaluate here hung the boot promise forever: sceneMs is only checked between awaits, so it
+    // never fired; trackBoot never settled, so bootFailed/cooldown never engaged; and runBoot's queue means
+    // every LATER boot waited behind the hung one — every call then died at its own deadline classified as
+    // "[recoverable] reconnecting… retry", an agent retried forever, and the one true diagnosis (resume the
+    // debugger) never surfaced. A mid-boot hang must FAIL the boot, loudly, with the renderer named.
+    const BOOT_STEP_MS = 10000;
+    const bootEv = async (fn, ...a) => {
+      let timer;
+      try {
+        return await Promise.race([
+          frame.evaluate(fn, ...a),
+          new Promise((_, rej) => { timer = setTimeout(() => rej(err(`copse: the renderer stopped answering mid-boot (phase=${bootPhase}) — almost certainly halted at a breakpoint. Resume the tab, then retry.`, { code: 'renderer-silent' })), BOOT_STEP_MS); }),
+        ]);
+      } finally { clearTimeout(timer); }
+    };
     // Cocos: the bundle goes in now (the engine is already up, so there's nothing to pre-arm).
     // Pixi: evaluateOnNewDocument already ran it pre-boot in launch mode — but re-evaluating is
     // idempotent (installInitHook/install both no-op when already present) and is the ONLY path in
     // attach mode, where the page loaded before we ever saw it.
-    await frame.evaluate(bundleFor(engine));
-    await frame.evaluate((pixi) => {
+    await bootEv(bundleFor(engine));
+    await bootEv((pixi) => {
       if (window.__copse) return;
       if (!window.copse) return;
       if (pixi) window.copse.autoInstall();               // findPixi ladder → install (null-safe)
@@ -349,47 +559,168 @@ export async function connect(url, opts = {}) {
       // opaque crash. The bundle's own auto-install already gates on findCC(); this call must too.
       else if (window.cc && window.cc.director) window.copse.install(window.cc);
     }, isPixi());
-    // A page with NO engine (a plain page, a release build whose `cc` was tree-shaken, a Pixi game
-    // attached to after boot) never installs `__copse`. That must NOT throw: it is the exact
-    // situation `doctor` exists to diagnose, and a crash tells the user nothing. Record it, let the
-    // in-page reads degrade, and let `engineDetected`/`installed` carry the finding.
-    installed = await frame.waitForFunction(() => !!window.__copse, { timeout: 10000 }).then(() => true, () => false);
-    if (!installed) return;                               // skip framework/fps/ready — there's nothing to talk to
-    // register framework adapters (PureMVC etc.) into the fresh __copse before anything reads state
-    for (const a of fwAdapters) { try { await frame.evaluate((x) => { try { window.__copse.registerFramework && window.__copse.registerFramework(x); } catch { /* */ } }, adapterToInjectable(a)); } catch { /* */ } }
-    if (fps != null) await rawEv(([f, pixi]) => {
+    // installTimeout:0 must mean "don't wait", NOT "wait forever" — but puppeteer reads timeout:0 as
+    // DISABLE THE TIMEOUT, so passing it through inverts the option into an unbounded hang. Skip instead.
+    const installMs = opts.installTimeout ?? 10000;
+    // waitForFunction THROWS on timeout, so reaching the next line already proves __copse is up — asking
+    // the page again would be a second round-trip for an answer we hold. Only the "don't wait" path
+    // (installTimeout:0) has to go and look.
+    if (installMs > 0) { await frame.waitForFunction(() => !!window.__copse, { timeout: installMs }); installed = true; }
+    else installed = await bootEv(() => !!window.__copse).catch(() => false);
+    // register framework adapters (PureMVC etc.) into the fresh __copse before anything reads state.
+    // A broken adapter is survivable (swallow it); a renderer that stopped answering is not — rethrow that
+    // one, or the very next step just times out again with less context.
+    for (const a of fwAdapters) { try { await bootEv((x) => { try { window.__copse.registerFramework && window.__copse.registerFramework(x); } catch { /* */ } }, adapterToInjectable(a)); } catch (e) { if (e && e.code === 'renderer-silent') throw e; } }
+    if (fps != null) await bootEv(([f, pixi]) => {
       if (pixi) { try { const t = window.__copse.app.ticker; t.maxFPS = f; } catch {} return; }
       const G = window.cc.game; try { G.frameRate = f; } catch {} try { G.setFrameRate && G.setFrameRate(f); } catch {}
     }, [fps, isPixi()]);
-    // Wait until the scene is actually LIVE before returning. A slow headless-CI SwiftShader renderer
-    // can take 20s+ to boot the first scene (pptr.dev/troubleshooting), and returning early makes the
-    // caller's first coverage/press read a null/empty scene. Break as soon as there are interactive
-    // buttons (fully ready); track `alive` so a genuinely button-less scene can still stop the wait
-    // once it's up rather than spinning the whole budget on a loading screen. snapshot() degrades to
-    // [] until the scene is live, so these reads never throw.
-    for (let i = 0, n = opts.readyTries ?? 45; i < n; i++) {
-      const st = await rawEv((pixi) => {
-        try {
-          const root = pixi ? (window.__copse && window.__copse.app && window.__copse.app.stage) : window.cc.director.getScene();
-          const alive = !!(root && (root.children || []).length);
-          let buttons = 0; try { buttons = window.__copse.interactive().length; } catch { /* pre-install */ }
-          return { alive, buttons };
-        } catch { return { alive: false, buttons: 0 }; }
-      }, isPixi());
-      if (st.buttons > 0) break;                       // fully ready (a live scene WITH pressable controls)
-      if (st.alive && i >= 8) break;                   // live but no buttons after a grace period → a genuinely button-less scene
-      await sleep(1000);
+    // Gate on the RUNTIME being usable (a scene/stage exists), NOT on "are there buttons yet". interactive()
+    // only counts cc.Button, so a screen whose only entry point is a bare node with a touch handler (a
+    // cocos intro's ClickToPlay) can NEVER satisfy it: every attach there burned the whole injectStallMs
+    // spinning and then reported a bogus "still settling", when __copse had been up for seconds. Whether
+    // there is anything to press is the CALLER's judgement (orient/snapshot already report it) — it was
+    // never a readiness condition. A scene is O(1) to check and is already up on a loading/intro screen,
+    // so this settles immediately there, while still keeping a fresh launch from handing back a session
+    // whose getScene() is null (goto resolves on `load`, before the engine has built a scene).
+    // NOT a hard gate — this loop just falls through when it runs out, and a scene that never appears
+    // stays the CALLER's call (per the paragraph above).
+    // Polled from NODE, deliberately, not via frame.waitForFunction({polling:'raf'}): rAF is FROZEN in a
+    // hidden tab, so an in-page poll never runs there at all. Measured — a condition that became true at
+    // 1s: visible tab 960ms, hidden tab NEVER (timed out at 8s). attach means driving your own browser,
+    // where the game tab routinely isn't the frontmost one, so every reboot would have paid the full
+    // budget instead of the ~ms this work exists to deliver: the optimization silently destroying the
+    // thing it optimized, and every reconnect number here measured on a visible tab. CDP evaluate is not
+    // throttled (measured: 1ms on a hidden tab), so polling from out here keeps the 250ms granularity AND
+    // is immune to visibility. A detach mid-wait propagates, which is correct: the page moved, so this
+    // boot is void and must be retried, not quietly completed.
+    bootPhase = 'waiting-scene';
+    for (let t0 = Date.now(); Date.now() - t0 < sceneMs;) {
+      // a silent renderer throws out of the boot (bootEv), it doesn't stall it
+      if (await bootEv((pixi) => {
+        try { return !!(pixi ? (window.__copse && window.__copse.app && window.__copse.app.stage) : window.cc.director.getScene()); } catch { return false; }
+      }, isPixi())) break;
+      await sleep(POLL);
     }
+    bootPhase = 'ready';
   };
-  const ready = bootInPage();
+  // A boot that FAILS (no cc found, or __copse never installed) leaves `frame` anchored to whatever
+  // bootInPage last set — and when the find-loop comes up empty that's page.mainFrame(): a perfectly
+  // LIVE frame with no game on it. Nothing about it is "detached", so isDetached() below never fires
+  // again, reboot is never retried, and the session is wedged FOREVER: every later call throws
+  // `__copse is undefined` and it stays broken even after the game comes back healthy. That is what
+  // turned "the preview happened to reload mid-rebuild" into "reconnect by hand, every time". Track the
+  // failure instead, so the next call retries it. Pinned by test/driver-reconnect.l2.test.js.
+  let bootFailed = null;   // null | { at, error }
+  const trackBoot = (p) => p.then((v) => { bootFailed = null; return v; },
+    // A boot killed by a detach failed because the page moved under it, not because the page is broken —
+    // the world already changed, so there is nothing to cool down from. at:0 → the next call retries at once.
+    (e) => { bootFailed = { at: isDetached(e) ? 0 : Date.now(), error: (e && e.message) || String(e) }; throw e; });
+  // A navigation means the world just changed, so a failed boot is worth retrying NOW rather than after the
+  // cooldown — the build-finished→preview-reloads case, where the retry succeeds in ~4ms.
+  // ANY frame, not just mainFrame: the game this tool exists for lives in an IFRAME (verified on the real
+  // editor preview — cc sits in a cross-origin iframe), and when that preview reloads it is the IFRAME that
+  // navigates. Filtering on mainFrame meant the self-heal never fired for the one shape that matters; the
+  // measurement that "proved" it healed had navigated the whole tab, which is not what a preview does.
+  // A timestamp, not a mutation of bootFailed.at: the ordering runs both ways (a navigation usually fires
+  // BEFORE the boot it kills rejects), so the two facts have to be comparable rather than one overwriting
+  // the other and losing the cancel.
+  let lastNavAt = 0;
+  page.on('framenavigated', () => { lastNavAt = Date.now(); });
 
   // Auto-reconnect (SUGGESTIONS #6): the page reloads a lot during testing (game refresh, mock-token
   // swap), which detaches the frame + wipes __copse → every in-page call throws "detached Frame". Detect
   // that class of error and TRANSPARENTLY re-find the cc frame + re-inject once, then retry — so a caller
   // never has to manually reconnect after a navigation. reboot() is de-duped so concurrent calls share one.
   const isDetached = (e) => { const m = (e && e.message) || String(e); return /detached|context was destroyed|Cannot find context|Target closed|Session closed|page has been closed/i.test(m); };
-  let rebooting = null;
-  const reboot = () => (rebooting || (rebooting = (async () => { frame = page.mainFrame(); await bootInPage(); })().then((v) => { rebooting = null; return v; }, (e) => { rebooting = null; throw e; })));
+  // A page can wipe __copse WITHOUT detaching anything. An iframe that navigates IN PLACE (`f.src = f.src`,
+  // a soft preview reload, the game redirecting itself) keeps its Frame object — verified: still in
+  // page.frames(), detached:false, evaluate still succeeds — and simply gets a fresh document. The call
+  // then fails with a plain TypeError from reaching into `window.__copse`, which isDetached() cannot see,
+  // so no reboot fires and the session wedges exactly as it did before any of this work. Every reconnect
+  // measurement here (including on a real editor preview) used page.reload(), the shape that DOES detach —
+  // so the whole mechanism rested on a premise the iframe case never satisfies.
+  // Ask the page rather than pattern-match the error: __copse missing is the fact that matters, and a
+  // TypeError from the game's own code must not be mistaken for it.
+  // async + try/catch, NOT .then(v,()=>false): a frame that detaches between the failed op and this probe
+  // makes evaluate throw SYNCHRONOUSLY (the same hole ccState's comment documents — and the same mistake,
+  // repeated), and a `.then` rejection handler never sees a sync throw, so the raw unbranded detach error
+  // escaped the recovery entirely. And if we can't even ask, the frame IS gone — that's a yes, not a no.
+  const copseGone = async () => {
+    try { return !!(await frame.evaluate(() => !window.__copse)); }
+    catch { return true; }
+  };
+
+  let reinjects = 0;
+  // ONE boot at a time, for EVERY entry point — the initial `ready`, a detach-driven reboot, and reload().
+  // bootInPage mutates connect-scoped state (`frame`, `engine`, bootPhase/bootAt, probeAnswered/probeTimedOut,
+  // and through
+  // trackBoot bootFailed), so two of them interleaving means the last to settle wins: a healthy boot marked
+  // failed by the other's rejection, or `frame` left on whatever the loser found. The old guard only deduped
+  // reboot against reboot, which the reachable case walks straight past — attach returns stalled with `ready`
+  // still booting, the caller does what the connect note tells them and reloads, and reload's boot races the
+  // initial one.
+  let inFlight = null;   // { at, p } — `at` is when the boot actually STARTED (Infinity until it does)
+  const runBoot = (budget, { notBefore = 0, reinject = false } = {}) => {
+    // Joining an in-flight boot is only sound if that boot can have SEEN the document the caller cares
+    // about. One that hasn't started yet (at = Infinity) will observe whatever exists when it does, so it
+    // is fresh for everybody; one that started before the caller's navigation cannot be, so that caller
+    // queues behind it rather than being handed a boot of the page that is already gone.
+    if (inFlight && inFlight.at >= notBefore) return inFlight.p;
+    const prev = inFlight ? inFlight.p.catch(() => {}) : Promise.resolve();   // a prior boot's failure must not poison the chain
+    const rec = { at: Infinity, p: null };
+    rec.p = trackBoot(prev.then(async () => {
+      rec.at = Date.now();
+      frame = page.mainFrame();   // a navigation replaced every frame; bootInPage re-finds the cc one
+      await bootInPage(budget);
+      if (reinject) {
+        reinjects++;
+        // Re-injection installs a FRESH __copse, so any patch/hold hooks the caller put in the page are gone
+        // (bootInPage re-registers framework adapters; caller hooks it can't know about). Say so — a silent
+        // re-inject turns "my patch stopped firing" into a false green that's very hard to trace back here.
+        cap('warn', 'copse: re-injected after a navigation — window.__copse is fresh, so any patch/hold hooks you installed are GONE (framework adapters were re-registered automatically). Re-apply them if this flow depends on them.');
+      }
+    }));
+    inFlight = rec;
+    rec.p.catch(() => {}).then(() => { if (inFlight === rec) inFlight = null; });
+    return rec.p;
+  };
+
+  const ready = runBoot({});   // the initial boot — cold budget, nothing to queue behind, not a re-inject
+  let readySettled = false;
+  ready.then(() => { readySettled = true; }, () => { readySettled = true; });  // also keeps an init failure from tripping unhandled-rejection
+
+  // A reboot gets its OWN, much smaller budget than a cold connect — for EVERY wait phase, not just the
+  // find. A cold boot may be waiting on a game booting from nothing; a reboot is waiting on a game that
+  // was alive moments ago (measured: a healthy reload is back in ~2s on the real preview, and re-found in
+  // ~2ms when it's already up). Overshooting is what made ONE op block for the whole cold budget.
+  // Undershooting is cheap now that a failed boot is recoverable: the cost is one visible retry (the
+  // cooldown below, which the next navigation cancels), not a wedged session.
+  // Callers pass `lastNavAt` as the freshness mark rather than Date.now(): every op knocked over by the
+  // SAME navigation then shares one boot instead of each queueing its own, while a boot older than that
+  // navigation is still correctly refused.
+  const reboot = (notBefore = 0) => { const ms = (opts.rebootTries ?? 15) * 1000; return runBoot({ findMs: ms, sceneMs: ms }, { notBefore, reinject: true }); };
+
+  // `ready` is deliberately NOT awaited in attach mode (a tab paused in the debugger, or one that simply
+  // hasn't booted yet, must not hang connect) — so it can still be pending here, and if the renderer is
+  // halted it stays pending forever. ev() used to open with a bare `await ready`, so every call then
+  // blocked on init unbounded and silently: one real session sat there 1953s (32 min) and only stopped
+  // because the MCP host's idle timeout cut it.
+  //
+  // The wait is SHORT on purpose, and answering "not yet" is not the same as giving up: the boot keeps
+  // running in the background, so the next call may just succeed. This gate only ever fires when someone
+  // attaches to a not-yet-ready tab and drives it immediately — a state connect ALREADY reported as
+  // stalled/paused. Waiting out a long budget there adds silence, not information; naming the phase and
+  // handing control back adds information. Anyone who genuinely wants to block can raise readyTimeout.
+  const readyBudget = opts.readyTimeout ?? 5000;
+  const readyGate = async () => {
+    if (readySettled) return;   // fast path: once init has settled, no race and no timer per call
+    let timer;
+    const stuck = await Promise.race([ready.then(() => false, () => false), new Promise((res) => { timer = setTimeout(() => res(true), readyBudget); })]);
+    clearTimeout(timer);
+    if (stuck) throw err(`copse: in-page init hasn't finished yet (phase=${bootPhase}, ${((Date.now() - bootAt) / 1000).toFixed(1)}s elapsed) — it's still running, so retry in a moment. If it never clears: phase=finding-cc means no frame has a live cc scene (tab still loading / on the wrong page / game never booted), and any phase stuck for minutes usually means the renderer is halted at a breakpoint.`,
+      { recoverable: true, code: 'init-pending' });   // init is still running — the retry is the whole point
+  };
 
   // Public evaluator: in-page calls wait for init, so a paused/deferred attach auto-unblocks them once
   // you resume. For launch + a live attach, `ready` is already settled → no extra delay. On a detached
@@ -398,34 +729,131 @@ export async function connect(url, opts = {}) {
   // rather than hoped for. bootInPage's `installed:false` path leaves `window.__copse` undefined; a
   // read then died on `Cannot read properties of undefined (reading 'snapshot')`, which is both
   // useless and hides the diagnosis the caller needs. Fail with the finding instead.
-  const notInstalled = () => new Error(
-    `copse is not installed on this page — no ${engineDetected ? engine : 'engine'} was found. `
-    + 'Looked for a live cc.director scene and a Pixi Application (init hook / __PIXI_APP__ / devtools globals). '
-    + 'If this is a Pixi game you ATTACHED to after load, reconnect with engine:"pixi" so the pre-boot hook can arm; '
-    + 'if it is a release Cocos build, `cc` may be tree-shaken away (docs/INJECT.md). Run `doctor` for the full report.',
+  // Goes through err(), like every other SESSION failure: this was the one runtime path still throwing a
+  // bare Error, so it carried no `copse` brand and no code — errClass() read nothing off it and a caller
+  // branching on the class silently fell through to prose-matching on exactly the diagnosis it most needs
+  // to act on. (The bare `new Error`s above are pre-connect CONFIG errors — "you called this wrong" — and
+  // deliberately stay unclassed; they are not something a retry or a reconnect can address.)
+  // Not recoverable: reaching here means the boot SUCCEEDED and there is still no engine, so retrying
+  // re-finds the same engine-less page. The fix is a different page or a different `engine` option.
+  const notInstalled = () => err(
+    `copse is not installed on this page — no ${engineDetected ? engine : 'engine'} was found. ${NO_ENGINE_HELP}`,
+    { code: 'not-installed' },
   );
-  const ev = async (fn, ...a) => {
-    await ready;
-    if (!installed) throw notInstalled();
-    try { return await frame.evaluate(fn, ...a); }
-    catch (e) { if (!isDetached(e)) throw e; await reboot(); return frame.evaluate(fn, ...a); }
+  const REBOOT_COOLDOWN = opts.rebootCooldown ?? 2000;
+  // The LAST unbounded wait. readyGate above only covers init; once init has settled it's a no-op, and
+  // this evaluate then had no bound at all — so a renderer that wedges AFTER connect (a breakpoint hit
+  // mid-session, a game whose JS thread spins) hung every call forever, silently. Same 32-minute hole the
+  // readyGate closed, entered at a later moment (verified: a post-connect wedge was still hanging with no
+  // signal). Most ops are milliseconds, so a generous bound never fires for them and only caps the hang.
+  // NOT recoverable: the renderer is halted, so an automatic retry just re-hangs for another full budget.
+  // A non-positive cap falls back to the default rather than meaning "unbounded": this deadline exists
+  // precisely so nothing hangs silently, and `opTimeout:0` / `eval({timeout:'0'})` reintroduced the very
+  // 32-minute hang it was added to kill — through the knob its own error message points you at. There is
+  // deliberately no way to switch it off; if an op is legitimately long, give it a large number.
+  const positive = (ms, dflt) => (ms > 0 ? ms : dflt);
+  const OP_TIMEOUT = positive(opts.opTimeout, 60000);
+  // The deadline wraps the WHOLE call — readyGate and the reboot recovery included, not just the evaluate.
+  // Bounding only the evaluate made the number a lie: `eval({timeout:'5s'})` could still burn readyGate
+  // (5s) + a full reboot (~40s) before the 5s cap was even armed. A caller who says "5s" means the call,
+  // not one interior step of it.
+  const evWith = async (deadlineMs, fn, ...a) => {
+    deadlineMs = positive(deadlineMs, OP_TIMEOUT);
+    // `sent` — the op has actually been handed to the page. Every claim the deadline/retry logic makes
+    // hinges on this bit: before it, the op provably never ran, so failing or retrying is FREE; after it,
+    // "failed" can no longer mean "didn't happen". The old unbounded ev() never reported failure before the
+    // op ran, so callers could safely read failure as not-run — the deadline broke that invariant, and an
+    // agent told "[recoverable] … retry" re-fired presses that a zombie run then ALSO fired (double bet).
+    // `sent` is only assigned after frame.evaluate returns its promise — a detached frame throws
+    // synchronously, and that path must read as "never sent".
+    // `abandoned` — the deadline already REPORTED this call as failed. A zombie run that later finishes its
+    // reboot must not fire the original op after the fact.
+    let sent = false, abandoned = false;
+    const lateAbort = () => err('copse: this call was already reported as timed out — refusing to fire it late (the caller may have retried it already).', { code: 'op-timeout' });
+    const run = (async () => {
+      await readyGate();   // an init FAILURE isn't rethrown here — bootFailed carries it, so there's one recovery path, not two
+      if (bootFailed) {
+        // Re-paying the whole boot budget on every call is the opposite failure (a 3-step script paying it
+        // per step, linearly); inside the cooldown, fail fast with the real reason instead — UNLESS a
+        // navigation has landed since the failure, which is the whole point of the cooldown being cancellable.
+        if (Date.now() - bootFailed.at < REBOOT_COOLDOWN && lastNavAt <= bootFailed.at) throw err(`copse: not attached to a live game — the last (re)connect failed: ${bootFailed.error}. It retries on the next call; reconnect if the tab is on the wrong page.`,
+          { recoverable: true, code: 'boot-failed' });
+        await reboot(lastNavAt);
+      }
+      // A boot can SUCCEED and still leave nothing to talk to: no engine was found on the page, so
+      // __copse never installed (see notInstalled). That is NOT a connection fault, so it must not take
+      // the reboot/retry path above — re-finding the same engine-less page 15 times just launders a
+      // diagnosis into a timeout. Report the finding, once, and let the caller act on it.
+      if (!installed) throw notInstalled();
+      try {
+        if (abandoned) throw lateAbort();
+        const p = frame.evaluate(fn, ...a);   // sync throw (detached frame) → `sent` stays false
+        sent = true;
+        return await p;
+      } catch (e) {
+        const det = isDetached(e);
+        if (!det && !(await copseGone())) throw e;   // a real in-page error — the game's, not the session's
+        // IN FLIGHT when the world moved: the op reached the page and may have taken effect before the
+        // context died — unknowable from here. Silently re-firing it was the old behavior, and for a
+        // press/pm_set that's a double actuation; for a watch it silently restarted the whole window and
+        // returned a timeline that starts AFTER the navigation. Hand the ambiguity to the caller instead.
+        if (det && sent) throw err('copse: the page navigated while this call was IN FLIGHT — it may or may not have taken effect. If it mutates state (press/pm_set/pm_notify), verify before retrying: a blind retry can fire it twice. Reads are safe to just retry.',
+          { recoverable: true, code: 'interrupted' });
+        // Never sent (sync detached throw), or the fn provably died on a missing __copse (copseGone) —
+        // nothing ran, so a transparent reboot+retry is safe.
+        await reboot(lastNavAt);
+        if (abandoned) throw lateAbort();
+        try {
+          const p = frame.evaluate(fn, ...a);
+          sent = true;
+          return await p;
+        } catch (e2) {
+          if (!isDetached(e2)) throw e2;
+          throw err('copse: the page navigated AGAIN while this call was being retried — wait for it to settle, then retry.', { recoverable: true, code: 'reconnecting' });
+        }
+      }
+    })();
+    run.catch(() => {});   // if the deadline wins, this may still settle later — don't trip unhandled-rejection
+    let timer;
+    // WHAT the call was doing when the clock ran out decides what to say and whether a retry helps.
+    // `sent` is the honest divider — NOT bootPhase, which is also non-'ready' during the INITIAL attach
+    // boot (where "the page navigated" would assert an event that never happened):
+    //   never sent → nothing ran; retrying is safe by construction (and the zombie is barred above).
+    //   sent       → the op is still running in the page and may complete AFTER this error — say so, so a
+    //                mutating caller verifies instead of blindly re-firing.
+    const capped = new Promise((_, rej) => {
+      timer = setTimeout(() => {
+        abandoned = true;
+        rej(!sent
+          ? err(`copse: call gave up after ${Math.round(deadlineMs / 1000)}s — the session is still ${bootPhase !== 'ready' ? `getting to the game (phase=${bootPhase})` : 'recovering the connection'}, and the op was never sent to the page: nothing ran, retrying is safe. If this never clears, the renderer is probably halted at a breakpoint.`,
+            { recoverable: true, code: 'reconnecting' })
+          : err(`copse: in-page call didn't return within ${Math.round(deadlineMs / 1000)}s — the renderer is almost certainly halted (a breakpoint, or the game's JS thread stuck in a loop). The call is STILL RUNNING in the page and may complete after this error: if it mutates state, verify before retrying. Resume the tab, or reconnect. Raise opTimeout (or pass a timeout) if this op legitimately takes longer.`,
+            { code: 'op-timeout' }));
+      }, deadlineMs);
+    });
+    try { return await Promise.race([run, capped]); } finally { clearTimeout(timer); }
   };
+  const ev = (fn, ...a) => evWith(OP_TIMEOUT, fn, ...a);
 
   // Two DISTINCT attach conditions, kept apart so connect never hangs AND never mislabels one as the
   // other (they were conflated into one `paused` before, so a still-loading game read as "paused in the
   // debugger"). `paused` = a trivial evaluate won't even return → the renderer is genuinely HALTED
-  // (debugger/OOPIF). `stalled` = evaluate returns fine, but init didn't settle within injectStallMs —
-  // almost always because the game is on a loading/intro screen with no interactive buttons yet (readyTries
-  // waits for interactive()>0); __copse is typically already installed, so snapshot/probe work — it's just
-  // not "ready" by the buttons heuristic. Launch can't be pre-paused → await fully (init errors still throw).
+  // (debugger/OOPIF). `stalled` = evaluate returns fine, but init didn't finish within injectStallMs —
+  // the bundle/__copse install is still queued, or the engine has no scene up yet. This used to fire on
+  // any intro screen (init waited for interactive()>0, which a Button-less intro never reaches); it now
+  // means init genuinely didn't complete. Launch can't be pre-paused → await fully (init errors still throw).
   let paused = false, stalled = false;
   if (!opts.attach) {
-    await ready;
+    try { await ready; } catch (e) { await bail(e); }   // a launch whose init failed must not leave its Chrome running
   } else {
     const probe = await Promise.race([page.evaluate(() => 1).then(() => 'live', () => 'live'), sleep(opts.pauseProbeMs ?? 1200).then(() => 'frozen')]);
     if (probe === 'frozen') paused = true;
-    else if ((await Promise.race([ready.then(() => 'ok', () => 'ok'), sleep(opts.injectStallMs ?? 20000).then(() => 'stall')])) === 'stall') stalled = true;
-    if (paused || stalled) ready.catch(() => {}); // settles on resume / once buttons appear; don't trip unhandled-rejection
+    // Same budget as readyGate, deliberately: "how long copse waits for init before saying it isn't ready"
+    // should be ONE number, whether you ask via connect (stalled) or via a call (phase=...). This used to
+    // block 20s — back when connect returning was the only chance to learn anything. Now a call answers the
+    // same question in 5s AND names the phase, so blocking connect any longer only adds silence.
+    else if ((await Promise.race([ready.then(() => 'ok', () => 'ok'), sleep(opts.injectStallMs ?? readyBudget).then(() => 'stall')])) === 'stall') stalled = true;
+    if (paused || stalled) ready.catch(() => {}); // settles on resume / once init finishes; don't trip unhandled-rejection
   }
 
   // A relevant (small) snapshot is the basis for settle + auto-delta around mutating ops.
@@ -457,12 +885,24 @@ export async function connect(url, opts = {}) {
     const logWin = []; logWindows.add(logWin);                 // collect THIS action's logs/net directly (not by index)
     const netWin = captureNetwork ? [] : null; if (netWin) netWindows.add(netWin);
     let r;
-    try { r = await action(); await settle(); }
-    finally { logWindows.delete(logWin); if (netWin) netWindows.delete(netWin); }
-    if (before && r && typeof r === 'object') {
-      const c = coreDiff(before, await snapDiff());
-      if (c.appeared.length || c.disappeared.length || c.activated.length || c.deactivated.length || c.labelChanged.length) r.changed = c;
-    }
+    try {
+      r = await action();
+      // The actuation has HAPPENED. Everything below is OBSERVATION (settle / diff), and an observation
+      // failure must not be reported as the action failing: the commonest trigger is the action ITSELF
+      // navigating the page (a restart/confirm button), whose settle-snapshot then trips the detach — the
+      // caller was handed "[recoverable] … retry" for a press that already fired, an agent obeyed, and the
+      // press fired twice (a second bet), with the evidence of the first success silently discarded.
+      // Annotate the result instead: the action's ok/fired stand; what was lost is only the after-state.
+      try {
+        await settle();
+        if (before && r && typeof r === 'object') {
+          const c = coreDiff(before, await snapDiff());
+          if (c.appeared.length || c.disappeared.length || c.activated.length || c.deactivated.length || c.labelChanged.length) r.changed = c;
+        }
+      } catch (e) {
+        if (r && typeof r === 'object') r.observation = { lost: true, error: (e && e.message) || String(e), note: 'the action itself COMPLETED; only its after-state could not be read (the page likely navigated under the settle). Do not re-fire the action to see the state — read it with snapshot/orient once the page is back.' };
+      }
+    } finally { logWindows.delete(logWin); if (netWin) netWindows.delete(netWin); }
     // captureNetwork (SUGGESTIONS #7): attach the requests this action triggered — for the
     // "client action → server error code" case where the client state looks fine but the server rejected it.
     if (netWin && r && typeof r === 'object' && netWin.length) r.network = netWin.map((x) => ({ ...x }));
@@ -482,16 +922,27 @@ export async function connect(url, opts = {}) {
   // the opaque screenshot for free; the game's own WebGL canvas can't be read from JS) → signature() the
   // tiny RGBA in Node. Masks are painted before downscaling so animation/particle/text jitter never signs.
   const VGRID = 16;
+  // The visual pipeline's raw page.* calls (screenshot, the in-page decode) bypass evWith on purpose —
+  // they aren't cc-frame ops — but unbounded they hung forever on a halted renderer, and because the MCP
+  // server serializes tool calls, ONE hung visual_check wedged every tool after it: the exact silent-hang
+  // class evWith exists to kill, alive in a side door. The pipeline already degrades loud via `reason`
+  // fields, so a timeout degrades the same way instead of hanging.
+  const TIMED_OUT = Symbol('timed-out');
+  const boundedPage = async (p, ms = OP_TIMEOUT) => {
+    let timer;
+    try { return await Promise.race([p, new Promise((res) => { timer = setTimeout(() => res(TIMED_OUT), ms); })]); }
+    finally { clearTimeout(timer); }
+  };
   // The cc frame may be a nested/OOPIF iframe offset from the top page. page.screenshot clips in TOP-page
   // coords while the manifest rect is IFRAME-local, so resolve the cc frame's offset in the top page (0,0
   // for the main frame). Returns null when it can't be determined (an OOPIF with no reachable frameElement)
   // → visualSig then degrades LOUD instead of screenshotting the wrong region.
   async function ccFrameOffset() {
     if (frame === page.mainFrame()) return { x: 0, y: 0 };
-    let el; try { el = await frame.frameElement(); } catch { el = null; }
-    if (!el) return null;
-    let box; try { box = await el.boundingBox(); } catch { box = null; } finally { try { await el.dispose(); } catch { /* */ } }
-    return box ? { x: box.x, y: box.y } : null;
+    let el; try { el = await boundedPage(frame.frameElement()); } catch { el = null; }
+    if (!el || el === TIMED_OUT) return null;
+    let box; try { box = await boundedPage(el.boundingBox()); } catch { box = null; } finally { try { await el.dispose(); } catch { /* */ } }
+    return box && box !== TIMED_OUT ? { x: box.x, y: box.y } : null;
   }
   async function visualSig(ref, o = {}) {
     const grid = o.grid || VGRID;
@@ -514,12 +965,13 @@ export async function connect(url, opts = {}) {
     const local = { x, y, width: w, height: h };                        // iframe-local region (mask math)
     const clip = { x: x + foff.x, y: y + foff.y, width: w, height: h };  // top-page region (the screenshot)
     // version-safe: recent puppeteer returns a Uint8Array (the `encoding:'base64'` option is gone) → base64 in Node.
-    const shot = await page.screenshot({ clip, type: 'png' }).catch(() => null);
+    const shot = await boundedPage(page.screenshot({ clip, type: 'png' }).catch(() => null));
+    if (shot === TIMED_OUT) return { manifest, sig: null, reason: 'renderer-silent' };
     if (!shot) return { manifest, sig: null, reason: 'screenshot-failed' };
     const png = Buffer.from(shot).toString('base64');
     // Decode+downsample in-page. Guard it like its siblings above: a CSP that blocks data: imgs (or any
     // decode failure) must degrade LOUD, not throw out of visualSig and reject the whole visualCheck.
-    const rgba = await page.evaluate(async ({ b64, grid, masks, clip }) => {
+    const rgba = await boundedPage(page.evaluate(async ({ b64, grid, masks, clip }) => {
       const img = new Image();
       await new Promise((res, rej) => { img.onload = res; img.onerror = () => rej(new Error('decode')); img.src = 'data:image/png;base64,' + b64; });
       const fw = img.width || 1, fh = img.height || 1;
@@ -531,7 +983,8 @@ export async function connect(url, opts = {}) {
       const small = document.createElement('canvas'); small.width = grid; small.height = grid;
       const s2 = small.getContext('2d'); s2.drawImage(scratch, 0, 0, grid, grid);
       return Array.from(s2.getImageData(0, 0, grid, grid).data);
-    }, { b64: png, grid, masks: manifest.maskRects, clip: local }).catch(() => null); // masks are iframe-local → pass the local region
+    }, { b64: png, grid, masks: manifest.maskRects, clip: local }).catch(() => null)); // masks are iframe-local → pass the local region
+    if (rgba === TIMED_OUT) return { manifest, sig: null, reason: 'renderer-silent' };
     if (!rgba) return { manifest, sig: null, reason: 'decode-failed' };
     return { manifest, sig: signature(rgba, grid, grid, { grid }), grid };
   }
@@ -544,18 +997,32 @@ export async function connect(url, opts = {}) {
     // cc frame post-navigation and re-installs __copse. Returns a readiness summary.
     reload: async (o = {}) => {
       await page.reload({ waitUntil: o.waitUntil || 'load' });
-      frame = page.mainFrame();   // the navigation replaced every frame; bootInPage re-finds the cc one
-      await bootInPage();
-      // bootInPage waits for a cc frame + interactive buttons, but a fresh navigation in a slow
-      // (headless CI) renderer can still be MID scene-swap when we read — poll for a LIVE scene so
-      // the summary snapshot below (and the caller's very next step, e.g. runScripts) don't hit a
-      // null getScene(). Belt-and-suspenders: the snapshot/interactive reads also degrade to [].
+      // Go through reboot(), not a boot of our own. This navigation DETACHES the cc frame, so any op in
+      // flight (a watch, a concurrent tool call) trips isDetached and calls reboot() at the same moment —
+      // and a second, un-deduped bootInPage would race it for the shared frame/bootPhase/bootFailed, with
+      // the last writer winning (a failed boot silently cleared by the other's success, or vice versa).
+      // It also earns reload the reinjects++ and the hook-loss warning: reload wipes __copse just as surely
+      // as an accidental navigation does, and warning on only the accidental path is the worse half to pick.
+      // reboot()'s budget (rebootTries) applies once its boot STARTS — but runBoot's freshness rule can
+      // QUEUE this reboot behind a still-running initial cold boot (attach → stalled → the caller reloads,
+      // exactly what the stalled note suggests), so the wait here is potentially cold-budget + reboot, not
+      // 15s. Cap the CALL like any other op: on timeout the boot keeps running in the background and the
+      // next call joins it — reload just stops pretending to be synchronous with it.
+      let timer;
+      const capped = new Promise((_, rej) => { timer = setTimeout(() => rej(err(`copse: reload's re-boot didn't finish within ${Math.round(OP_TIMEOUT / 1000)}s — it is still running in the background; call orient/snapshot in a moment, or reconnect if this repeats.`, { recoverable: true, code: 'reconnecting' })), OP_TIMEOUT); });
+      try { await Promise.race([reboot(lastNavAt), capped]); } finally { clearTimeout(timer); }   // we navigated on purpose — a boot that predates it saw the document we just replaced
+      // reboot() already waited for a live engine root, but a slow (headless CI) renderer can still be
+      // MID scene-swap when we read — poll so the summary snapshot below (and the caller's very next
+      // step, e.g. runScripts) don't hit a null getScene() / an empty Pixi stage.
       for (let i = 0; i < 40; i++) {
-        if (await rawEv((pixi) => { try { const r = pixi ? window.__copse.app.stage : window.cc.director.getScene(); return !!(r && (r.children || []).length); } catch { return false; } }, isPixi())) break;
+        // A raw evaluate, deliberately: ev() would re-enter readyGate/reboot recovery, and this is a
+        // best-effort settle check on a frame reboot() just handed us. A transient mid-swap throw means
+        // "not settled yet", not "reload failed" — so it degrades to false rather than out of reload().
+        if (await frame.evaluate((pixi) => { try { const r = pixi ? window.__copse.app.stage : window.cc.director.getScene(); return !!(r && (r.children || []).length); } catch { return false; } }, isPixi()).catch(() => false)) break;
         await sleep(200);
       }
-      const snap = await ev(() => window.__copse.snapshot({ relevant: true })).catch(() => []);
-      const inter = await ev(() => window.__copse.interactive()).catch(() => []);
+      const snap = await ev(() => window.__copse.snapshot({ relevant: true }));
+      const inter = await ev(() => window.__copse.interactive());
       return { ok: true, reloaded: true, url: page.url(), relevantNodes: snap.length, buttons: inter.length };
     },
     snapshot: (o) => ev((o) => window.__copse.snapshot(o), o ?? {}),
@@ -581,7 +1048,10 @@ export async function connect(url, opts = {}) {
     // CDP eval_frame (which needs a breakpoint and freezes the renderer). Runs via indirect eval so
     // cc / window / window.__copse / cc.find are all in reach; a returned thenable is awaited; the
     // value is coerced to a JSON-safe form so a non-serialisable return doesn't blow up the bridge.
-    eval: (expr) => ev((code) => {
+    // `timeout` ('90s'/ms) raises the op deadline for THIS call — eval is the one op whose duration is
+    // user-authored, and the reported 1953s hang was an eval polling loop: it needs the cap most, and is
+    // also the only op that can legitimately want more than the default.
+    eval: (expr, o = {}) => evWith(positive(parseDur(o.timeout, OP_TIMEOUT), OP_TIMEOUT), (code) => {
       const wrap = (v) => { let value = v; try { JSON.stringify(v); } catch { try { value = String(v); } catch { value = '[unserializable]'; } } return { ok: true, value }; };
       // Auto-wrap top-level `await` in an async IIFE (SUGGESTIONS #5) so `await fetch(...)` etc. just work
       // instead of "await is only valid in async functions". Try the expression form first (returns the
@@ -639,7 +1109,13 @@ export async function connect(url, opts = {}) {
       o = o || {};                                          // guard: a null opts must not reach the in-page destructure
       const netWin = o.captureNetwork ? [] : null; if (netWin) netWindows.add(netWin);
       let r;
-      try { r = await ev((oo) => window.__copse.watch(oo), o); }
+      // watch runs its whole poll loop IN-PAGE and is SUPPOSED to take as long as its own timeout (40s by
+      // default, and callers pass '2m'), so judging it by the default op deadline would kill the healthy
+      // case. Derive its budget from the same duration grammar the in-page loop parses, plus room to return.
+      // `interval` counts too: the in-page loop checks its deadline between samples, so it can overshoot by
+      // up to one interval — a long-interval watch sized to survive would otherwise be killed on the tail.
+      const budget = parseDur(o.timeout, 40000) + parseDur(o.settle, 0) + parseDur(o.interval, 1000) + 15000;
+      try { r = await evWith(budget, (oo) => window.__copse.watch(oo), o); }
       finally { if (netWin) netWindows.delete(netWin); }
       if (netWin && r && typeof r === 'object' && netWin.length) r.network = netWin.map((x) => ({ ...x }));
       return r;
@@ -652,7 +1128,7 @@ export async function connect(url, opts = {}) {
     hold: (sel, opts) => ev(([s, o]) => window.__copse.hold(s, o), [sel, opts ?? {}]),   // freeze the loop at a trigger (SUGGESTIONS C1)
     release: () => ev(() => window.__copse.release()),
     holdStatus: () => ev(() => window.__copse.hold_status()),
-    patchCalls: (sel) => ev((s) => window.__copse.patch_calls(s), sel),   // a trace:true patch's recorded calls
+    patchCalls: (sel) => ev((s) => window.__copse.patch_calls(s || undefined), sel ?? null),   // a trace:true patch's recorded calls (no sel → the merged timeline)
 
     // framework-aware state access (PureMVC etc.) — reach logic state OUTSIDE the cc tree (SUGGESTIONS #4).
     framework: () => ev(() => window.__copse.framework()),
@@ -666,6 +1142,7 @@ export async function connect(url, opts = {}) {
     pmSet: (sel, value) => mutate(() => ev(([s, v]) => window.__copse.pmSet(s, v), [sel, value])),
     pmCall: (sel, ...args) => mutate(() => ev(([s, a]) => window.__copse.pmCall(s, a), [sel, args])),
     pmPatch: (sel, hooks) => ev(([s, h]) => window.__copse.pmPatch(s, h), [sel, hooks ?? {}]),   // patch a proxy/mediator/command method
+    pmTrace: (opts) => ev((o) => window.__copse.pmTrace(o), opts ?? {}),   // arm every dispatch choke point → patchCalls() reads the merged flow
     pmNotify: (name, body, type) => mutate(() => ev(([n, b, t]) => window.__copse.pmNotify(n, b, t), [name, body, type])), // fire a notification
     // on-demand screenshot (SUGGESTIONS #8): pair a logic state with what's on screen. `selector` clips to a
     // node's screen rect via the SAME `visualManifest` projection visual_check signs through (one projection,
@@ -686,7 +1163,8 @@ export async function connect(url, opts = {}) {
         } catch { clip = null; }
       }
       if (clip && !(clip.width > 0 && clip.height > 0 && clip.x >= 0 && clip.y >= 0)) clip = null;
-      const b64 = await page.screenshot({ encoding: 'base64', ...(clip ? { clip } : {}) });
+      const b64 = await boundedPage(page.screenshot({ encoding: 'base64', ...(clip ? { clip } : {}) }));
+      if (b64 === TIMED_OUT) throw err(`copse: screenshot didn't return within ${Math.round(OP_TIMEOUT / 1000)}s — the renderer is almost certainly halted (a breakpoint). Resume the tab, then retry.`, { code: 'op-timeout' });
       if (o.path) { writeFileSync(o.path, Buffer.from(b64, 'base64')); return { ok: true, path: o.path, clipped: !!clip }; }
       return { base64: b64, mimeType: 'image/png', clipped: !!clip };
     },
@@ -712,7 +1190,7 @@ export async function connect(url, opts = {}) {
     },
     // attach mode drives the user's own browser → disconnect, don't close it.
     // `paused`: attached while the renderer is HALTED (debugger) → inject deferred until resume.
-    // `stalled`: init didn't settle in time (game on a loading/intro screen) → __copse usually already up.
+    // `stalled`: init didn't finish in time (install still queued, or no scene up yet) → reads may not work.
     // NOTE (contract change): `paused` USED to mean "inject deferred for ANY reason"; it now means the
     // debugger case ONLY. A consumer that gated on `paused` to wait for the game to be live must now gate on
     // `!paused && !stalled` (a stalled/loading tab reads paused:false), or it will act on a not-yet-ready tree.
@@ -735,6 +1213,9 @@ export async function connect(url, opts = {}) {
     engineReady: async () => { try { await ready; } catch { /* boot failure is reported elsewhere */ } return engine; },
     get engineDetected() { return engineDetected; }, // false = nothing identified itself (auto fell back to cocos); doctor's key finding
     get installed() { return installed; },   // false = __copse never came up; every read then throws notInstalled()
+    // how many times the session re-injected after a navigation — each one wiped the caller's in-page
+    // patch/hold hooks (a warning also lands in cp.logs()), so a hook-dependent flow can check it.
+    get reinjects() { return reinjects; },
     page, get frame() { return frame; }, browser, ready, paused, stalled,
     close: () => (opts.attach ? browser.disconnect() : browser.close()),
   };
